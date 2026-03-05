@@ -12,12 +12,17 @@ const nextConfig = {
     // Remove custom watchOptions that were too aggressive and could evict entries.
     return config;
   },
-  // Increase thresholds to prevent on-demand entry disposal causing 404s for dev assets
+  // Keep dev chunks/pages warm much longer; helps avoid ChunkLoadError after idle periods.
   onDemandEntries: {
-    maxInactiveAge: 120000, // 2 minutes (default ~60s). Higher to be safe.
-    pagesBufferLength: 10,  // keep more pages/chunks in memory
+    maxInactiveAge: 60 * 60 * 1000, // 1 hour
+    pagesBufferLength: 100, // retain more entries to reduce eviction churn
   },
   async headers() {
+    // In development, let Next manage dev asset/runtime headers untouched.
+    if (process.env.NODE_ENV !== "production") {
+      return [];
+    }
+
     return [
       {
         source: "/(.*)",

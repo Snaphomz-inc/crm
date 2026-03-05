@@ -353,23 +353,71 @@ async function fetchMLSPhotos(query = {}) {
 // Enhanced OpenAI Agent Utilities with advanced features
 class OpenAIUtility {
   constructor() {
-    this.apiKey = process.env.OPENAI_API_KEY
-    this.baseURL = 'https://api.openai.com/v1'
+    this.provider = this.resolveProvider()
+    this.apiKey = this.provider === 'groq'
+      ? process.env.GROQ_API_KEY
+      : process.env.OPENAI_API_KEY
+    this.baseURL = this.provider === 'groq'
+      ? 'https://api.groq.com/openai/v1'
+      : 'https://api.openai.com/v1'
+    this.defaultModel = this.provider === 'groq'
+      ? (process.env.GROQ_MODEL || 'openai/gpt-oss-120b')
+      : (process.env.OPENAI_MODEL || 'gpt-4o-mini')
     this.maxRetries = 3
     this.baseDelay = 1000 // 1 second
     this.maxDelay = 30000 // 30 seconds
+    const toNum = (v, fallback = 0) => {
+      const n = Number(v)
+      return Number.isFinite(n) ? n : fallback
+    }
+    const groqInputCost = toNum(process.env.GROQ_COST_PER_1K_INPUT, 0)
+    const groqOutputCost = toNum(process.env.GROQ_COST_PER_1K_OUTPUT, 0)
     this.tokenLimits = {
       'gpt-4o-mini': { input: 128000, output: 16000, cost_per_1k_input: 0.00015, cost_per_1k_output: 0.0006 },
       'o1-mini': { input: 128000, output: 65536, cost_per_1k_input: 0.003, cost_per_1k_output: 0.012 },
-      'gpt-4o': { input: 128000, output: 4096, cost_per_1k_input: 0.005, cost_per_1k_output: 0.015 }
+      'gpt-4o': { input: 128000, output: 4096, cost_per_1k_input: 0.005, cost_per_1k_output: 0.015 },
+      // Groq-hosted OSS model (OpenAI-compatible endpoint)
+      'openai/gpt-oss-120b': { input: 131072, output: 65536, cost_per_1k_input: groqInputCost, cost_per_1k_output: groqOutputCost }
     }
     this.requestLog = []
     this.totalCost = 0
     this.dailyCostLimit = 50.00 // $50 daily limit
   }
 
+  resolveProvider() {
+    const explicit = String(process.env.AI_PROVIDER || '').trim().toLowerCase()
+    if (explicit === 'groq') return 'groq'
+    if (explicit === 'openai') return 'openai'
+    if (process.env.GROQ_API_KEY) return 'groq'
+    return 'openai'
+  }
+
+  normalizeModel(inputModel) {
+    let model = inputModel || this.defaultModel
+
+    // Preserve existing call-sites and remap aliases based on active provider.
+    if (this.provider === 'groq') {
+      if (model === 'o1-mini' || model === 'gpt-4o-mini' || model === 'gpt-4o') {
+        model = this.defaultModel
+      }
+    } else if (model === 'o1-mini') {
+      // Existing internal alias for OpenAI flows.
+      model = 'gpt-4o-mini'
+    }
+
+    if (!this.tokenLimits[model]) {
+      console.warn(`Unknown model: ${model}, using ${this.defaultModel} as fallback`)
+      model = this.defaultModel
+      if (!this.tokenLimits[model]) {
+        model = 'gpt-4o-mini'
+      }
+    }
+
+    return model
+  }
+
   // Enhanced token counting with tiktoken-style approximation
-  estimateTokenCount(text, model = 'gpt-4o-mini') {
+  estimateTokenCount(text, model = this.defaultModel) {
     if (!text) return 0
     
     // Rough approximation: 1 token ≈ 4 characters for English text
@@ -380,14 +428,15 @@ class OpenAIUtility {
     const modelAdjustments = {
       'gpt-4o-mini': 1.0,
       'o1-mini': 1.1, // O1 models tend to use slightly more tokens
-      'gpt-4o': 1.0
+      'gpt-4o': 1.0,
+      'openai/gpt-oss-120b': 1.0
     }
     
     return Math.ceil(baseCount * (modelAdjustments[model] || 1.0))
   }
 
   // Calculate message token count including system formatting
-  calculateMessageTokens(messages, model = 'gpt-4o-mini') {
+  calculateMessageTokens(messages, model = this.defaultModel) {
     let totalTokens = 0
     
     for (const message of messages) {
@@ -405,7 +454,7 @@ class OpenAIUtility {
   }
 
   // Cost calculation and budget checking
-  calculateCost(inputTokens, outputTokens, model = 'gpt-4o-mini') {
+  calculateCost(inputTokens, outputTokens, model = this.defaultModel) {
     const limits = this.tokenLimits[model]
     if (!limits) return 0
 
@@ -500,7 +549,7 @@ class OpenAIUtility {
   }
 
   // Main callOpenAI function with all enhancements
-  async callOpenAI(model = 'gpt-4o-mini', messages, options = {}) {
+  async callOpenAI(model = this.defaultModel, messages, options = {}) {
     const {
       stream = false,
       onChunk = null,
@@ -517,24 +566,12 @@ class OpenAIUtility {
       streamTimeoutMs = 60000
     } = options
 
-    // Map deprecated/alias model names
-    if (model === 'o1-mini') {
-      // 'o1-mini' is an internal alias for 'gpt-4o-mini'.
-      // The public OpenAI endpoint rejects the former with
-      // "unsupported_value: messages[0].role does not support 'system'"
-      // so we transparently switch to the supported model name.
-      model = 'gpt-4o-mini'
-    }
-
-    // Validate model
-    if (!this.tokenLimits[model]) {
-      console.warn(`Unknown model: ${model}, using gpt-4o-mini as fallback`)
-      model = 'gpt-4o-mini'
-    }
+    // Normalize aliases and validate model
+    model = this.normalizeModel(model)
 
     // Validate API key
     if (!this.apiKey) {
-      throw new Error('OpenAI API key not configured')
+      throw new Error(`${this.provider.toUpperCase()} API key not configured`)
     }
 
     // Calculate token usage and cost
@@ -648,7 +685,7 @@ class OpenAIUtility {
 
         // Handle error response
         const errorData = await response.json().catch(() => ({}))
-        const error = new Error(`OpenAI API Error: ${response.status}`)
+        const error = new Error(`${this.provider.toUpperCase()} API Error: ${response.status}`)
         error.status = response.status
         error.data = errorData
         throw error
@@ -668,7 +705,7 @@ class OpenAIUtility {
           error: errorInfo
         })
 
-        console.error(`OpenAI API attempt ${attempt} failed:`, errorInfo)
+        console.error(`${this.provider.toUpperCase()} API attempt ${attempt} failed:`, errorInfo)
 
         // Don't retry on non-retryable errors
         if (!errorInfo.isRetryable || attempt > maxRetries) {
@@ -692,11 +729,11 @@ class OpenAIUtility {
     if (errorInfo.isRateLimit) {
       throw new Error(`Rate limit exceeded after ${maxRetries} retries. Please try again later.`)
     } else if (errorInfo.isBudgetIssue) {
-      throw new Error(`OpenAI quota exceeded. Please check your billing.`)
+      throw new Error(`${this.provider.toUpperCase()} quota exceeded. Please check your billing.`)
     } else if (errorInfo.isModelIssue) {
       throw new Error(`Model '${model}' is not available. Please try a different model.`)
     } else {
-      throw new Error(`OpenAI API failed after ${maxRetries} retries: ${errorInfo.message}`)
+      throw new Error(`${this.provider.toUpperCase()} API failed after ${maxRetries} retries: ${errorInfo.message}`)
     }
   }
 
@@ -716,9 +753,9 @@ class OpenAIUtility {
 
     // Console logging for monitoring
     if (requestInfo.success) {
-      console.log(`✅ OpenAI ${requestInfo.model}: ${requestInfo.inputTokens}+${requestInfo.outputTokens} tokens, $${requestInfo.cost.toFixed(4)}, ${requestInfo.responseTime}ms`)
+      console.log(`✅ ${this.provider.toUpperCase()} ${requestInfo.model}: ${requestInfo.inputTokens}+${requestInfo.outputTokens} tokens, $${requestInfo.cost.toFixed(4)}, ${requestInfo.responseTime}ms`)
     } else {
-      console.error(`❌ OpenAI ${requestInfo.model} failed: ${requestInfo.error.message}`)
+      console.error(`❌ ${this.provider.toUpperCase()} ${requestInfo.model} failed: ${requestInfo.error.message}`)
     }
   }
 
@@ -736,6 +773,9 @@ class OpenAIUtility {
       totalCost: this.totalCost,
       totalTokens,
       avgResponseTime: Math.round(avgResponseTime),
+      provider: this.provider,
+      defaultModel: this.defaultModel,
+      baseURL: this.baseURL,
       dailyCostLimit: this.dailyCostLimit,
       remainingBudget: Math.max(0, this.dailyCostLimit - this.totalCost),
       modelUsage: this.getModelUsageBreakdown()
@@ -783,7 +823,7 @@ class OpenAIUtility {
 // Create global instance
 const openaiUtility = new OpenAIUtility()
 
-async function callOpenAI(model = 'gpt-4o-mini', messages, options = {}) {
+async function callOpenAI(model = openaiUtility.defaultModel, messages, options = {}) {
   return await openaiUtility.callOpenAI(model, messages, options)
 }
 
@@ -4094,9 +4134,10 @@ async function handleRoute(request, { params }) {
         const durationSec = Number(form.get('duration'))
         const mime = (file.type || 'audio/webm').toString()
 
-        // Transcribe using OpenAI Whisper API
-        if (!process.env.OPENAI_API_KEY) {
-          return handleCORS(NextResponse.json({ success: false, error: 'OPENAI_API_KEY not configured for transcription' }, { status: 500 }))
+        // Transcribe using provider-compatible audio transcription API
+        const transcriptionKey = process.env.OPENAI_API_KEY || process.env.GROQ_API_KEY
+        if (!transcriptionKey) {
+          return handleCORS(NextResponse.json({ success: false, error: 'OPENAI_API_KEY or GROQ_API_KEY not configured for transcription' }, { status: 500 }))
         }
         const memoId = uuidv4()
         const fileName = `${itemId}-${memoId}.webm`
@@ -4112,9 +4153,11 @@ async function handleRoute(request, { params }) {
           // Optional: language hint if known; comment out if undesired
           // fd.append('language', 'en')
 
-          const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+          const transcriptionBase = process.env.TRANSCRIPTION_BASE_URL || openaiUtility.baseURL
+          const transcriptionUrl = `${transcriptionBase.replace(/\/$/, '')}/audio/transcriptions`
+          const res = await fetch(transcriptionUrl, {
             method: 'POST',
-            headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+            headers: { Authorization: `Bearer ${transcriptionKey}` },
             body: fd
           })
           if (!res.ok) {
@@ -5385,7 +5428,7 @@ async function handleRoute(request, { params }) {
     if (route === '/openai/test' && method === 'POST') {
       try {
         const body = await request.json()
-        let { model = 'gpt-4o-mini', test_type = 'simple', enable_streaming = false } = body
+        let { model = openaiUtility.defaultModel, test_type = 'simple', enable_streaming = false } = body
 
         let messages = []
         let options = {}
@@ -5433,14 +5476,14 @@ async function handleRoute(request, { params }) {
           test_type,
           response: result,
           options_used: options,
-          message: 'OpenAI utility test completed successfully'
+          message: `${openaiUtility.provider.toUpperCase()} utility test completed successfully`
         }))
       } catch (error) {
         console.error('OpenAI test error:', error)
         return handleCORS(NextResponse.json({
           success: false,
           error: error.message,
-          details: 'OpenAI utility test failed'
+          details: `${openaiUtility.provider.toUpperCase()} utility test failed`
         }, { status: 500 }))
       }
     }
@@ -5467,6 +5510,9 @@ async function handleRoute(request, { params }) {
       try {
         return handleCORS(NextResponse.json({
           success: true,
+          provider: openaiUtility.provider,
+          default_model: openaiUtility.defaultModel,
+          base_url: openaiUtility.baseURL,
           models: openaiUtility.tokenLimits,
           current_limits: {
             daily_cost_limit: openaiUtility.dailyCostLimit,
