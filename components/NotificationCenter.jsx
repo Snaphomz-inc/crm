@@ -14,8 +14,17 @@ const apiUrl = (path) => `${API_BASE}${path}`
 
 async function fetchJSON(url, opts) {
   const res = await fetch(url, opts)
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  return await res.json()
+  const text = await res.text().catch(() => '')
+  let json = null
+  try { json = text ? JSON.parse(text) : null } catch (_) { json = null }
+
+  if (!res.ok) {
+    const msg = json?.error || json?.message || `HTTP ${res.status}`
+    throw new Error(msg)
+  }
+
+  if (json !== null) return json
+  throw new Error('API returned non-JSON response')
 }
 
 export function NotificationBell() {
@@ -91,62 +100,51 @@ export function NotificationBell() {
   )
 }
 
-export default function NotificationCenter({ onAnyAction }) {
+export function NotificationCenter({ onAnyAction }) {
+  const [tab, setTab] = useState('all')
   const [loading, setLoading] = useState(false)
-  const [tab, setTab] = useState('nudges')
-  const [nudges, setNudges] = useState([])
-  const [reminders, setReminders] = useState([])
+  const [notifications, setNotifications] = useState([])
   const [alerts, setAlerts] = useState([])
   const { toast } = useToast()
 
   const loadAll = async () => {
     setLoading(true)
     try {
-      const [notifs, alertsRes] = await Promise.all([
+      const [notifRes, alertRes] = await Promise.all([
         fetchJSON(apiUrl('/api/notifications?limit=100')),
         fetchJSON(apiUrl('/api/alerts/smart'))
       ])
-      const items = Array.isArray(notifs?.items) ? notifs.items : []
-      setNudges(items.filter(x => x.type === 'nudge'))
-      setReminders(items.filter(x => x.type === 'reminder'))
-      setAlerts(Array.isArray(alertsRes?.alerts) ? alertsRes.alerts : [])
+      setNotifications(notifRes.notifications || [])
+      setAlerts(alertRes.alerts || [])
     } catch (e) {
-      console.warn('Load notifications error', e)
+      toast({ title: 'Failed to load notifications', description: e.message || 'Please try again', variant: 'destructive' })
     } finally {
       setLoading(false)
     }
   }
 
   useEffect(() => { loadAll() }, [])
+
+  // Realtime refresh on server events
   useEffect(() => {
     let es
     try {
       es = new EventSource(apiUrl('/api/assistant/stream'))
-      const onBump = () => { loadAll(); onAnyAction && onAnyAction() }
-      es.addEventListener('notifications:changed', onBump)
-      es.addEventListener('alerts:changed', onBump)
-      es.addEventListener('nudge', onBump)
-      es.addEventListener('notifications:remind', (e) => {
-        try {
-          const p = JSON.parse(e.data || '{}')
-          // In-app toast
-          toast({ title: p.title || 'Reminder', description: p.message || '' })
-          // Browser notification (if permitted)
-          if (typeof window !== 'undefined' && 'Notification' in window) {
-            if (Notification.permission === 'granted') {
-              new Notification(p.title || 'Reminder', { body: p.message || '', icon: '/snaphomz-logo.svg' })
-            } else if (Notification.permission === 'default') {
-              Notification.requestPermission().then((perm) => {
-                if (perm === 'granted') new Notification(p.title || 'Reminder', { body: p.message || '', icon: '/snaphomz-logo.svg' })
-              })
-            }
-          }
-        } catch {}
-        loadAll(); onAnyAction && onAnyAction()
-      })
+      const refresh = () => setTimeout(loadAll, 150)
+      es.addEventListener('notifications:changed', refresh)
+      es.addEventListener('alerts:changed', refresh)
     } catch {}
     return () => { try { es && es.close() } catch {} }
   }, [])
+
+  const unreadCount = useMemo(() => notifications.filter(n => n.status !== 'read').length, [notifications])
+  const allItems = useMemo(() => {
+    const notifs = notifications.map(n => ({ ...n, kind: 'notification' }))
+    const al = alerts.map(a => ({ ...a, kind: 'alert' }))
+    if (tab === 'notifications') return notifs
+    if (tab === 'alerts') return al
+    return [...notifs, ...al].sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))
+  }, [notifications, alerts, tab])
 
   const markRead = async (id) => {
     try { await fetchJSON(apiUrl(`/api/notifications/${id}/read`), { method: 'POST' }); await loadAll(); onAnyAction && onAnyAction() } catch {}
@@ -161,83 +159,81 @@ export default function NotificationCenter({ onAnyAction }) {
     try { await fetchJSON(apiUrl(`/api/alerts/dismiss/${id}`), { method: 'POST' }); await loadAll(); onAnyAction && onAnyAction() } catch {}
   }
 
-  const renderList = (items, kind) => (
-    <div className="mt-3 space-y-2 max-h-[70vh] overflow-y-auto pr-1">
-      {items.length === 0 && (
-        <div className="text-sm text-muted-foreground py-6 text-center">No {kind} yet</div>
-      )}
-      {items.map((it) => (
-        <div key={it.id} className="rounded-md border p-3 flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <span className="text-sm font-medium truncate">{it.title || kind === 'alerts' ? (it.alert_type || it.type) : (it.type || 'Notification')}</span>
-              {it.status === 'unread' && <Badge>New</Badge>}
-              {it.status === 'snoozed' && (
-                <Badge variant="secondary">
-                  Snoozed until {it.snooze_until ? new Date(it.snooze_until).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : 'later'}
-                </Badge>
-              )}
-              {it.status === 'read' && <Badge variant="outline">Read</Badge>}
-            </div>
-            <div className="text-sm text-muted-foreground mt-1 break-words">
-              {it.message || it.description || it.summary || it.title}
-            </div>
-            <div className="text-[11px] text-muted-foreground mt-1">
-              {new Date(it.created_at || it.updated_at || Date.now()).toLocaleString()}
-            </div>
-          </div>
-          <div className="flex items-center gap-1 shrink-0">
-            {kind !== 'alerts' ? (
-              <>
-                <Button variant="ghost" size="icon" title="Mark read" onClick={() => markRead(it.id)}>
-                  <Check className="h-4 w-4" />
-                </Button>
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button variant="ghost" size="icon" title="Snooze">
-                      <Clock className="h-4 w-4" />
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end">
-                    <DropdownMenuItem onClick={() => snooze(it.id, 5)}>Snooze 5m</DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => snooze(it.id, 15)}>Snooze 15m</DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => snooze(it.id, 30)}>Snooze 30m</DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </>
-            ) : (
-              <Button variant="ghost" size="icon" title="Dismiss" onClick={() => dismissAlert(it.id)}>
-                <Trash2 className="h-4 w-4" />
-              </Button>
-            )}
-          </div>
-        </div>
-      ))}
-    </div>
-  )
+  const fmt = (d) => {
+    const dt = new Date(d)
+    if (isNaN(dt.getTime())) return '—'
+    return dt.toLocaleString()
+  }
 
   return (
-    <div>
-      <div className="flex items-center justify-between">
-        <Tabs value={tab} onValueChange={setTab}>
+    <div className="space-y-3">
+      <div className="flex items-center justify-between gap-2">
+        <Tabs value={tab} onValueChange={setTab} className="w-auto">
           <TabsList>
-            <TabsTrigger value="nudges">Nudges</TabsTrigger>
-            <TabsTrigger value="reminders">Reminders</TabsTrigger>
+            <TabsTrigger value="all">All</TabsTrigger>
+            <TabsTrigger value="notifications">Notifications</TabsTrigger>
             <TabsTrigger value="alerts">Alerts</TabsTrigger>
           </TabsList>
         </Tabs>
         <div className="flex items-center gap-1">
-          <Button variant="ghost" size="icon" onClick={loadAll} disabled={loading} title="Refresh">
-            <RefreshCcw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
+          <Button variant="ghost" size="icon" onClick={loadAll} disabled={loading}><RefreshCcw className="h-4 w-4" /></Button>
+          <Button variant="ghost" size="sm" onClick={clearRead}>
+            <Trash2 className="h-4 w-4 mr-1" /> Clear read
           </Button>
-          <Button variant="ghost" size="sm" onClick={clearRead}>Clear Read</Button>
         </div>
       </div>
-      <div>
-        {tab === 'nudges' && renderList(nudges, 'nudges')}
-        {tab === 'reminders' && renderList(reminders, 'reminders')}
-        {tab === 'alerts' && renderList(alerts, 'alerts')}
+
+      <div className="text-xs text-muted-foreground">Unread: {unreadCount}</div>
+
+      <div className="max-h-[70vh] overflow-auto space-y-2 pr-1">
+        {allItems.length === 0 && (
+          <div className="text-sm text-muted-foreground py-8 text-center">No items</div>
+        )}
+
+        {allItems.map((item) => (
+          <div key={`${item.kind}:${item.id}`} className="rounded-md border p-3 bg-background">
+            <div className="flex items-start justify-between gap-2">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <Badge variant={item.kind === 'alert' ? 'destructive' : 'secondary'}>
+                    {item.kind}
+                  </Badge>
+                  {item.priority && <Badge variant="outline">{item.priority}</Badge>}
+                  {item.status && <Badge variant="outline">{item.status}</Badge>}
+                </div>
+                <div className="font-medium text-sm">{item.title || item.message || item.alert_type || 'Untitled'}</div>
+                {item.message && <div className="text-sm text-muted-foreground">{item.message}</div>}
+                <div className="text-xs text-muted-foreground flex items-center gap-1"><Clock className="h-3 w-3" /> {fmt(item.created_at)}</div>
+              </div>
+
+              <div className="flex items-center gap-1">
+                {item.kind === 'notification' ? (
+                  <>
+                    {item.status !== 'read' && (
+                      <Button size="sm" variant="outline" onClick={() => markRead(item.id)}>
+                        <Check className="h-3.5 w-3.5 mr-1" /> Read
+                      </Button>
+                    )}
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button size="sm" variant="ghost">Snooze</Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem onClick={() => snooze(item.id, 15)}>15 min</DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => snooze(item.id, 60)}>1 hour</DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => snooze(item.id, 24 * 60)}>1 day</DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </>
+                ) : (
+                  <Button size="sm" variant="outline" onClick={() => dismissAlert(item.id)}>Dismiss</Button>
+                )}
+              </div>
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   )
 }
+

@@ -1,9 +1,34 @@
-// Seed script for Real Estate CRM
-const { MongoClient } = require('mongodb');
+// Seed script for Real Estate CRM (Postgres)
+const fs = require('fs');
+const path = require('path');
+const { Pool } = require('pg');
 const { v4: uuidv4 } = require('uuid');
 
-const MONGO_URL = 'mongodb://localhost:27017';
-const DB_NAME = 'realestatecrm';
+function loadLocalEnv() {
+  const envFiles = ['.env.local', '.env'];
+  for (const file of envFiles) {
+    const fullPath = path.join(process.cwd(), file);
+    if (!fs.existsSync(fullPath)) continue;
+    const lines = fs.readFileSync(fullPath, 'utf8').split(/\r?\n/);
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const eqIndex = line.indexOf('=');
+      if (eqIndex <= 0) continue;
+      const key = line.slice(0, eqIndex).trim();
+      let value = line.slice(eqIndex + 1).trim();
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      if (!process.env[key]) process.env[key] = value;
+    }
+  }
+}
+
+loadLocalEnv();
+
+const POSTGRES_URL = process.env.POSTGRES_URL || process.env.DATABASE_URL;
+const DOC_TABLE = 'crm_documents';
 
 const sampleLeads = [
   {
@@ -109,30 +134,62 @@ const sampleLeads = [
 ];
 
 async function seedDatabase() {
-  let client;
-  try {
-    console.log('Connecting to MongoDB...');
-    client = new MongoClient(MONGO_URL);
-    await client.connect();
-    console.log('Connected successfully to MongoDB');
+  if (!POSTGRES_URL) {
+    throw new Error('POSTGRES_URL or DATABASE_URL must be set before running seed-data.js');
+  }
 
-    const db = client.db(DB_NAME);
+  const pool = new Pool({
+    connectionString: POSTGRES_URL,
+    ssl: /sslmode=require|ssl=true/i.test(POSTGRES_URL) ? { rejectUnauthorized: false } : undefined
+  });
+
+  try {
+    console.log('Connecting to Postgres...');
+    await pool.query('SELECT 1');
+    console.log('Connected successfully to Postgres');
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ${DOC_TABLE} (
+        collection_name TEXT NOT NULL,
+        doc_id TEXT NOT NULL,
+        doc JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (collection_name, doc_id)
+      )
+    `);
 
     // Clear existing data
     console.log('Clearing existing leads...');
-    await db.collection('leads').deleteMany({});
+    await pool.query(`DELETE FROM ${DOC_TABLE} WHERE collection_name = $1`, ['leads']);
 
     // Insert sample leads
     console.log('Inserting sample leads...');
-    await db.collection('leads').insertMany(sampleLeads);
+    for (const lead of sampleLeads) {
+      await pool.query(
+        `
+          INSERT INTO ${DOC_TABLE} (collection_name, doc_id, doc, updated_at)
+          VALUES ($1, $2, $3::jsonb, NOW())
+          ON CONFLICT (collection_name, doc_id)
+          DO UPDATE SET doc = EXCLUDED.doc, updated_at = NOW()
+        `,
+        ['leads', lead.id, JSON.stringify(lead)]
+      );
+    }
     console.log(`Inserted ${sampleLeads.length} sample leads`);
 
     console.log('Database seeded successfully!');
 
     // Display summary
-    const leadCount = await db.collection('leads').countDocuments();
-    const buyerCount = await db.collection('leads').countDocuments({ lead_type: 'buyer' });
-    const sellerCount = await db.collection('leads').countDocuments({ lead_type: 'seller' });
+    const [leadCountRow, buyerCountRow, sellerCountRow] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::int AS c FROM ${DOC_TABLE} WHERE collection_name = $1`, ['leads']),
+      pool.query(`SELECT COUNT(*)::int AS c FROM ${DOC_TABLE} WHERE collection_name = $1 AND doc->>'lead_type' = 'buyer'`, ['leads']),
+      pool.query(`SELECT COUNT(*)::int AS c FROM ${DOC_TABLE} WHERE collection_name = $1 AND doc->>'lead_type' = 'seller'`, ['leads'])
+    ]);
+
+    const leadCount = leadCountRow.rows?.[0]?.c || 0;
+    const buyerCount = buyerCountRow.rows?.[0]?.c || 0;
+    const sellerCount = sellerCountRow.rows?.[0]?.c || 0;
 
     console.log('\n=== SEED SUMMARY ===');
     console.log(`Total Leads: ${leadCount}`);
@@ -143,10 +200,8 @@ async function seedDatabase() {
   } catch (error) {
     console.error('Error seeding database:', error);
   } finally {
-    if (client) {
-      await client.close();
-      console.log('MongoDB connection closed');
-    }
+    await pool.end();
+    console.log('Postgres connection closed');
   }
 }
 

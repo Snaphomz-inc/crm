@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -23,7 +23,8 @@ import {
   CheckCircle,
   AlertCircle,
   Loader2,
-  FileText
+  FileText,
+  X
 } from 'lucide-react'
 
 import ChatPropertyResults from '@/components/ChatPropertyResults'
@@ -41,6 +42,25 @@ export function AssistantChat() {
   const [isLoading, setIsLoading] = useState(false)
   // Keep track of the lead we are enriching via slot-filling
   const [currentLeadId, setCurrentLeadId] = useState(null)
+  // Session continuity when bridged to Snaphomz-ai-search
+  const [aiSessionId, setAiSessionId] = useState(null)
+  const activeRequestRef = useRef(null)
+
+  useEffect(() => {
+    return () => {
+      if (activeRequestRef.current) {
+        try { activeRequestRef.current.abort() } catch {}
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!isLoading) return
+    const guard = setTimeout(() => {
+      setIsLoading(false)
+    }, 45000)
+    return () => clearTimeout(guard)
+  }, [isLoading])
 
   const formatCurrency = (amount) => {
     if (amount === null || amount === undefined || amount === '') return 'N/A'
@@ -68,20 +88,24 @@ export function AssistantChat() {
     
     const currentInput = inputMessage
     setInputMessage('')
+    let matchController = null
+    let matchTimeout = null
 
     try {
       // Single-step: let backend self-parse and fulfill
-      const matchController = new AbortController()
-      const matchTimeout = setTimeout(() => matchController.abort(), 30000)
+      matchController = new AbortController()
+      activeRequestRef.current = matchController
+
+      matchTimeout = setTimeout(() => {
+        try { matchController.abort() } catch {}
+      }, 30000)
 
       const matchResponse = await fetch('/api/assistant/match', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: currentInput, lead_id: currentLeadId || undefined }),
+        body: JSON.stringify({ query: currentInput, lead_id: currentLeadId || undefined, session_id: aiSessionId || undefined }),
         signal: matchController.signal
       })
-
-      clearTimeout(matchTimeout)
 
       console.log('Match response status:', matchResponse.status, matchResponse.statusText)
 
@@ -120,8 +144,9 @@ export function AssistantChat() {
         data: {
           lead: matchData.lead,
           isNewLead: matchData.is_new_lead,
-          properties: matchData.properties || [],
+          properties: Array.isArray(matchData.properties) ? matchData.properties : null,
           propertiesCount: matchData.properties_count || 0,
+          intent: matchData.intent || null,
           summary: matchData.summary,
           transactions: matchData.transactions || [],
           tasks: matchData.tasks || [],
@@ -137,6 +162,9 @@ export function AssistantChat() {
       if (matchData?.lead?.id) {
         setCurrentLeadId(matchData.lead.id)
       }
+      if (matchData?.session_id) {
+        setAiSessionId(matchData.session_id)
+      }
 
     } catch (error) {
       console.error('Assistant error:', error)
@@ -146,7 +174,7 @@ export function AssistantChat() {
       if (error.name === 'AbortError') {
         errorMsg = 'Request timed out. The AI processing is taking longer than expected. Please try with a shorter message.'
       } else if (error.message.includes('502') || error.message.includes('Bad Gateway')) {
-        errorMsg = '🔧 **Infrastructure Issue Detected**\n\nThe AI Assistant backend is fully functional, but there\'s a proxy configuration issue preventing external API access. \n\n**What works**: All APIs on localhost:3000 ✅\n**Issue**: External proxy routing for /api/* endpoints ❌\n\n**For immediate testing**, you can verify the AI works by running:\n```bash\ncurl -X POST http://localhost:3000/api/assistant/parse \\\n  -H "Content-Type: application/json" \\\n  -d \'{"message": "Met Sarah, 2BHK in Austin under $350K"}\'\n```\n\n**Status**: Waiting for proxy configuration fix to enable full functionality.'
+        errorMsg = '**Infrastructure Issue Detected**\n\nThe assistant backend is reachable, but external API routing is failing. Please check proxy/API configuration and retry.'
       } else if (error.message.includes('Match API failed')) {
         errorMsg = 'Failed to process your request. Please try again.'
       } else {
@@ -162,11 +190,25 @@ export function AssistantChat() {
       }
       setMessages(prev => [...prev, errorMessage])
     } finally {
+      if (matchTimeout) {
+        clearTimeout(matchTimeout)
+      }
+      if (activeRequestRef.current === matchController) {
+        activeRequestRef.current = null
+      }
       setIsLoading(false)
     }
   }
 
-  const handleKeyPress = (e) => {
+  const cancelActiveRequest = () => {
+    if (activeRequestRef.current) {
+      try { activeRequestRef.current.abort() } catch {}
+      activeRequestRef.current = null
+    }
+    setIsLoading(false)
+  }
+
+  const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       handleSendMessage()
@@ -272,7 +314,7 @@ export function AssistantChat() {
                               <div key={idx} className="flex items-center justify-between text-sm">
                                 <div>
                                   <div className="font-medium">{t.title}</div>
-                                  <div className="text-muted-foreground">Due: {t.due_date ? new Date(t.due_date).toLocaleString() : '—'}</div>
+                                  <div className="text-muted-foreground">Due: {t.due_date ? new Date(t.due_date).toLocaleString() : 'N/A'}</div>
                                 </div>
                                 {t.id && (
                                   <Button size="sm" variant="outline" onClick={async () => {
@@ -338,8 +380,8 @@ export function AssistantChat() {
                             <div className="space-y-2">
                               <p className="font-medium">{message.data.lead.name}</p>
                               <div className="grid grid-cols-2 gap-2 text-sm text-muted-foreground">
-                                <span>📧 {message.data.lead.email}</span>
-                                <span>📞 {message.data.lead.phone}</span>
+                                <span>Email: {message.data.lead.email}</span>
+                                <span>Phone: {message.data.lead.phone}</span>
                               </div>
                               {message.data.lead.preferences && Object.keys(message.data.lead.preferences).length > 0 && (
                                 <div className="mt-2 p-2 bg-muted rounded text-sm">
@@ -418,7 +460,7 @@ export function AssistantChat() {
                       )}
 
                       {/* No Properties Found */}
-                      {message.data.properties && message.data.properties.length === 0 && (
+                      {Array.isArray(message.data.properties) && message.data.properties.length === 0 && /find_properties|search|properties|listing/i.test(String(message.data.intent || '')) && (
                         <Card className="bg-background border-dashed">
                           <CardContent className="p-4 text-center">
                             <Home className="h-8 w-8 mx-auto mb-2 text-muted-foreground" />
@@ -461,18 +503,18 @@ export function AssistantChat() {
           <Input
             value={inputMessage}
             onChange={(e) => setInputMessage(e.target.value)}
-            onKeyPress={handleKeyPress}
+            onKeyDown={handleKeyDown}
             placeholder="Try: 'Just met John Smith. Looking for 3BR in Dallas under $400K'"
             className="flex-1"
-            disabled={isLoading}
           />
           <Button 
-            onClick={handleSendMessage} 
-            disabled={!inputMessage.trim() || isLoading}
+            onClick={isLoading ? cancelActiveRequest : handleSendMessage}
+            disabled={!isLoading && !inputMessage.trim()}
             className="shrink-0"
+            title={isLoading ? 'Stop request' : 'Send'}
           >
             {isLoading ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
+              <X className="h-4 w-4" />
             ) : (
               <Send className="h-4 w-4" />
             )}
@@ -485,3 +527,10 @@ export function AssistantChat() {
     </div>
   )
 }
+
+
+
+
+
+
+

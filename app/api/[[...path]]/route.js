@@ -1,106 +1,578 @@
-import { MongoClient } from 'mongodb'
+﻿import { Pool } from 'pg'
 import { v4 as uuidv4 } from 'uuid'
 import { NextResponse } from 'next/server'
 import fs from 'fs'
 import nodePath from 'path'
 
-// MongoDB connection
-let client
+// Database connection
+let pgPool
 let db
 
-async function connectToMongo() {
-  // Return existing connection if available
-  if (db) return db
+const PG_DOC_TABLE = 'crm_documents'
 
-  const url = process.env.MONGO_URL
-  const name = process.env.DB_NAME
-
-  // Development fallback: use an in-memory stub when env vars are missing
-  if (!url || !name) {
-    console.warn('⚠️  MONGO_URL or DB_NAME not set – using in-memory stub DB (development only).')
-    db = {
-      _data: {},
-      collection(col) {
-        if (!this._data[col]) this._data[col] = []
-        const list = this._data[col]
-        return {
-          find(query = {}) {
-            // minimal filter support for equality on top-level fields
-            const matches = (doc) => {
-              for (const [k, v] of Object.entries(query || {})) {
-                if (doc[k] !== v) return false
-              }
-              return true
-            }
-            const results = list.filter(matches)
-            return {
-              sort: () => ({
-              toArray: async () => results,
-              limit: () => ({ toArray: async () => results })
-            }),
-              limit: () => ({ toArray: async () => results }),
-              toArray: async () => results
-            }
-          },
-          findOne(filter = {}) {
-            return list.find((d) => d.id === filter.id)
-          },
-          countDocuments: async (filter = undefined) => {
-            if (!filter || Object.keys(filter).length === 0) return list.length
-            return list.filter((d) => {
-              for (const [k, v] of Object.entries(filter)) { if (d[k] !== v) return false }
-              return true
-            }).length
-          },
-          insertOne: async (doc) => {
-            const id = doc.id || uuidv4()
-            list.push({ ...doc, id })
-            return { insertedId: id }
-          },
-          updateOne: async (filter, { $set }) => {
-            const idx = list.findIndex((d) => d.id === filter.id)
-            if (idx !== -1) {
-              list[idx] = { ...list[idx], ...$set }
-              return { matchedCount: 1 }
-            }
-            return { matchedCount: 0 }
-          },
-          deleteMany: async (filter = {}) => {
-            const keep = []
-            let deletedCount = 0
-            for (const d of list) {
-              let match = true
-              for (const [k, v] of Object.entries(filter)) { if (d[k] !== v) { match = false; break } }
-              if (match) { deletedCount++ } else { keep.push(d) }
-            }
-            // mutate the original array in place
-            list.length = 0
-            for (const d of keep) list.push(d)
-            return { deletedCount }
-          },
-          deleteOne: async (filter) => {
-            const idx = list.findIndex((d) => d.id === filter.id)
-            if (idx !== -1) {
-              list.splice(idx, 1)
-              return { deletedCount: 1 }
-            }
-            return { deletedCount: 0 }
-          }
-        }
-      }
-    }
-    return db
-  }
-
-  // Normal Mongo connection
-  if (!client) {
-    client = new MongoClient(url)
-    await client.connect()
-  }
-  db = client.db(name)
-  return db
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Date) && !(value instanceof RegExp)
 }
 
+function cloneDoc(value) {
+  if (typeof structuredClone === 'function') return structuredClone(value)
+  return JSON.parse(JSON.stringify(value))
+}
+
+function getFieldValue(obj, field) {
+  if (!field || typeof field !== 'string') return undefined
+  if (!field.includes('.')) return obj?.[field]
+  const parts = field.split('.')
+  let current = obj
+  for (const part of parts) {
+    if (current === null || current === undefined) return undefined
+    current = current[part]
+  }
+  return current
+}
+
+function toDateMillis(value) {
+  if (value instanceof Date) {
+    const t = value.getTime()
+    return Number.isNaN(t) ? null : t
+  }
+  if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}(T|\s|$)/.test(value)) {
+    const parsed = Date.parse(value)
+    return Number.isNaN(parsed) ? null : parsed
+  }
+  return null
+}
+
+function normalizeComparable(value) {
+  const asDate = toDateMillis(value)
+  if (asDate !== null) return asDate
+  if (typeof value === 'number') return value
+  if (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value)) return Number(value)
+  return value
+}
+
+function valuesEqual(left, right) {
+  if (left === right) return true
+  const leftDate = toDateMillis(left)
+  const rightDate = toDateMillis(right)
+  if (leftDate !== null && rightDate !== null) return leftDate === rightDate
+  return false
+}
+
+function deepEqual(a, b) {
+  if (a === b) return true
+  if (a === null || b === null || typeof a !== typeof b) return false
+  if (Array.isArray(a)) {
+    if (!Array.isArray(b) || a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) {
+      if (!deepEqual(a[i], b[i])) return false
+    }
+    return true
+  }
+  if (isPlainObject(a)) {
+    if (!isPlainObject(b)) return false
+    const keysA = Object.keys(a)
+    const keysB = Object.keys(b)
+    if (keysA.length !== keysB.length) return false
+    for (const key of keysA) {
+      if (!deepEqual(a[key], b[key])) return false
+    }
+    return true
+  }
+  return false
+}
+
+function compareForSort(a, b) {
+  const left = normalizeComparable(a)
+  const right = normalizeComparable(b)
+  if (left === right) return 0
+  if (left === undefined || left === null) return 1
+  if (right === undefined || right === null) return -1
+  if (typeof left === 'string' && typeof right === 'string') return left.localeCompare(right)
+  return left > right ? 1 : -1
+}
+
+function applySort(docs, sortSpec = {}) {
+  const entries = Object.entries(sortSpec).filter(([, direction]) => direction === 1 || direction === -1)
+  if (!entries.length) return docs
+  return [...docs].sort((a, b) => {
+    for (const [field, direction] of entries) {
+      const cmp = compareForSort(getFieldValue(a, field), getFieldValue(b, field))
+      if (cmp !== 0) return direction === -1 ? -cmp : cmp
+    }
+    return 0
+  })
+}
+
+function applyProjection(doc, projection = null) {
+  if (!projection || !isPlainObject(projection) || Object.keys(projection).length === 0) return doc
+  const include = Object.entries(projection).filter(([, v]) => v === 1).map(([k]) => k)
+  const exclude = Object.entries(projection).filter(([, v]) => v === 0).map(([k]) => k)
+  if (include.length) {
+    const out = {}
+    for (const key of include) out[key] = getFieldValue(doc, key)
+    return out
+  }
+  const out = cloneDoc(doc)
+  for (const key of exclude) delete out[key]
+  return out
+}
+
+function matchesCondition(actualValue, condition) {
+  if (condition instanceof RegExp) {
+    if (actualValue === null || actualValue === undefined) return false
+    return condition.test(String(actualValue))
+  }
+  if (isPlainObject(condition)) {
+    const keys = Object.keys(condition)
+    const operatorKeys = keys.filter((k) => k.startsWith('$'))
+    if (!operatorKeys.length) return deepEqual(actualValue, condition)
+
+    for (const op of operatorKeys) {
+      const expected = condition[op]
+      if (op === '$options') continue
+      if (op === '$ne') {
+        if (valuesEqual(actualValue, expected)) return false
+        continue
+      }
+      if (op === '$in') {
+        if (!Array.isArray(expected)) return false
+        if (Array.isArray(actualValue)) {
+          if (!actualValue.some((item) => expected.some((candidate) => valuesEqual(item, candidate)))) return false
+        } else if (!expected.some((candidate) => valuesEqual(actualValue, candidate))) {
+          return false
+        }
+        continue
+      }
+      if (op === '$nin') {
+        if (!Array.isArray(expected)) return false
+        if (Array.isArray(actualValue)) {
+          if (actualValue.some((item) => expected.some((candidate) => valuesEqual(item, candidate)))) return false
+        } else if (expected.some((candidate) => valuesEqual(actualValue, candidate))) {
+          return false
+        }
+        continue
+      }
+      if (op === '$exists') {
+        const exists = actualValue !== undefined
+        if (Boolean(expected) !== exists) return false
+        continue
+      }
+      if (op === '$regex') {
+        const flags = typeof condition.$options === 'string' ? condition.$options : ''
+        const regex = expected instanceof RegExp ? expected : new RegExp(String(expected ?? ''), flags)
+        if (actualValue === null || actualValue === undefined || !regex.test(String(actualValue))) return false
+        continue
+      }
+      if (op === '$gt' || op === '$gte' || op === '$lt' || op === '$lte') {
+        const left = normalizeComparable(actualValue)
+        const right = normalizeComparable(expected)
+        if (left === undefined || left === null || right === undefined || right === null) return false
+        if (op === '$gt' && !(left > right)) return false
+        if (op === '$gte' && !(left >= right)) return false
+        if (op === '$lt' && !(left < right)) return false
+        if (op === '$lte' && !(left <= right)) return false
+        continue
+      }
+      if (!valuesEqual(actualValue, expected)) return false
+    }
+    return true
+  }
+  if (condition === null) return actualValue === null || actualValue === undefined
+  return valuesEqual(actualValue, condition)
+}
+
+function matchesQuery(doc, query = {}) {
+  if (!query || !isPlainObject(query) || Object.keys(query).length === 0) return true
+  for (const [key, value] of Object.entries(query)) {
+    if (key === '$or') {
+      if (!Array.isArray(value) || !value.some((sub) => matchesQuery(doc, sub))) return false
+      continue
+    }
+    if (key === '$and') {
+      if (!Array.isArray(value) || !value.every((sub) => matchesQuery(doc, sub))) return false
+      continue
+    }
+    const actual = getFieldValue(doc, key)
+    if (!matchesCondition(actual, value)) return false
+  }
+  return true
+}
+
+function createCursor(loadDocs, query = {}) {
+  let sortSpec = null
+  let limitCount = null
+  let projection = null
+  return {
+    sort(spec = {}) {
+      sortSpec = spec
+      return this
+    },
+    limit(count) {
+      const parsed = Number(count)
+      limitCount = Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : null
+      return this
+    },
+    project(spec = {}) {
+      projection = spec
+      return this
+    },
+    async toArray() {
+      let docs = (await loadDocs()).filter((doc) => matchesQuery(doc, query))
+      if (sortSpec) docs = applySort(docs, sortSpec)
+      if (limitCount !== null) docs = docs.slice(0, limitCount)
+      if (projection) docs = docs.map((doc) => applyProjection(doc, projection))
+      return docs.map((doc) => cloneDoc(doc))
+    },
+    async next() {
+      const docs = await this.limit(1).toArray()
+      return docs[0] || null
+    }
+  }
+}
+
+function createCollectionAdapter(loadAll, persistOne, removeByIds) {
+  return {
+    find(query = {}) {
+      return createCursor(loadAll, query)
+    },
+    async findOne(filter = {}) {
+      const docs = await loadAll()
+      const found = docs.find((doc) => matchesQuery(doc, filter))
+      return found ? cloneDoc(found) : null
+    },
+    async countDocuments(filter = {}) {
+      const docs = await loadAll()
+      return docs.filter((doc) => matchesQuery(doc, filter)).length
+    },
+    async insertOne(doc = {}) {
+      const id = String(doc.id || uuidv4())
+      const payload = { ...doc, id }
+      await persistOne(payload)
+      return { insertedId: id }
+    },
+    async insertMany(docs = []) {
+      const insertedIds = {}
+      for (let i = 0; i < docs.length; i++) {
+        const doc = docs[i]
+        const id = String(doc.id || uuidv4())
+        await persistOne({ ...doc, id })
+        insertedIds[i] = id
+      }
+      return { insertedCount: docs.length, insertedIds }
+    },
+    async updateOne(filter = {}, update = {}) {
+      const docs = await loadAll()
+      const index = docs.findIndex((doc) => matchesQuery(doc, filter))
+      if (index === -1) return { matchedCount: 0, modifiedCount: 0 }
+      const target = docs[index]
+      const patch = isPlainObject(update.$set) ? update.$set : {}
+      const nextDoc = { ...target, ...patch }
+      if (!nextDoc.id) nextDoc.id = String(target.id || uuidv4())
+      await persistOne(nextDoc)
+      return { matchedCount: 1, modifiedCount: 1 }
+    },
+    async deleteOne(filter = {}) {
+      const docs = await loadAll()
+      const target = docs.find((doc) => matchesQuery(doc, filter))
+      if (!target?.id) return { deletedCount: 0 }
+      const deleted = await removeByIds([String(target.id)])
+      return { deletedCount: deleted }
+    },
+    async deleteMany(filter = {}) {
+      const docs = await loadAll()
+      const ids = docs.filter((doc) => matchesQuery(doc, filter)).map((doc) => String(doc.id)).filter(Boolean)
+      if (!ids.length) return { deletedCount: 0 }
+      const deleted = await removeByIds(ids)
+      return { deletedCount: deleted }
+    }
+  }
+}
+
+function createInMemoryDb() {
+  const data = new Map()
+  return {
+    collection(name) {
+      if (!data.has(name)) data.set(name, [])
+      const list = data.get(name)
+      return createCollectionAdapter(
+        async () => list,
+        async (doc) => {
+          const idx = list.findIndex((item) => item.id === doc.id)
+          if (idx >= 0) list[idx] = cloneDoc(doc)
+          else list.push(cloneDoc(doc))
+        },
+        async (ids) => {
+          const idSet = new Set(ids)
+          const keep = list.filter((item) => !idSet.has(String(item.id)))
+          const deletedCount = list.length - keep.length
+          list.length = 0
+          keep.forEach((item) => list.push(item))
+          return deletedCount
+        }
+      )
+    }
+  }
+}
+
+async function ensurePgSchema(pool) {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ${PG_DOC_TABLE} (
+      collection_name TEXT NOT NULL,
+      doc_id TEXT NOT NULL,
+      doc JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (collection_name, doc_id)
+    )
+  `)
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_${PG_DOC_TABLE}_collection ON ${PG_DOC_TABLE} (collection_name)`)
+}
+
+function shouldUseSsl(connectionString) {
+  const value = String(connectionString || '').toLowerCase()
+  return value.includes('sslmode=require') || value.includes('ssl=true')
+}
+
+function createPostgresDb(pool) {
+  return {
+    collection(name) {
+      const loadAll = async () => {
+        const { rows } = await pool.query(`SELECT doc FROM ${PG_DOC_TABLE} WHERE collection_name = $1`, [name])
+        return rows.map((row) => (typeof row.doc === 'string' ? JSON.parse(row.doc) : row.doc))
+      }
+      const persistOne = async (doc) => {
+        const id = String(doc.id || uuidv4())
+        const payload = { ...doc, id }
+        await pool.query(
+          `
+            INSERT INTO ${PG_DOC_TABLE} (collection_name, doc_id, doc, updated_at)
+            VALUES ($1, $2, $3::jsonb, NOW())
+            ON CONFLICT (collection_name, doc_id)
+            DO UPDATE SET doc = EXCLUDED.doc, updated_at = NOW()
+          `,
+          [name, id, JSON.stringify(payload)]
+        )
+      }
+      const removeByIds = async (ids = []) => {
+        if (!ids.length) return 0
+        const { rowCount } = await pool.query(
+          `DELETE FROM ${PG_DOC_TABLE} WHERE collection_name = $1 AND doc_id = ANY($2::text[])`,
+          [name, ids]
+        )
+        return rowCount || 0
+      }
+      return createCollectionAdapter(loadAll, persistOne, removeByIds)
+    }
+  }
+}
+
+async function connectToMongo() {
+  // Kept for compatibility with existing route handlers.
+  if (db) return db
+
+  const connectionString = process.env.POSTGRES_URL || process.env.DATABASE_URL
+  if (!connectionString) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.warn('POSTGRES_URL or DATABASE_URL not set - using in-memory stub DB (development only).')
+      db = createInMemoryDb()
+      return db
+    }
+    throw new Error('POSTGRES_URL or DATABASE_URL not configured')
+  }
+
+  try {
+    if (!pgPool) {
+      pgPool = new Pool({
+        connectionString,
+        ssl: shouldUseSsl(connectionString) ? { rejectUnauthorized: false } : undefined
+      })
+    }
+    await pgPool.query('SELECT 1')
+    await ensurePgSchema(pgPool)
+    db = createPostgresDb(pgPool)
+    return db
+  } catch (error) {
+    console.error('Postgres connection failed:', error?.message || error)
+    try { if (pgPool) await pgPool.end() } catch (_) {}
+    pgPool = null
+    db = null
+    if (process.env.NODE_ENV !== 'production') {
+      console.warn('Postgres unavailable - falling back to in-memory stub DB (development only).')
+      db = createInMemoryDb()
+      return db
+    }
+    throw error
+  }
+}
+
+function getAiSearchBaseUrl() {
+  const raw = String(process.env.AI_SEARCH_BASE_URL || '').trim()
+  if (!raw) return null
+  return raw.replace(/\/+$/, '')
+}
+function isGreetingOrSmallTalk(message = '') {
+  const raw = String(message || '').trim()
+  if (!raw) return false
+
+  const lc = raw.toLowerCase()
+  const compact = lc.replace(/[^a-z\s']/g, ' ').replace(/\s+/g, ' ').trim()
+  const words = compact ? compact.split(' ') : []
+
+  const greetingOnly = /^(hi|hello|hey|yo|hola|good\s+morning|good\s+afternoon|good\s+evening|sup|what'?s\s+up)$/i.test(compact)
+  const simpleSmallTalk = /^(how\s+are\s+you|who\s+are\s+you|what\s+can\s+you\s+do|thanks|thank\s+you)$/i.test(compact)
+
+  return (words.length <= 6 && greetingOnly) || simpleSmallTalk
+}
+
+function mapAiSearchToCrmMatchResponse(aiData = {}, fallbackQuery = '', inputSessionId = null) {
+  const properties = Array.isArray(aiData.properties)
+    ? aiData.properties
+    : (Array.isArray(aiData.search_results) ? aiData.search_results : [])
+
+  const metadataPayload = aiData?.metadata?.crm_payload || {}
+  const finalResponse = (aiData.final_response || aiData.answer || aiData.summary || '').toString().trim()
+  const answer = finalResponse || (fallbackQuery ? `Processed: "${fallbackQuery}"` : 'Your request has been processed.')
+
+  const tasks = Array.isArray(aiData.tasks) ? aiData.tasks : []
+  const alerts = Array.isArray(aiData.alerts) ? aiData.alerts : []
+  const transactions = Array.isArray(aiData.transactions) ? aiData.transactions : []
+
+  return {
+    success: true,
+    source: 'ai_search',
+    intent: aiData.intent || aiData.primary_intent || 'search',
+    answer,
+    ai_recommendations: answer,
+    properties,
+    properties_count: properties.length,
+    suggestions: Array.isArray(aiData.suggestions) ? aiData.suggestions : [],
+    summary: (aiData.summary || answer).toString(),
+    session_id: aiData.session_id || inputSessionId || null,
+    lead: aiData.lead || metadataPayload.lead || null,
+    is_new_lead: Boolean(aiData.is_new_lead ?? metadataPayload.is_new_lead),
+    transactions,
+    tasks,
+    alerts,
+    metadata: aiData.metadata || {}
+  }
+}
+async function tryAiSearchBridge({ query, sessionId = null }) {
+  const baseUrl = getAiSearchBaseUrl()
+  if (!baseUrl || !query) return null
+
+  const text = String(query || '').trim()
+  if (!text) return null
+
+  const payload = {
+    query: text,
+    session_id: sessionId || undefined,
+    use_cache: true,
+  }
+
+  const timeoutMs = Math.max(1000, Number(process.env.AI_SEARCH_TIMEOUT_MS || 120000))
+  const controller = new AbortController()
+  const timeoutRef = setTimeout(() => controller.abort(new Error('AI Search timeout')), timeoutMs)
+  try {
+    const response = await fetch(`${baseUrl}/api/search`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-crm-bridge': '1',
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    })
+
+    if (!response.ok) {
+      const errTxt = await response.text().catch(() => '')
+      throw new Error(`AI Search ${response.status} ${response.statusText}: ${errTxt.slice(0, 300)}`)
+    }
+
+    const aiData = await response.json()
+    return mapAiSearchToCrmMatchResponse(aiData, text, sessionId)
+  } finally {
+    clearTimeout(timeoutRef)
+  }
+}
+function parseAssistantJsonResponseSafe(rawText = '') {
+  const text = String(rawText || '').trim()
+  if (!text) return null
+
+  try {
+    return JSON.parse(text)
+  } catch (_) {}
+
+  const first = text.indexOf('{')
+  const last = text.lastIndexOf('}')
+  if (first >= 0 && last > first) {
+    const candidate = text.slice(first, last + 1)
+    try {
+      return JSON.parse(candidate)
+    } catch (_) {
+      try {
+        const cleaned = candidate.replace(/,\s*([}\]])/g, '$1')
+        return JSON.parse(cleaned)
+      } catch (_) {}
+    }
+  }
+
+  return null
+}
+
+function heuristicAssistantParseSafe(message = '') {
+  const text = String(message || '')
+  const lc = text.toLowerCase()
+
+  const leadType = /\b(seller|selling|list(?:ing)?)\b/.test(lc) ? 'seller' : 'buyer'
+  const nameMatch = text.match(/\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b/)
+  const zipMatch = text.match(/\b(\d{5})(?:-\d{4})?\b/)
+  const bedMatch = lc.match(/(\d+(?:\.\d+)?)\s*(?:bhk|bed(?:room)?s?|br)\b/)
+  const bathMatch = lc.match(/(\d+(?:\.\d+)?)\s*(?:bath(?:room)?s?|ba)\b/)
+  const underPrice = lc.match(/\b(?:under|below|upto|up to|max(?:imum)?|<=?)\s*\$?\s*([\d,.]+)\s*(k|m|million|thousand)?\b/)
+  const abovePrice = lc.match(/\b(?:above|over|at least|min(?:imum)?|>=?)\s*\$?\s*([\d,.]+)\s*(k|m|million|thousand)?\b/)
+  const inCity = text.match(/\bin\s+([A-Za-z]+(?:\s+[A-Za-z]+){0,2})\b/i)
+  const city = inCity ? inCity[1].trim() : null
+
+  const toNumber = (raw, unit) => {
+    if (!raw) return null
+    const base = Number(String(raw).replace(/,/g, ''))
+    if (!Number.isFinite(base)) return null
+    const u = String(unit || '').toLowerCase()
+    if (u === 'k' || u === 'thousand') return Math.round(base * 1000)
+    if (u === 'm' || u === 'million') return Math.round(base * 1000000)
+    return Math.round(base)
+  }
+
+  return {
+    lead_info: {
+      name: nameMatch ? nameMatch[1] : null,
+      phone: null,
+      email: null,
+      lead_type: leadType
+    },
+    preferences: {
+      zipcode: zipMatch ? zipMatch[1] : null,
+      city,
+      state: null,
+      min_price: abovePrice ? toNumber(abovePrice[1], abovePrice[2]) : null,
+      max_price: underPrice ? toNumber(underPrice[1], underPrice[2]) : null,
+      bedrooms: bedMatch ? Number(bedMatch[1]) : null,
+      bathrooms: bathMatch ? Number(bathMatch[1]) : null,
+      property_type: null
+    },
+    transaction_info: {
+      property_address: null,
+      transaction_type: null,
+      price: null,
+      listing_price: null,
+      contract_price: null,
+      closing_date: null
+    },
+    intent: /\b(find|show|search|properties|listing)\b/.test(lc) ? 'find_properties' : 'other',
+    summary: text.slice(0, 140) || 'Parsed from heuristic fallback'
+  }
+}
 // Fetch images for a single property by provider ID or address parts
 async function fetchPropertyImages(query = {}) {
   const { id, address, city, state, zipcode } = query
@@ -358,8 +830,8 @@ class OpenAIUtility {
       ? process.env.GROQ_API_KEY
       : process.env.OPENAI_API_KEY
     this.baseURL = this.provider === 'groq'
-      ? 'https://api.groq.com/openai/v1'
-      : 'https://api.openai.com/v1'
+      ? (process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1')
+      : (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1')
     this.defaultModel = this.provider === 'groq'
       ? (process.env.GROQ_MODEL || 'openai/gpt-oss-120b')
       : (process.env.OPENAI_MODEL || 'gpt-4o-mini')
@@ -376,6 +848,11 @@ class OpenAIUtility {
       'gpt-4o-mini': { input: 128000, output: 16000, cost_per_1k_input: 0.00015, cost_per_1k_output: 0.0006 },
       'o1-mini': { input: 128000, output: 65536, cost_per_1k_input: 0.003, cost_per_1k_output: 0.012 },
       'gpt-4o': { input: 128000, output: 4096, cost_per_1k_input: 0.005, cost_per_1k_output: 0.015 },
+      'gpt-5': { input: 400000, output: 128000, cost_per_1k_input: 0.00025, cost_per_1k_output: 0.002 },
+      'claude-sonnet-4.5': { input: 1000000, output: 64000, cost_per_1k_input: 0.0006, cost_per_1k_output: 0.003 },
+      'anthropic/claude-sonnet-4.5': { input: 1000000, output: 64000, cost_per_1k_input: 0.0006, cost_per_1k_output: 0.003 },
+      'claude-opus-4.5': { input: 200000, output: 32000, cost_per_1k_input: 0.001, cost_per_1k_output: 0.005 },
+      'anthropic/claude-opus-4.5': { input: 200000, output: 32000, cost_per_1k_input: 0.001, cost_per_1k_output: 0.005 },
       // Groq-hosted OSS model (OpenAI-compatible endpoint)
       'openai/gpt-oss-120b': { input: 131072, output: 65536, cost_per_1k_input: groqInputCost, cost_per_1k_output: groqOutputCost }
     }
@@ -395,14 +872,31 @@ class OpenAIUtility {
   normalizeModel(inputModel) {
     let model = inputModel || this.defaultModel
 
+    // Normalize common provider-prefixed aliases from OpenAI-compatible gateways.
+    const aliasMap = {
+      'openai/gpt-5': 'gpt-5',
+      'openai/gpt-4o': 'gpt-4o',
+      'claude-sonnet-4.5': 'anthropic/claude-sonnet-4.5',
+      'claude-opus-4.5': 'anthropic/claude-opus-4.5'
+    }
+    model = aliasMap[model] || model
+
     // Preserve existing call-sites and remap aliases based on active provider.
     if (this.provider === 'groq') {
       if (model === 'o1-mini' || model === 'gpt-4o-mini' || model === 'gpt-4o') {
         model = this.defaultModel
       }
-    } else if (model === 'o1-mini') {
-      // Existing internal alias for OpenAI flows.
-      model = 'gpt-4o-mini'
+    } else {
+      const hardcodedOpenAiAliases = new Set(['o1-mini', 'gpt-4o-mini', 'gpt-4o'])
+      const defaultIsCustomGatewayModel = !hardcodedOpenAiAliases.has(this.defaultModel)
+
+      // When a custom OpenAI-compatible gateway model is configured, prefer it over internal hardcoded aliases.
+      if (defaultIsCustomGatewayModel && hardcodedOpenAiAliases.has(model)) {
+        model = this.defaultModel
+      } else if (model === 'o1-mini') {
+        // Existing internal alias for OpenAI-native flows.
+        model = 'gpt-4o-mini'
+      }
     }
 
     if (!this.tokenLimits[model]) {
@@ -420,7 +914,7 @@ class OpenAIUtility {
   estimateTokenCount(text, model = this.defaultModel) {
     if (!text) return 0
     
-    // Rough approximation: 1 token ≈ 4 characters for English text
+    // Rough approximation: 1 token ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â°ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â  4 characters for English text
     // More accurate for code and structured content
     const baseCount = Math.ceil(text.length / 4)
     
@@ -429,6 +923,11 @@ class OpenAIUtility {
       'gpt-4o-mini': 1.0,
       'o1-mini': 1.1, // O1 models tend to use slightly more tokens
       'gpt-4o': 1.0,
+      'gpt-5': 1.0,
+      'claude-sonnet-4.5': 1.0,
+      'anthropic/claude-sonnet-4.5': 1.0,
+      'claude-opus-4.5': 1.0,
+      'anthropic/claude-opus-4.5': 1.0,
       'openai/gpt-oss-120b': 1.0
     }
     
@@ -753,9 +1252,9 @@ class OpenAIUtility {
 
     // Console logging for monitoring
     if (requestInfo.success) {
-      console.log(`✅ ${this.provider.toUpperCase()} ${requestInfo.model}: ${requestInfo.inputTokens}+${requestInfo.outputTokens} tokens, $${requestInfo.cost.toFixed(4)}, ${requestInfo.responseTime}ms`)
+      console.log(`ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ ${this.provider.toUpperCase()} ${requestInfo.model}: ${requestInfo.inputTokens}+${requestInfo.outputTokens} tokens, $${requestInfo.cost.toFixed(4)}, ${requestInfo.responseTime}ms`)
     } else {
-      console.error(`❌ ${this.provider.toUpperCase()} ${requestInfo.model} failed: ${requestInfo.error.message}`)
+      console.error(`ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ ${this.provider.toUpperCase()} ${requestInfo.model} failed: ${requestInfo.error.message}`)
     }
   }
 
@@ -816,7 +1315,7 @@ class OpenAIUtility {
   resetDailyUsage() {
     this.totalCost = 0
     this.requestLog = []
-    console.log('✅ Daily usage reset')
+    console.log('ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ Daily usage reset')
   }
 }
 
@@ -2316,11 +2815,13 @@ async function checkDuplicateLead(db, email, phone) {
 }
 
 async function generateLeadInsights(lead, properties = []) {
-  const leadType = String(lead?.lead_type || '').toLowerCase()
+  const safeLead = lead && typeof lead === 'object' ? lead : {}
+  const leadName = safeLead.name || 'Unknown Lead'
+  const leadType = String(safeLead?.lead_type || '').toLowerCase()
 
   // Seller: provide valuation/pricing/listing-prep insights. Do NOT fetch listings.
   if (leadType === 'seller') {
-    const prefs = lead?.preferences || {}
+    const prefs = safeLead?.preferences || {}
     const sellerAddress = prefs.seller_address || prefs.address || null
     const sellerPrice = prefs.seller_price ?? prefs.asking_price ?? null
     // Normalize seller detail fields so the AI has explicit structured facts
@@ -2348,7 +2849,7 @@ async function generateLeadInsights(lead, properties = []) {
       },
       {
         role: "user",
-        content: `Lead: ${lead.name} (seller)
+        content: `Lead: ${leadName} (seller)
 Seller Details (structured JSON): ${JSON.stringify(sellerDetails)}
 
 Instructions:
@@ -2379,7 +2880,7 @@ ${sellerAddress ? '- Suggest obtaining a CMA for the specific address.' : ''}`
   let fetchedProps = properties
   try {
     if (!Array.isArray(fetchedProps) || fetchedProps.length === 0) {
-      const filters = mapLeadPreferencesToFilters(lead?.preferences || {})
+      const filters = mapLeadPreferencesToFilters(safeLead?.preferences || {})
       const res = await fetchProperties(filters)
       fetchedProps = res?.properties || []
 
@@ -2415,8 +2916,8 @@ ${sellerAddress ? '- Suggest obtaining a CMA for the specific address.' : ''}`
     },
     {
       role: "user",
-      content: `Lead: ${lead.name} (${lead.lead_type})
-      Preferences: ${JSON.stringify(lead.preferences)}
+      content: `Lead: ${leadName} (${leadType || 'buyer'})
+      Preferences: ${JSON.stringify(safeLead.preferences || {})}
       Candidate Properties (up to 5): ${JSON.stringify(topProps)}
 
       Rules:
@@ -2728,7 +3229,7 @@ async function handleRoute(request, { params }) {
       }
 
       if (matchingPool.length === 0 && (minPrice !== null || maxPrice !== null)) {
-        // Expand price by ±10%
+        // Expand price by ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±10%
         const adjMin = minPrice !== null ? Math.floor(minPrice * 0.9) : null
         const adjMax = maxPrice !== null ? Math.ceil(maxPrice * 1.1) : null
         matchingPool = properties.filter(p => {
@@ -3008,23 +3509,21 @@ async function handleRoute(request, { params }) {
           }
         ]
 
-        const response = await callOpenAI('gpt-4o-mini', messages, { maxTokens: 500 })
+        const response = await callOpenAI('gpt-4o-mini', messages, { maxTokens: 700, temperature: 0 })
         
         if (!response) {
           throw new Error('No response from OpenAI')
         }
         
         // Parse model response to JSON and return
-        let parsed
-        try {
-          parsed = JSON.parse(response)
-        } catch (parseErr) {
-          console.error('Assistant parse JSON error:', parseErr, 'Raw:', response)
+        const parsed = parseAssistantJsonResponseSafe(response)
+        if (!parsed) {
+          console.warn('Assistant parse JSON error: using heuristic fallback. Raw:', response)
           return handleCORS(NextResponse.json({
-            success: false,
-            error: 'Could not parse AI response',
-            raw: response
-          }, { status: 502 }))
+            success: true,
+            parsed_data: heuristicAssistantParseSafe(body.message),
+            parse_fallback: 'heuristic'
+          }))
         }
 
         return handleCORS(NextResponse.json({ success: true, parsed_data: parsed }))
@@ -3048,6 +3547,30 @@ async function handleRoute(request, { params }) {
         let query = (body.query || body.text || body.message || original_message || '').toString()
         if (!original_message && query) original_message = query
 
+        // AI Search bridge (optional): if AI_SEARCH_BASE_URL is set, route through Snaphomz-ai-search tool framework first.
+        const skipAiSearchBridge =
+          body?.skip_ai_search_bridge === true ||
+          String(body?.skip_ai_search_bridge || '').toLowerCase() === 'true' ||
+          request.headers.get('x-ai-search-bridge') === '1'
+
+        const skipAiInsights =
+          body?.skip_ai_insights === true ||
+          String(body?.skip_ai_insights || '').toLowerCase() === 'true'
+
+        const skipPropertySearch =
+          body?.skip_property_search === true ||
+          String(body?.skip_property_search || '').toLowerCase() === 'true'
+
+        if (query && !skipAiSearchBridge) {
+          try {
+            const external = await tryAiSearchBridge({ query, sessionId: body.session_id || body.ai_session_id || null })
+            if (external?.success) {
+              return handleCORS(NextResponse.json(external))
+            }
+          } catch (bridgeError) {
+            console.warn('AI Search bridge failed, falling back to CRM assistant:', bridgeError?.message || bridgeError)
+          }
+        }
         // Backward compatibility: if parsed_data missing, invoke the heavy parser internally
         if (!parsed_data && query) {
           try {
@@ -3205,8 +3728,8 @@ async function handleRoute(request, { params }) {
 
             // timeline
             if (/\basap\b|\bimmediately\b|\bright away\b/.test(l)) out.seller_timeline = 'asap'
-            else if (/(30|thirty)\s*[–-]?\s*(60|sixty)\s*days/.test(l)) out.seller_timeline = '30_60'
-            else if (/(60|sixty)\s*[–-]?\s*(90|ninety)\s*days/.test(l)) out.seller_timeline = '60_90'
+            else if (/(30|thirty)\s*[ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ-]?\s*(60|sixty)\s*days/.test(l)) out.seller_timeline = '30_60'
+            else if (/(60|sixty)\s*[ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ-]?\s*(90|ninety)\s*days/.test(l)) out.seller_timeline = '60_90'
             else if (/(90|ninety)\+?\s*days/.test(l)) out.seller_timeline = '90_plus'
 
             // HOA
@@ -3221,8 +3744,92 @@ async function handleRoute(request, { params }) {
             if (price) out.seller_price = price
 
           } catch { /* ignore */ }
-          return out
-        }
+  return out
+}
+
+function parseAssistantJsonResponse(rawText = '') {
+  const text = String(rawText || '').trim()
+  if (!text) return null
+
+  // 1) Direct parse
+  try {
+    return JSON.parse(text)
+  } catch (_) {}
+
+  // 2) Extract the outermost JSON object block
+  const first = text.indexOf('{')
+  const last = text.lastIndexOf('}')
+  if (first >= 0 && last > first) {
+    const candidate = text.slice(first, last + 1)
+    try {
+      return JSON.parse(candidate)
+    } catch (_) {
+      // 3) Remove trailing commas and retry
+      try {
+        const cleaned = candidate.replace(/,\s*([}\]])/g, '$1')
+        return JSON.parse(cleaned)
+      } catch (_) {}
+    }
+  }
+
+  return null
+}
+
+function heuristicAssistantParse(message = '') {
+  const text = String(message || '')
+  const lc = text.toLowerCase()
+
+  const leadType = /\b(seller|selling|list(?:ing)?)\b/.test(lc) ? 'seller' : 'buyer'
+  const nameMatch = text.match(/\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b/)
+  const zipMatch = text.match(/\b(\d{5})(?:-\d{4})?\b/)
+  const bedMatch = lc.match(/(\d+(?:\.\d+)?)\s*(?:bhk|bed(?:room)?s?|br)\b/)
+  const bathMatch = lc.match(/(\d+(?:\.\d+)?)\s*(?:bath(?:room)?s?|ba)\b/)
+  const underPrice = lc.match(/\b(?:under|below|upto|up to|max(?:imum)?|<=?)\s*\$?\s*([\d,.]+)\s*(k|m|million|thousand)?\b/)
+  const abovePrice = lc.match(/\b(?:above|over|at least|min(?:imum)?|>=?)\s*\$?\s*([\d,.]+)\s*(k|m|million|thousand)?\b/)
+  const inCity = text.match(/\bin\s+([A-Za-z]+(?:\s+[A-Za-z]+){0,2})\b/i)
+  const city = inCity ? inCity[1].trim() : null
+
+  const toNumber = (raw, unit) => {
+    if (!raw) return null
+    const base = Number(String(raw).replace(/,/g, ''))
+    if (!Number.isFinite(base)) return null
+    const u = String(unit || '').toLowerCase()
+    if (u === 'k' || u === 'thousand') return Math.round(base * 1000)
+    if (u === 'm' || u === 'million') return Math.round(base * 1000000)
+    return Math.round(base)
+  }
+
+  const parsed = {
+    lead_info: {
+      name: nameMatch ? nameMatch[1] : null,
+      phone: null,
+      email: null,
+      lead_type: leadType
+    },
+    preferences: {
+      zipcode: zipMatch ? zipMatch[1] : null,
+      city: city,
+      state: null,
+      min_price: abovePrice ? toNumber(abovePrice[1], abovePrice[2]) : null,
+      max_price: underPrice ? toNumber(underPrice[1], underPrice[2]) : null,
+      bedrooms: bedMatch ? Number(bedMatch[1]) : null,
+      bathrooms: bathMatch ? Number(bathMatch[1]) : null,
+      property_type: null
+    },
+    transaction_info: {
+      property_address: null,
+      transaction_type: null,
+      price: null,
+      listing_price: null,
+      contract_price: null,
+      closing_date: null
+    },
+    intent: /\b(find|show|search|properties|listing)\b/.test(lc) ? 'find_properties' : 'other',
+    summary: text.slice(0, 140) || 'Parsed from heuristic fallback'
+  }
+
+  return parsed
+}
 
         if ((lead_info.lead_type || '').toLowerCase() === 'seller') {
           preferences = preferences || {}
@@ -3345,11 +3952,16 @@ async function handleRoute(request, { params }) {
             lead = await db.collection('leads').findOne({ id: lead.id })
           }
         } else {
-          filters = mapLeadPreferencesToFilters(effectivePrefs)
-          const propertySearchResult = await searchProperties(filters)
-          properties = Array.isArray(propertySearchResult)
-            ? propertySearchResult
-            : (propertySearchResult?.properties || [])
+          if (skipPropertySearch) {
+            properties = []
+            filters = mapLeadPreferencesToFilters(effectivePrefs)
+          } else {
+            filters = mapLeadPreferencesToFilters(effectivePrefs)
+            const propertySearchResult = await searchProperties(filters)
+            properties = Array.isArray(propertySearchResult)
+              ? propertySearchResult
+              : (propertySearchResult?.properties || [])
+          }
         }
 
         // Step 3: Optionally create a transaction if requested
@@ -3407,17 +4019,21 @@ async function handleRoute(request, { params }) {
 
         // Step 4: AI recommendations/confirmation
         let aiRecommendations = ''
-        try {
-          if (leadType === 'seller') {
-            // Seller-focused insights: valuation/pricing/listing-prep, no property suggestions
-            aiRecommendations = await generateLeadInsights(lead, [])
-          } else {
-            // Buyer-focused insights that can leverage the found properties
-            aiRecommendations = await generateLeadInsights(lead, properties)
-          }
-        } catch (e) {
-          console.warn('AI recommendation generation failed:', e)
+        if (skipAiInsights) {
           aiRecommendations = 'Your request has been processed.'
+        } else {
+          try {
+            if (leadType === 'seller') {
+              // Seller-focused insights: valuation/pricing/listing-prep, no property suggestions
+              aiRecommendations = await generateLeadInsights(lead, [])
+            } else {
+              // Buyer-focused insights that can leverage the found properties
+              aiRecommendations = await generateLeadInsights(lead, properties)
+            }
+          } catch (e) {
+            console.warn('AI recommendation generation failed:', e)
+            aiRecommendations = 'Your request has been processed.'
+          }
         }
 
         // Step 4b: Missing field detection for seller slot-filling
@@ -4808,17 +5424,17 @@ async function handleRoute(request, { params }) {
           const sellerPrice = prefs.seller_price ?? prefs.asking_price
           const bullets = [
             `Name: ${lead.name}${lead.lead_type ? ` (${lead.lead_type})` : ''}`,
-            `Contact: ${lead.email || '—'} | ${lead.phone || '—'}`,
+            `Contact: ${lead.email || 'ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â'} | ${lead.phone || 'ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â'}`,
             sellerAddress ? `Address: ${sellerAddress}` : null,
             sellerPrice != null ? `Asking price: $${Number(sellerPrice).toLocaleString()}` : null,
-            prefs.seller_property_type ? `Property: ${prefs.seller_property_type}${prefs.seller_bedrooms ? ` • ${prefs.seller_bedrooms} bd` : ''}${prefs.seller_bathrooms ? ` • ${prefs.seller_bathrooms} ba` : ''}` : null,
+            prefs.seller_property_type ? `Property: ${prefs.seller_property_type}${prefs.seller_bedrooms ? ` ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ ${prefs.seller_bedrooms} bd` : ''}${prefs.seller_bathrooms ? ` ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ ${prefs.seller_bathrooms} ba` : ''}` : null,
             prefs.seller_year_built ? `Year built: ${prefs.seller_year_built}` : null,
             prefs.seller_square_feet ? `Size: ${prefs.seller_square_feet} sqft` : null,
             prefs.seller_lot_size ? `Lot: ${prefs.seller_lot_size}` : null,
             prefs.seller_condition ? `Condition: ${prefs.seller_condition}` : null,
             prefs.seller_occupancy ? `Occupancy: ${prefs.seller_occupancy}` : null,
             prefs.seller_timeline ? `Timeline to list: ${prefs.seller_timeline}` : null,
-            prefs.seller_hoa_fee != null ? `HOA: ${prefs.seller_hoa_fee ? `$${Number(prefs.seller_hoa_fee).toLocaleString()}/mo` : '—'}` : null,
+            prefs.seller_hoa_fee != null ? `HOA: ${prefs.seller_hoa_fee ? `$${Number(prefs.seller_hoa_fee).toLocaleString()}/mo` : 'ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â'}` : null,
             prefs.seller_description ? `Notes: ${prefs.seller_description}` : null,
             lead.updated_at ? `Last updated: ${new Date(lead.updated_at).toLocaleString()}` : null
           ]
@@ -4828,13 +5444,13 @@ async function handleRoute(request, { params }) {
           const actions = []
           const soonish = (prefs.seller_timeline || '').toString().toLowerCase().includes('week') || (prefs.seller_timeline || '').toString().toLowerCase().includes('soon')
           actions.push('Schedule a listing consultation and walkthrough')
-          actions.push('Prepare CMA with 3–5 comps and pricing strategy')
+          actions.push('Prepare CMA with 3ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ5 comps and pricing strategy')
           if (prefs.seller_condition && /needs|repair|fix|update/i.test(prefs.seller_condition)) actions.push('Outline repair/refresh plan (paint, fixtures, minor repairs)')
           else actions.push('Create a light staging/declutter checklist')
           actions.push('Book professional photography and floor plan')
           actions.push('Gather docs: HOA, disclosures, utility averages, survey')
           actions.push('Draft listing timeline and MLS remarks')
-          if (soonish) actions.push('Expedite prep: compress timeline to 1–2 weeks with daily checkpoints')
+          if (soonish) actions.push('Expedite prep: compress timeline to 1ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ2 weeks with daily checkpoints')
           const nextSteps = makeAnswer('Suggested next steps:', actions)
 
           // Optional AI insights reuse
@@ -5025,7 +5641,7 @@ async function handleRoute(request, { params }) {
             reasonBits.push(`Due in ${daysLeft} day${daysLeft === 1 ? '' : 's'}`)
           }
           if (t.client_name) reasonBits.push(`Client: ${t.client_name}`)
-          const labelDue = isNaN(due) ? '—' : (urgency === 'due_today' ? 'today' : `due ${due.toLocaleDateString()}`)
+          const labelDue = isNaN(due) ? 'ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â' : (urgency === 'due_today' ? 'today' : `due ${due.toLocaleDateString()}`)
           nbaItems.push({
             key: `task:${t.id}`,
             type: 'task',
@@ -5038,7 +5654,7 @@ async function handleRoute(request, { params }) {
             priority_score,
             urgency,
             impact: 'medium',
-            reason: reasonBits.join(' • '),
+            reason: reasonBits.join(' ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ '),
             can_auto_complete: false,
             source: tag
           })
@@ -5190,7 +5806,7 @@ async function handleRoute(request, { params }) {
             const { est_duration_min, priority_score, urgency } = estimateTask(t)
             const tx = txMap.get(t.transaction_id)
             const due = t.due_date ? new Date(t.due_date) : null
-            const labelDue = due ? (due.toDateString() === new Date().toDateString() ? 'today' : `due ${due.toLocaleDateString()}`) : '—'
+            const labelDue = due ? (due.toDateString() === new Date().toDateString() ? 'today' : `due ${due.toLocaleDateString()}`) : 'ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â'
             items.push({
               key: `task:${t.id}`,
               type: 'task',
@@ -5240,7 +5856,7 @@ async function handleRoute(request, { params }) {
           items = tasks.map(t => {
             const { est_duration_min, priority_score, urgency } = estimateTask(t)
             const due = t.due_date ? new Date(t.due_date) : null
-            const labelDue = due ? (due >= startOfToday && due <= endOfToday ? 'today' : `due ${due.toLocaleDateString()}`) : '—'
+            const labelDue = due ? (due >= startOfToday && due <= endOfToday ? 'today' : `due ${due.toLocaleDateString()}`) : 'ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â'
             const tx = txMap.get(t.transaction_id)
             return {
               key: `task:${t.id}`,
@@ -5867,3 +6483,11 @@ export const POST = handleRoute
 export const PUT = handleRoute
 export const DELETE = handleRoute
 export const PATCH = handleRoute
+
+
+
+
+
+
+
+

@@ -2,129 +2,87 @@
 
 ## Prerequisites
 
-- Node.js 18+ and Yarn
-- MongoDB (local or cloud instance)
-- OpenAI API Key
-- Real Estate API Key
+- Node.js 18+
+- PostgreSQL (local, Docker, Supabase, Neon, Render, etc.)
+- GROQ API key (or OpenAI API key if you choose OpenAI provider)
+- RealEstateAPI key
+- AWS Cognito User Pool + App Client (for login)
 
 ## Environment Setup
 
-1. **Clone the repository**
-   ```bash
-   git clone <your-repo-url>
-   cd real-estate-crm
-   ```
+Create or edit `.env.local` in the project root:
 
-2. **Install dependencies**
-   ```bash
-   yarn install
-   ```
+```env
+# Database (required)
+POSTGRES_URL=postgres://USER:PASSWORD@HOST:5432/DBNAME
+# You can use DATABASE_URL instead of POSTGRES_URL if preferred
 
-3. **Configure environment variables**
-   ```bash
-   cp .env.example .env
-   ```
-   
-   Then edit `.env` with your actual values:
-   
-   ```env
-   # Database Configuration
-   MONGO_URL=mongodb://localhost:27017
-   DB_NAME=realestatecrm
-   
-   # External URL for production
-   NEXT_PUBLIC_BASE_URL=https://your-domain.com
-   
-   # OpenAI API Configuration
-   # Get your API key from: https://platform.openai.com/api-keys
-   OPENAI_API_KEY=your-openai-api-key-here
-   
-   # Real Estate API Configuration  
-   # Get your API key from: https://developer.realestateapi.com/
-   REAL_ESTATE_API_KEY=your-real-estate-api-key-here
-   ```
+# Optional external URL (production)
+NEXT_PUBLIC_BASE_URL=https://your-domain.com
 
-## Required API Keys
+# AI provider
+AI_PROVIDER=groq
+GROQ_API_KEY=your-groq-api-key
+OPENAI_MODEL=openai/gpt-oss-120b
 
-### OpenAI API Key
-1. Visit https://platform.openai.com/api-keys
-2. Sign in or create an account
-3. Create a new API key
-4. Copy the key and add it to your `.env` file
+# Real estate data
+REAL_ESTATE_API_KEY=your-realestateapi-key
+REAL_ESTATE_USER_ID=CRMApp
 
-### Real Estate API Key
-1. Visit https://developer.realestateapi.com/
-2. Sign up for an account
-3. Generate an API key
-4. Copy the key and add it to your `.env` file
+# Optional: bridge CRM assistant to local Snaphomz-ai-search
+AI_SEARCH_BASE_URL=http://localhost:8001
 
-## Running the Application
-
-### Development Mode
-```bash
-yarn dev
+# Cognito auth (required to enable login gate)
+NEXT_PUBLIC_COGNITO_REGION=us-east-1
+NEXT_PUBLIC_COGNITO_USER_POOL_ID=us-east-1_xxxxxxxx
+NEXT_PUBLIC_COGNITO_CLIENT_ID=xxxxxxxxxxxxxxxxxxxxxxxxxx
+NEXT_PUBLIC_COGNITO_DOMAIN=your-domain-prefix.auth.us-east-1.amazoncognito.com
+NEXT_PUBLIC_COGNITO_REDIRECT_URI=http://localhost:3000/auth/callback
+NEXT_PUBLIC_COGNITO_LOGOUT_URI=http://localhost:3000
 ```
 
-The application will be available at `http://localhost:3000`
+## Cognito App Client Settings
 
-### Production Mode
+In Cognito User Pool -> App integration -> App client:
+
+1. Enable Authorization code grant.
+2. Allowed callback URL: `http://localhost:3000/auth/callback`
+3. Allowed sign-out URL: `http://localhost:3000`
+4. Scopes: `openid`, `email`, `profile`
+
+## Install and Run (npm)
+
 ```bash
-yarn build
-yarn start
+npm install
+npm run dev:no-reload
 ```
 
-## Database Setup
+App URL: `http://localhost:3000`
 
-### MongoDB Setup
-1. Install MongoDB locally or use MongoDB Atlas (cloud)
-2. Update `MONGO_URL` in your `.env` file
-3. Run the seed script to populate initial data:
-   ```bash
-   node seed-data.js
-   ```
+## Seed Sample Data
 
-## Features
+```bash
+node seed-data.js
+```
 
-- **Lead Management**: CRUD operations for real estate leads
-- **AI Assistant**: Natural language processing for lead and property matching
-- **Property Search**: Integration with Real Estate API for property listings
-- **Transaction Timeline**: Track deals through various stages
-- **Deal Summary**: AI-powered deal analysis and alerts
-- **Smart Alerts**: Automated notifications for overdue tasks
+The seed script writes sample leads into Postgres table `crm_documents` (collection `leads`).
 
-## API Routes
+## Production
 
-All backend API routes are prefixed with `/api/`:
-
-- `/api/leads` - Lead management
-- `/api/assistant` - AI assistant functionality
-- `/api/properties` - Property search
-- `/api/transactions` - Transaction management
-- `/api/deals` - Deal summaries and alerts
-
-## Security Notes
-
-- Never commit your `.env` file to version control
-- The `.gitignore` file is configured to ignore all environment files
-- Use the provided `.env.example` as a template
-- Store sensitive API keys securely
+```bash
+npm run build
+npm run start
+```
 
 ## Troubleshooting
 
-1. **Port 3000 already in use**: Stop any other processes using port 3000
-2. **MongoDB connection issues**: Verify your `MONGO_URL` is correct
-3. **API key errors**: Ensure your API keys are valid and have sufficient quota
-4. **502 Bad Gateway**: Check if all services are running and properly configured
-
-## Project Structure
-
-```
-/app/
-├── app/
-│   ├── api/[[...path]]/route.js  # Backend API routes
-│   ├── page.js                   # Main dashboard
-│   └── layout.js                 # App layout
-├── components/                   # React components
-├── lib/utils/                   # Utility functions
-└── .env.example                 # Environment template
-```
+1. `POSTGRES_URL or DATABASE_URL not configured`:
+   - Add `POSTGRES_URL` in `.env.local` and restart dev server.
+2. `connect ECONNREFUSED ... 5432`:
+   - Postgres is not running or host/port is wrong.
+3. RealEstateAPI `401 Unauthorized`:
+   - Replace placeholder key with a valid paid/active key.
+4. AI fallback/template responses:
+   - Ensure `AI_PROVIDER=groq` and `GROQ_API_KEY` are set, then restart dev server.
+5. Cognito keeps returning to login:
+   - Verify callback/sign-out URLs in Cognito exactly match your `.env.local` values.

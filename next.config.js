@@ -4,12 +4,15 @@ const nextConfig = {
     unoptimized: true,
   },
   experimental: {
-    // Remove if not using Server Components
-    serverComponentsExternalPackages: ['mongodb'],
+    // Keep DB driver external to server component bundling.
+    serverComponentsExternalPackages: ['pg'],
   },
   webpack(config, { dev }) {
-    // Use Next.js defaults for file watching in dev to avoid HMR/asset 404 issues
-    // Remove custom watchOptions that were too aggressive and could evict entries.
+    // OneDrive can race with .next filesystem cache and cause missing vendor-chunks warnings.
+    // Disable webpack fs cache in dev for stability.
+    if (dev) {
+      config.cache = false;
+    }
     return config;
   },
   // Keep dev chunks/pages warm much longer; helps avoid ChunkLoadError after idle periods.
@@ -39,3 +42,4 @@ const nextConfig = {
 };
 
 module.exports = nextConfig;
+
