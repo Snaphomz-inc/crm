@@ -96,6 +96,13 @@ function toAuthError(error) {
   return error?.message || error?.code || String(error)
 }
 
+function toAuthException(error) {
+  const wrapped = new Error(toAuthError(error))
+  wrapped.code = error?.code || null
+  wrapped.raw = error || null
+  return wrapped
+}
+
 function patchFetchForApiAuth() {
   if (typeof window === 'undefined') return () => {}
   if (window.__crmFetchAuthPatched) return () => {}
@@ -154,10 +161,108 @@ export function CognitoAuthProvider({ children }) {
 
   const makeUsername = (email) => String(email || '').trim().toLowerCase()
 
+  const getSignupUsernameMapKey = () => `crm.cognito.signup-username-map.${config.userPoolId}.${config.clientId}`
+
+  const readSignupUsernameMap = () => {
+    if (typeof window === 'undefined') return {}
+    try {
+      const raw = window.localStorage.getItem(getSignupUsernameMapKey())
+      if (!raw) return {}
+      const parsed = JSON.parse(raw)
+      return parsed && typeof parsed === 'object' ? parsed : {}
+    } catch {
+      return {}
+    }
+  }
+
+  const writeSignupUsernameMap = (mapValue) => {
+    if (typeof window === 'undefined') return
+    try {
+      window.localStorage.setItem(getSignupUsernameMapKey(), JSON.stringify(mapValue || {}))
+    } catch {}
+  }
+
+  const getMappedSignupUsername = (email) => {
+    const normalizedEmail = makeUsername(email)
+    if (!normalizedEmail) return ''
+    const mapValue = readSignupUsernameMap()
+    return String(mapValue?.[normalizedEmail] || '').trim()
+  }
+
+  const rememberSignupUsername = (email, username) => {
+    const normalizedEmail = makeUsername(email)
+    const normalizedUsername = String(username || '').trim()
+    if (!normalizedEmail || !normalizedUsername) return
+
+    const mapValue = readSignupUsernameMap()
+    mapValue[normalizedEmail] = normalizedUsername
+    writeSignupUsernameMap(mapValue)
+  }
+
+  const hashFNV1a = (input) => {
+    let hash = 2166136261
+    const text = String(input || '')
+    for (let i = 0; i < text.length; i++) {
+      hash ^= text.charCodeAt(i)
+      hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24)
+    }
+    return (hash >>> 0).toString(36)
+  }
+
+  const makeAliasCompatibleUsername = (email) => {
+    const normalizedEmail = makeUsername(email)
+    if (!normalizedEmail) return ''
+
+    const localPart = normalizedEmail.split('@')[0].replace(/[^a-z0-9]/g, '').slice(0, 12) || 'user'
+    const salt = `${config.userPoolId}:${config.clientId}:${normalizedEmail}`
+    const digest = hashFNV1a(salt)
+    return `u_${localPart}_${digest}`
+  }
+
+  const shouldRetrySignUpWithInternalUsername = (error) => {
+    const msg = String(error?.message || '').toLowerCase()
+    const code = String(error?.code || '').toLowerCase()
+    if (code !== 'invalidparameterexception') return false
+    return msg.includes('username cannot be of email format') || msg.includes('configured for email alias')
+  }
+
   const makeUser = (email) => new CognitoUser({
     Username: makeUsername(email),
     Pool: getPool(),
   })
+
+  const isUserNotFoundError = (error) => {
+    const code = String(error?.code || '').toLowerCase()
+    const message = String(error?.message || '').toLowerCase()
+    return code === 'usernotfoundexception' || message.includes('user does not exist')
+  }
+
+  const getUsernameCandidates = (email) => {
+    const normalizedEmail = makeUsername(email)
+    if (!normalizedEmail) return []
+    const mapped = getMappedSignupUsername(normalizedEmail)
+    const generated = makeAliasCompatibleUsername(normalizedEmail)
+    return [...new Set([mapped, normalizedEmail, generated].filter(Boolean))]
+  }
+
+  const runWithUsernameCandidates = async (email, runner) => {
+    const candidates = getUsernameCandidates(email)
+    let lastError = null
+
+    for (let i = 0; i < candidates.length; i++) {
+      const username = candidates[i]
+      try {
+        return await runner(username)
+      } catch (err) {
+        lastError = err
+        if (!isUserNotFoundError(err) || i === candidates.length - 1) {
+          throw err
+        }
+      }
+    }
+
+    throw lastError || new Error('Authentication failed')
+  }
 
   const persistSession = (session) => {
     const idToken = session?.getIdToken?.()?.getJwtToken?.() || ''
@@ -272,39 +377,65 @@ export function CognitoAuthProvider({ children }) {
   const signUp = async ({ email, password }) => {
     if (!configured) throw new Error('Cognito is not configured')
 
-    const username = makeUsername(email)
-    if (!username || !password) throw new Error('Email and password are required')
+    const emailUsername = makeUsername(email)
+    if (!emailUsername || !password) throw new Error('Email and password are required')
 
     const pool = getPool()
     const attributes = [
-      new CognitoUserAttribute({ Name: 'email', Value: username }),
+      new CognitoUserAttribute({ Name: 'email', Value: emailUsername }),
     ]
 
-    return new Promise((resolve, reject) => {
-      pool.signUp(username, password, attributes, null, (err, result) => {
+    const runSignUp = (usernameValue) => new Promise((resolve, reject) => {
+      pool.signUp(usernameValue, password, attributes, null, (err, result) => {
         if (err) {
-          reject(new Error(toAuthError(err)))
+          reject(err)
           return
         }
-        resolve({ success: true, userConfirmed: Boolean(result?.userConfirmed) })
+        resolve(result)
       })
     })
+
+    try {
+      const first = await runSignUp(emailUsername)
+      return { success: true, userConfirmed: Boolean(first?.userConfirmed) }
+    } catch (firstError) {
+      if (!shouldRetrySignUpWithInternalUsername(firstError)) {
+        throw toAuthException(firstError)
+      }
+
+      const mapped = getMappedSignupUsername(emailUsername)
+      const internalUsername = mapped || makeAliasCompatibleUsername(emailUsername)
+      if (!internalUsername) {
+        throw toAuthException(firstError)
+      }
+
+      // Persist mapping before retry so follow-up flows (confirm/resend/reset) can target same username.
+      rememberSignupUsername(emailUsername, internalUsername)
+
+      try {
+        const second = await runSignUp(internalUsername)
+        return { success: true, userConfirmed: Boolean(second?.userConfirmed) }
+      } catch (secondError) {
+        throw toAuthException(secondError)
+      }
+    }
   }
 
   const confirmSignUp = async ({ email, code }) => {
     if (!configured) throw new Error('Cognito is not configured')
 
-    const username = makeUsername(email)
-    if (!username || !code) throw new Error('Email and confirmation code are required')
+    if (!makeUsername(email) || !code) throw new Error('Email and confirmation code are required')
 
-    const user = makeUser(username)
-    return new Promise((resolve, reject) => {
-      user.confirmRegistration(code, true, (err) => {
-        if (err) {
-          reject(new Error(toAuthError(err)))
-          return
-        }
-        resolve({ success: true })
+    return runWithUsernameCandidates(email, (username) => {
+      const user = makeUser(username)
+      return new Promise((resolve, reject) => {
+        user.confirmRegistration(code, true, (err) => {
+          if (err) {
+            reject(toAuthException(err))
+            return
+          }
+          resolve({ success: true })
+        })
       })
     })
   }
@@ -312,17 +443,18 @@ export function CognitoAuthProvider({ children }) {
   const resendConfirmationCode = async ({ email }) => {
     if (!configured) throw new Error('Cognito is not configured')
 
-    const username = makeUsername(email)
-    if (!username) throw new Error('Email is required')
+    if (!makeUsername(email)) throw new Error('Email is required')
 
-    const user = makeUser(username)
-    return new Promise((resolve, reject) => {
-      user.resendConfirmationCode((err) => {
-        if (err) {
-          reject(new Error(toAuthError(err)))
-          return
-        }
-        resolve({ success: true })
+    return runWithUsernameCandidates(email, (username) => {
+      const user = makeUser(username)
+      return new Promise((resolve, reject) => {
+        user.resendConfirmationCode((err) => {
+          if (err) {
+            reject(toAuthException(err))
+            return
+          }
+          resolve({ success: true })
+        })
       })
     })
   }
@@ -330,15 +462,16 @@ export function CognitoAuthProvider({ children }) {
   const forgotPasswordStart = async ({ email }) => {
     if (!configured) throw new Error('Cognito is not configured')
 
-    const username = makeUsername(email)
-    if (!username) throw new Error('Email is required')
+    if (!makeUsername(email)) throw new Error('Email is required')
 
-    const user = makeUser(username)
-    return new Promise((resolve, reject) => {
-      user.forgotPassword({
-        onFailure: (err) => reject(new Error(toAuthError(err))),
-        inputVerificationCode: () => resolve({ success: true, codeSent: true }),
-        onSuccess: () => resolve({ success: true }),
+    return runWithUsernameCandidates(email, (username) => {
+      const user = makeUser(username)
+      return new Promise((resolve, reject) => {
+        user.forgotPassword({
+          onFailure: (err) => reject(toAuthException(err)),
+          inputVerificationCode: () => resolve({ success: true, codeSent: true }),
+          onSuccess: () => resolve({ success: true }),
+        })
       })
     })
   }
@@ -346,16 +479,17 @@ export function CognitoAuthProvider({ children }) {
   const forgotPasswordSubmit = async ({ email, code, newPassword }) => {
     if (!configured) throw new Error('Cognito is not configured')
 
-    const username = makeUsername(email)
-    if (!username || !code || !newPassword) {
+    if (!makeUsername(email) || !code || !newPassword) {
       throw new Error('Email, verification code and new password are required')
     }
 
-    const user = makeUser(username)
-    return new Promise((resolve, reject) => {
-      user.confirmPassword(code, newPassword, {
-        onFailure: (err) => reject(new Error(toAuthError(err))),
-        onSuccess: () => resolve({ success: true }),
+    return runWithUsernameCandidates(email, (username) => {
+      const user = makeUser(username)
+      return new Promise((resolve, reject) => {
+        user.confirmPassword(code, newPassword, {
+          onFailure: (err) => reject(toAuthException(err)),
+          onSuccess: () => resolve({ success: true }),
+        })
       })
     })
   }

@@ -29,6 +29,9 @@ import {
 
 import ChatPropertyResults from '@/components/ChatPropertyResults'
 
+const ASSISTANT_MATCH_TIMEOUT_MS = 120000
+const ASSISTANT_LOADING_GUARD_MS = ASSISTANT_MATCH_TIMEOUT_MS + 5000
+
 export function AssistantChat() {
   const [messages, setMessages] = useState([
     {
@@ -58,7 +61,7 @@ export function AssistantChat() {
     if (!isLoading) return
     const guard = setTimeout(() => {
       setIsLoading(false)
-    }, 45000)
+    }, ASSISTANT_LOADING_GUARD_MS)
     return () => clearTimeout(guard)
   }, [isLoading])
 
@@ -98,7 +101,7 @@ export function AssistantChat() {
 
       matchTimeout = setTimeout(() => {
         try { matchController.abort() } catch {}
-      }, 30000)
+      }, ASSISTANT_MATCH_TIMEOUT_MS)
 
       const matchResponse = await fetch('/api/assistant/match', {
         method: 'POST',
@@ -172,7 +175,7 @@ export function AssistantChat() {
       let errorMsg = 'Sorry, I encountered an error. Please try again.'
       
       if (error.name === 'AbortError') {
-        errorMsg = 'Request timed out. The AI processing is taking longer than expected. Please try with a shorter message.'
+        errorMsg = 'Request timed out. The AI processing is taking longer than expected. Please try again.'
       } else if (error.message.includes('502') || error.message.includes('Bad Gateway')) {
         errorMsg = '**Infrastructure Issue Detected**\n\nThe assistant backend is reachable, but external API routing is failing. Please check proxy/API configuration and retry.'
       } else if (error.message.includes('Match API failed')) {

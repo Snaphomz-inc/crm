@@ -408,7 +408,11 @@ async function connectToMongo() {
 
 function getAiSearchBaseUrl() {
   const raw = String(process.env.AI_SEARCH_BASE_URL || '').trim()
-  if (!raw) return null
+  if (!raw) {
+    // Local development default so CRM can bridge to a colocated AI search service.
+    if (process.env.NODE_ENV !== 'production') return 'http://localhost:8001'
+    return null
+  }
   return raw.replace(/\/+$/, '')
 }
 function isGreetingOrSmallTalk(message = '') {
