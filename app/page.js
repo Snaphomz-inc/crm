@@ -106,6 +106,12 @@ export default function RealEstateCRM() {
   }, [activeTab])
 
   useEffect(() => {
+    const handleFocusTask = () => setActiveTab('transactions')
+    window.addEventListener('crm:focus-task', handleFocusTask)
+    return () => window.removeEventListener('crm:focus-task', handleFocusTask)
+  }, [])
+
+  useEffect(() => {
     if (activeTab === 'dashboard') {
       filterLeads()
     }

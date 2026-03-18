@@ -42,6 +42,14 @@ const ALERT_TYPE_CONFIG = {
   closing_approaching: { name: 'Closing Soon', icon: Calendar }
 }
 
+const PRIORITY_LEVELS = ['urgent', 'high', 'medium', 'low']
+const EMPTY_TASK_PRIORITY_COUNTS = { urgent: 0, high: 0, medium: 0, low: 0 }
+const createEmptyTaskPriorityGroups = () => ({ urgent: [], high: [], medium: [], low: [] })
+const formatStageLabel = (stage = '') =>
+  String(stage)
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+
 export function DealCommand() {
   const [command, setCommand] = useState('')
   const [loading, setLoading] = useState(false)
@@ -389,7 +397,11 @@ export function DealCommand() {
 
 export function SmartAlerts() {
   const [alerts, setAlerts] = useState([])
+  const [taskPriorityCounts, setTaskPriorityCounts] = useState(EMPTY_TASK_PRIORITY_COUNTS)
+  const [taskPriorityGroups, setTaskPriorityGroups] = useState(() => createEmptyTaskPriorityGroups())
   const [loading, setLoading] = useState(false)
+  const [taskDialog, setTaskDialog] = useState({ open: false, alert: null })
+  const [priorityDialog, setPriorityDialog] = useState({ open: false, priority: null })
   const [filters, setFilters] = useState({
     priority: 'all',
     type: 'all'
@@ -399,6 +411,109 @@ export function SmartAlerts() {
     fetchAlerts()
   }, [filters])
 
+  useEffect(() => {
+    let es
+    let timer = null
+    const scheduleRefresh = () => {
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(() => {
+        fetchAlerts()
+      }, 250)
+    }
+
+    try {
+      es = new EventSource('/api/assistant/stream')
+      es.addEventListener('ready', scheduleRefresh)
+      es.addEventListener('tasks:changed', scheduleRefresh)
+      es.addEventListener('alerts:changed', scheduleRefresh)
+      es.addEventListener('suggestions:update', scheduleRefresh)
+      es.onerror = () => { try { es.close() } catch {} }
+    } catch (_) {
+      // Ignore SSE setup issues; manual refresh remains available.
+    }
+
+    return () => {
+      if (timer) clearTimeout(timer)
+      try { es && es.close() } catch {}
+    }
+  }, [])
+
+  const getPriorityBadgeClasses = (priority) => {
+    const normalized = String(priority || 'medium').toLowerCase()
+    const base = ALERT_PRIORITY_CONFIG[normalized]?.color || ALERT_PRIORITY_CONFIG.medium.color
+    return `${base} border-0 capitalize`
+  }
+
+  const fetchTaskPriorityCounts = async () => {
+    const txRes = await fetch('/api/transactions')
+    const txData = await txRes.json()
+    if (!txRes.ok || txData?.success === false) {
+      throw new Error(txData?.error || 'Failed to fetch transactions')
+    }
+
+    const txList = Array.isArray(txData?.transactions)
+      ? txData.transactions
+      : (Array.isArray(txData) ? txData : [])
+
+    if (!txList.length) {
+      return {
+        counts: { ...EMPTY_TASK_PRIORITY_COUNTS },
+        groups: createEmptyTaskPriorityGroups()
+      }
+    }
+
+    const checklistResults = await Promise.all(
+      txList.map(async (tx) => {
+        const res = await fetch(`/api/transactions/${tx.id}/checklist`)
+        const data = await res.json()
+        return { ok: res.ok, data }
+      })
+    )
+
+    const counts = { ...EMPTY_TASK_PRIORITY_COUNTS }
+    const groups = createEmptyTaskPriorityGroups()
+    let validChecklistResponses = 0
+
+    checklistResults.forEach(({ ok, data }, txIndex) => {
+      if (!ok || !data?.success || !Array.isArray(data.checklist_items)) return
+      validChecklistResponses += 1
+      const tx = txList[txIndex] || {}
+
+      data.checklist_items.forEach((task) => {
+        if (task?.status === 'completed') return
+        const priority = String(task?.priority || 'medium').toLowerCase()
+        if (Object.prototype.hasOwnProperty.call(counts, priority)) {
+          counts[priority] += 1
+          groups[priority].push({
+            id: task.id,
+            title: task.title || 'Untitled task',
+            due_date: task.due_date || null,
+            stage: task.stage || '',
+            transaction_id: tx.id || '',
+            property_address: tx.property_address || 'Unknown address'
+          })
+        }
+      })
+    })
+
+    if (validChecklistResponses === 0) {
+      throw new Error('Failed to fetch checklist data')
+    }
+
+    PRIORITY_LEVELS.forEach((priority) => {
+      groups[priority] = groups[priority]
+        .slice()
+        .sort((a, b) => {
+          const ad = a?.due_date ? new Date(a.due_date).getTime() : Number.POSITIVE_INFINITY
+          const bd = b?.due_date ? new Date(b.due_date).getTime() : Number.POSITIVE_INFINITY
+          if (ad !== bd) return ad - bd
+          return String(a?.title || '').localeCompare(String(b?.title || ''))
+        })
+    })
+
+    return { counts, groups }
+  }
+
   const fetchAlerts = async () => {
     setLoading(true)
     try {
@@ -406,14 +521,32 @@ export function SmartAlerts() {
       if (filters.priority !== 'all') params.append('priority', filters.priority)
       if (filters.type !== 'all') params.append('type', filters.type)
 
-      const response = await fetch(`/api/alerts/smart?${params.toString()}`)
-      const data = await response.json()
-      
-      if (data.success) {
-        setAlerts(data.alerts)
+      const [alertsResult, countsResult] = await Promise.allSettled([
+        fetch(`/api/alerts/smart?${params.toString()}`).then(async (response) => {
+          const data = await response.json()
+          return { ok: response.ok, data }
+        }),
+        fetchTaskPriorityCounts()
+      ])
+
+      if (alertsResult.status === 'fulfilled' && alertsResult.value?.ok && alertsResult.value?.data?.success) {
+        setAlerts(alertsResult.value.data.alerts || [])
+      } else if (alertsResult.status === 'rejected') {
+        console.error('Error fetching alerts:', alertsResult.reason)
+      }
+
+      if (countsResult.status === 'fulfilled') {
+        setTaskPriorityCounts(countsResult.value.counts)
+        setTaskPriorityGroups(countsResult.value.groups)
+      } else {
+        console.error('Error fetching task priority counts:', countsResult.reason)
+        setTaskPriorityCounts({ ...EMPTY_TASK_PRIORITY_COUNTS })
+        setTaskPriorityGroups(createEmptyTaskPriorityGroups())
       }
     } catch (error) {
       console.error('Error fetching alerts:', error)
+      setTaskPriorityCounts({ ...EMPTY_TASK_PRIORITY_COUNTS })
+      setTaskPriorityGroups(createEmptyTaskPriorityGroups())
     }
     setLoading(false)
   }
@@ -443,11 +576,52 @@ export function SmartAlerts() {
     setLoading(false)
   }
 
+  const focusTaskFromAlert = (alert, task) => {
+    const transactionId = alert?.transaction_id
+    const taskId = task?.id
+    if (!transactionId || !taskId || typeof window === 'undefined') return
+
+    window.dispatchEvent(new CustomEvent('crm:focus-task', {
+      detail: {
+        transactionId,
+        taskId,
+        stage: task.stage || null
+      }
+    }))
+    setTaskDialog({ open: false, alert: null })
+  }
+
+  const focusTaskFromPriorityDialog = (task) => {
+    const transactionId = task?.transaction_id
+    const taskId = task?.id
+    if (!transactionId || !taskId || typeof window === 'undefined') return
+
+    window.dispatchEvent(new CustomEvent('crm:focus-task', {
+      detail: {
+        transactionId,
+        taskId,
+        stage: task.stage || null
+      }
+    }))
+    setPriorityDialog({ open: false, priority: null })
+  }
+
   const AlertCard = ({ alert }) => {
     const priorityConfig = ALERT_PRIORITY_CONFIG[alert.priority] || ALERT_PRIORITY_CONFIG.medium
     const typeConfig = ALERT_TYPE_CONFIG[alert.alert_type] || ALERT_TYPE_CONFIG.overdue_tasks
     const PriorityIcon = priorityConfig.icon
-    const TypeIcon = typeConfig.icon
+    const closingDateLabel = alert?.details?.closing_date
+      ? new Date(alert.details.closing_date).toLocaleDateString()
+      : new Date(alert.created_at).toLocaleDateString()
+    const openStages = Array.from(
+      new Set(
+        (Array.isArray(alert?.details?.open_stages) ? alert.details.open_stages : [alert?.details?.current_stage])
+          .filter(Boolean)
+      )
+    )
+    const remainingTaskList = Array.isArray(alert?.details?.remaining_tasks) ? alert.details.remaining_tasks : []
+    const remainingTasks = remainingTaskList.length || Number(alert?.details?.incomplete_tasks || 0)
+    const isClosingAlert = alert.alert_type === 'closing_approaching'
 
     return (
       <Card className="hover:shadow-sm transition-shadow">
@@ -465,28 +639,57 @@ export function SmartAlerts() {
                     {typeConfig.name}
                   </Badge>
                 </div>
-                
-                <p className="text-sm text-muted-foreground mb-2">
-                  {alert.message}
-                </p>
-                
-                <div className="flex items-center gap-4 text-xs text-muted-foreground">
-                  <span className="flex items-center gap-1">
-                    <Home className="h-3 w-3" />
-                    {alert.property_address}
-                  </span>
-                  <span className="flex items-center gap-1">
-                    <User className="h-3 w-3" />
-                    {alert.client_name}
-                  </span>
-                  <span className="flex items-center gap-1">
-                    <Calendar className="h-3 w-3" />
-                    {new Date(alert.created_at).toLocaleDateString()}
-                  </span>
-                </div>
+
+                {isClosingAlert ? (
+                  <div className="flex flex-wrap items-center gap-4 text-xs text-muted-foreground mb-2">
+                    <span className="flex items-center gap-1">
+                      <Home className="h-3 w-3" />
+                      {alert.property_address}
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <User className="h-3 w-3" />
+                      {alert.client_name}
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <Calendar className="h-3 w-3" />
+                      {closingDateLabel}
+                    </span>
+                  </div>
+                ) : (
+                  <p className="text-sm text-muted-foreground mb-2">
+                    {alert.message}
+                  </p>
+                )}
+
+                {isClosingAlert && openStages.length > 0 && (
+                  <div className="mb-2 flex flex-wrap gap-2">
+                    {openStages.map((stage) => (
+                      <Badge key={stage} variant="secondary" className="text-xs">
+                        {formatStageLabel(stage)}
+                      </Badge>
+                    ))}
+                  </div>
+                )}
+
+                {!isClosingAlert && (
+                  <div className="flex items-center gap-4 text-xs text-muted-foreground">
+                    <span className="flex items-center gap-1">
+                      <Home className="h-3 w-3" />
+                      {alert.property_address}
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <User className="h-3 w-3" />
+                      {alert.client_name}
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <Calendar className="h-3 w-3" />
+                      {closingDateLabel}
+                    </span>
+                  </div>
+                )}
 
                 {/* Alert Details */}
-                {alert.details && (
+                {alert.details && !isClosingAlert && (
                   <div className="mt-3 p-2 bg-muted rounded text-xs">
                     {alert.alert_type === 'overdue_tasks' && (
                       <div>
@@ -509,14 +712,18 @@ export function SmartAlerts() {
                         <br />Current stage: {alert.details.current_stage}
                       </div>
                     )}
-                    
-                    {alert.alert_type === 'closing_approaching' && (
-                      <div>
-                        <strong>Closing in {alert.details.days_to_closing} days</strong>
-                        <br />{alert.details.incomplete_tasks} tasks remaining
-                      </div>
-                    )}
                   </div>
+                )}
+
+                {isClosingAlert && (
+                  <Button
+                    variant="default"
+                    size="sm"
+                    className="mt-3 h-9 rounded-full px-4 text-xs font-semibold"
+                    onClick={() => setTaskDialog({ open: true, alert })}
+                  >
+                    {remainingTasks} {remainingTasks === 1 ? 'task' : 'tasks'} remaining
+                  </Button>
                 )}
               </div>
             </div>
@@ -557,11 +764,15 @@ export function SmartAlerts() {
 
       {/* Alert Summary */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        {['urgent', 'high', 'medium', 'low'].map(priority => {
-          const count = alerts.filter(alert => alert.priority === priority).length
+        {PRIORITY_LEVELS.map(priority => {
+          const count = taskPriorityCounts[priority] || 0
           const config = ALERT_PRIORITY_CONFIG[priority]
           return (
-            <Card key={priority}>
+            <Card
+              key={priority}
+              className="cursor-pointer transition-shadow hover:shadow-md"
+              onClick={() => setPriorityDialog({ open: true, priority })}
+            >
               <CardContent className="p-4 text-center">
                 <div className={`text-2xl font-bold ${config.color.replace('bg-', 'text-').replace('100', '600')}`}>
                   {count}
@@ -602,6 +813,115 @@ export function SmartAlerts() {
           </CardContent>
         </Card>
       )}
+
+      <Dialog
+        open={taskDialog.open}
+        onOpenChange={(open) => setTaskDialog((prev) => ({ ...prev, open, alert: open ? prev.alert : null }))}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>
+              {(taskDialog.alert?.title || 'Remaining Tasks')}
+            </DialogTitle>
+            <DialogDescription>
+              {taskDialog.alert?.property_address || 'Transaction'} tasks across open stages
+            </DialogDescription>
+          </DialogHeader>
+
+          {Array.isArray(taskDialog.alert?.details?.remaining_tasks) && taskDialog.alert.details.remaining_tasks.length > 0 ? (
+            <div className="max-h-[320px] space-y-2 overflow-y-auto pr-1">
+              {taskDialog.alert.details.remaining_tasks.map((task) => {
+                const dueDate = task?.due_date ? new Date(task.due_date) : null
+                const dueLabel = dueDate && !Number.isNaN(dueDate.getTime())
+                  ? dueDate.toLocaleDateString()
+                  : 'No due date'
+
+                return (
+                  <button
+                    type="button"
+                    key={task.id || `${task.title}-${task.stage}-${task.due_date || 'na'}`}
+                    className="w-full rounded-md border p-3 text-left transition-colors hover:bg-muted/50"
+                    onClick={() => focusTaskFromAlert(taskDialog.alert, task)}
+                  >
+                    <div className="font-medium">{task.title}</div>
+                    <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                      <span className="flex items-center gap-1">
+                        <Calendar className="h-3 w-3" />
+                        {dueLabel}
+                      </span>
+                      <Badge variant="outline" className={`text-xs ${getPriorityBadgeClasses(task.priority || 'medium')}`}>
+                        {String(task.priority || 'medium')}
+                      </Badge>
+                      {task.stage && (
+                        <Badge variant="secondary" className="text-xs">
+                          {formatStageLabel(task.stage)}
+                        </Badge>
+                      )}
+                    </div>
+                  </button>
+                )
+              })}
+            </div>
+          ) : (
+            <div className="text-sm text-muted-foreground">No remaining tasks found.</div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={priorityDialog.open}
+        onOpenChange={(open) => setPriorityDialog((prev) => ({ ...prev, open, priority: open ? prev.priority : null }))}
+      >
+        <DialogContent className="sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>
+              {priorityDialog.priority ? `${formatStageLabel(priorityDialog.priority)} Priority Tasks` : 'Priority Tasks'}
+            </DialogTitle>
+            <DialogDescription>
+              All incomplete tasks across transactions for this priority level
+            </DialogDescription>
+          </DialogHeader>
+
+          {priorityDialog.priority && (taskPriorityGroups[priorityDialog.priority] || []).length > 0 ? (
+            <div className="max-h-[360px] space-y-2 overflow-y-auto pr-1">
+              {(taskPriorityGroups[priorityDialog.priority] || []).map((task) => {
+                const dueDate = task?.due_date ? new Date(task.due_date) : null
+                const dueLabel = dueDate && !Number.isNaN(dueDate.getTime())
+                  ? dueDate.toLocaleDateString()
+                  : 'No due date'
+
+                return (
+                  <button
+                    type="button"
+                    key={`${task.transaction_id}-${task.id}`}
+                    className="w-full rounded-md border p-3 text-left transition-colors hover:bg-muted/50"
+                    onClick={() => focusTaskFromPriorityDialog(task)}
+                  >
+                    <div className="font-medium">{task.property_address}</div>
+                    <div className="mt-1 text-sm text-muted-foreground">{task.title}</div>
+                    <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                      {task.stage && (
+                        <Badge variant="secondary" className="text-xs">
+                          {formatStageLabel(task.stage)}
+                        </Badge>
+                      )}
+                      <Badge variant="outline" className={`text-xs ${getPriorityBadgeClasses(priorityDialog.priority)}`}>
+                        {String(priorityDialog.priority)}
+                      </Badge>
+                      <span className="flex items-center gap-1">
+                        <Calendar className="h-3 w-3" />
+                        {dueLabel}
+                      </span>
+                    </div>
+                  </button>
+                )
+              })}
+            </div>
+          ) : (
+            <div className="text-sm text-muted-foreground">No tasks found for this priority.</div>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

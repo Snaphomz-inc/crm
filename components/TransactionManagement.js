@@ -53,10 +53,16 @@ const STAGE_CONFIGS = {
   }
 }
 
+const formatStageLabel = (stage = '') =>
+  String(stage)
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+
 export function TransactionManagement() {
   const [transactions, setTransactions] = useState([])
   const [filteredTransactions, setFilteredTransactions] = useState([])
   const [selectedTransaction, setSelectedTransaction] = useState(null)
+  const [focusTarget, setFocusTarget] = useState(null)
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false)
   const [loading, setLoading] = useState(false)
   const [searchTerm, setSearchTerm] = useState('')
@@ -83,13 +89,104 @@ export function TransactionManagement() {
     filterTransactions()
   }, [transactions, searchTerm, stageFilter])
 
+  useEffect(() => {
+    const handleFocusTask = async (event) => {
+      const transactionId = event?.detail?.transactionId
+      const taskId = event?.detail?.taskId
+      const stage = event?.detail?.stage || null
+      if (!transactionId || !taskId) return
+
+      let transaction = transactions.find((tx) => tx.id === transactionId) || null
+      if (!transaction) {
+        try {
+          const response = await fetch(`/api/transactions/${transactionId}`)
+          const data = await response.json()
+          if (data?.success && data?.transaction) {
+            transaction = data.transaction
+            setTransactions((prev) => {
+              if (prev.some((tx) => tx.id === transaction.id)) return prev
+              return [transaction, ...prev]
+            })
+          }
+        } catch (error) {
+          console.error('Error loading transaction for task focus:', error)
+        }
+      }
+
+      if (transaction) {
+        setSelectedTransaction(transaction)
+        setFocusTarget({ transactionId, taskId, stage, nonce: Date.now() })
+      }
+    }
+
+    window.addEventListener('crm:focus-task', handleFocusTask)
+    return () => window.removeEventListener('crm:focus-task', handleFocusTask)
+  }, [transactions])
+
   const fetchTransactions = async () => {
     setLoading(true)
     try {
       const response = await fetch('/api/transactions')
       const data = await response.json()
       if (data.success) {
-        setTransactions(data.transactions)
+        const baseTransactions = Array.isArray(data.transactions) ? data.transactions : []
+
+        const enrichedTransactions = await Promise.all(
+          baseTransactions.map(async (tx) => {
+            try {
+              const txType = (tx?.transaction_type || 'sale').toLowerCase()
+              const checklistRes = await fetch(`/api/transactions/${tx.id}/checklist`)
+              const checklistData = await checklistRes.json()
+              if (!checklistRes.ok || !checklistData?.success || !Array.isArray(checklistData.checklist_items)) {
+                return tx
+              }
+
+              const incompleteItems = checklistData.checklist_items.filter((item) => item?.status !== 'completed')
+              const stageHistory = Array.isArray(tx?.stage_history) ? tx.stage_history : []
+              const forcedStages = new Set(
+                stageHistory
+                  .filter((entry) => {
+                    if (!entry || !entry.stage) return false
+                    if (entry.forced === true) return true
+                    return entry?.validation_result?.valid === false
+                  })
+                  .flatMap((entry) => [entry.stage, entry.transitioned_from].filter(Boolean))
+              )
+
+              const scopedStages = new Set(forcedStages)
+              if (tx?.current_stage) scopedStages.add(tx.current_stage)
+
+              // Backward compatibility for records where forced stage history wasn't persisted.
+              if (forcedStages.size === 0 && tx?.current_stage) {
+                const currentOrder = getStageOrder(tx.current_stage, txType)
+                incompleteItems.forEach((task) => {
+                  const order = getStageOrder(task?.stage, txType)
+                  if (order <= currentOrder) scopedStages.add(task.stage)
+                })
+              }
+
+              const openStages = Array.from(
+                new Set(
+                  incompleteItems
+                    .map((task) => task?.stage)
+                    .filter((stage) => stage && scopedStages.has(stage))
+                )
+              ).sort((a, b) => getStageOrder(a, txType) - getStageOrder(b, txType))
+
+              return {
+                ...tx,
+                open_stages: openStages.length > 0
+                  ? openStages
+                  : (tx?.current_stage ? [tx.current_stage] : [])
+              }
+            } catch (error) {
+              console.error(`Error deriving open stages for transaction ${tx?.id}:`, error)
+              return tx
+            }
+          })
+        )
+
+        setTransactions(enrichedTransactions)
       }
     } catch (error) {
       console.error('Error fetching transactions:', error)
@@ -109,7 +206,11 @@ export function TransactionManagement() {
     }
 
     if (stageFilter !== 'all') {
-      filtered = filtered.filter(transaction => transaction.current_stage === stageFilter)
+      filtered = filtered.filter((transaction) => {
+        const openStages = getOpenStages(transaction)
+        if (openStages.length > 0) return openStages.includes(stageFilter)
+        return transaction.current_stage === stageFilter
+      })
     }
 
     setFilteredTransactions(filtered)
@@ -131,7 +232,8 @@ export function TransactionManagement() {
 
       const data = await response.json()
       if (data.success) {
-        setTransactions([data.transaction, ...transactions])
+        const createdTx = data.transaction || {}
+        setTransactions([{ ...createdTx, open_stages: createdTx.current_stage ? [createdTx.current_stage] : [] }, ...transactions])
         setNewTransaction({
           property_address: '',
           client_name: '',
@@ -191,19 +293,55 @@ export function TransactionManagement() {
     }
   }
 
+  const getStageOrder = (stage, txType) => {
+    const orderedStages = Object.keys(STAGE_CONFIGS[txType] || {})
+    const idx = orderedStages.indexOf(stage)
+    return idx === -1 ? Number.MAX_SAFE_INTEGER : idx
+  }
+
+  const getOpenStages = (transaction) => {
+    const txType = (transaction?.transaction_type || 'sale').toLowerCase()
+    const stageHistory = Array.isArray(transaction?.stage_history) ? transaction.stage_history : []
+    const scoped = new Set(
+      stageHistory
+        .filter((entry) => {
+          if (!entry || !entry.stage) return false
+          if (entry.forced === true) return true
+          return entry?.validation_result?.valid === false
+        })
+        .flatMap((entry) => [entry.stage, entry.transitioned_from].filter(Boolean))
+    )
+
+    if (Array.isArray(transaction?.open_stages)) {
+      transaction.open_stages.filter(Boolean).forEach((stage) => scoped.add(stage))
+    }
+    if (transaction?.current_stage) scoped.add(transaction.current_stage)
+
+    return Array.from(scoped).sort((a, b) => getStageOrder(a, txType) - getStageOrder(b, txType))
+  }
+
   if (selectedTransaction) {
     return (
       <div className="space-y-6">
         <div className="flex items-center justify-between">
           <Button 
             variant="outline" 
-            onClick={() => setSelectedTransaction(null)}
+            onClick={async () => {
+              setSelectedTransaction(null)
+              setFocusTarget(null)
+              await fetchTransactions()
+            }}
           >
             ← Back to Transactions
           </Button>
           <h2 className="text-2xl font-bold">Transaction Timeline</h2>
         </div>
-        <TransactionTimeline transactionId={selectedTransaction.id} />
+        <TransactionTimeline
+          transactionId={selectedTransaction.id}
+          focusTaskId={focusTarget?.taskId || null}
+          focusStage={focusTarget?.stage || null}
+          onFocusHandled={() => setFocusTarget(null)}
+        />
       </div>
     )
   }
@@ -267,8 +405,7 @@ export function TransactionManagement() {
         <div className="grid gap-6">
           {filteredTransactions.map((transaction) => {
             const tType = transaction.transaction_type || 'sale'
-            const stageConfig = (STAGE_CONFIGS[tType] && STAGE_CONFIGS[tType][transaction.current_stage]) || {}
-            const StageIcon = stageConfig.icon || FileText
+            const openStages = getOpenStages(transaction)
             
             return (
               <Card key={transaction.id} className="hover:shadow-md transition-shadow cursor-pointer"
@@ -281,10 +418,18 @@ export function TransactionManagement() {
                           <h3 className="text-lg font-semibold">{transaction.property_address}</h3>
                           <p className="text-muted-foreground">Client: {transaction.client_name}</p>
                         </div>
-                        <Badge className={`${stageConfig.color || 'bg-gray-500'} text-white`}>
-                          <StageIcon className="mr-1 h-3 w-3" />
-                          {stageConfig.name || transaction.current_stage}
-                        </Badge>
+                        <div className="flex flex-wrap justify-end gap-2 pl-4">
+                          {(openStages.length > 0 ? openStages : [transaction.current_stage]).map((stageKey) => {
+                            const badgeCfg = (STAGE_CONFIGS[tType] && STAGE_CONFIGS[tType][stageKey]) || {}
+                            const BadgeIcon = badgeCfg.icon || FileText
+                            return (
+                              <Badge key={`${transaction.id}-${stageKey}`} className={`${badgeCfg.color || 'bg-gray-500'} text-white`}>
+                                <BadgeIcon className="mr-1 h-3 w-3" />
+                                {badgeCfg.name || formatStageLabel(stageKey)}
+                              </Badge>
+                            )
+                          })}
+                        </div>
                       </div>
                       
                       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-sm">

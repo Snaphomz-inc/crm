@@ -115,9 +115,10 @@ const PRIORITY_CONFIG = {
   urgent: { label: 'Urgent', color: 'text-red-600' }
 }
 
-export function TransactionTimeline({ transactionId }) {
+export function TransactionTimeline({ transactionId, focusTaskId = null, focusStage = null, onFocusHandled }) {
   const [transaction, setTransaction] = useState(null)
   const [checklistItems, setChecklistItems] = useState([])
+  const [checklistLoaded, setChecklistLoaded] = useState(false)
   const [activeStage, setActiveStage] = useState(firstStageForType('sale'))
   const [expandedStages, setExpandedStages] = useState({ [firstStageForType('sale')]: true })
   const [loading, setLoading] = useState(false)
@@ -127,6 +128,7 @@ export function TransactionTimeline({ transactionId }) {
   const [addTaskStage, setAddTaskStage] = useState('')
   const [transitionDialog, setTransitionDialog] = useState({ open: false, targetStage: null })
   const [editForm, setEditForm] = useState(null)
+  const [highlightedTaskId, setHighlightedTaskId] = useState(null)
 
   const [newTask, setNewTask] = useState({
     title: '',
@@ -135,7 +137,6 @@ export function TransactionTimeline({ transactionId }) {
     assignee: '',
     due_date: '',
     notes: '',
-    weight: 1,
     parent_id: null
   })
 
@@ -155,6 +156,7 @@ export function TransactionTimeline({ transactionId }) {
 
   useEffect(() => {
     if (transactionId) {
+      setChecklistLoaded(false)
       fetchTransaction()
       fetchChecklist()
     }
@@ -190,6 +192,40 @@ export function TransactionTimeline({ transactionId }) {
     }
   }, [transactionId])
 
+  useEffect(() => {
+    if (!focusTaskId) return
+    if (!checklistLoaded) return
+    const task = checklistItems.find((item) => item.id === focusTaskId)
+    if (!task) {
+      if (typeof onFocusHandled === 'function') onFocusHandled()
+      return
+    }
+
+    const targetStage = focusStage || task.stage || null
+    if (targetStage) {
+      setActiveStage(targetStage)
+      setExpandedStages((prev) => ({ ...prev, [targetStage]: true }))
+    }
+    setHighlightedTaskId(focusTaskId)
+
+    const scrollTimer = setTimeout(() => {
+      const element = document.getElementById(`task-${focusTaskId}`)
+      if (element) {
+        element.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      }
+      if (typeof onFocusHandled === 'function') onFocusHandled()
+    }, 300)
+
+    const clearTimer = setTimeout(() => {
+      setHighlightedTaskId((current) => (current === focusTaskId ? null : current))
+    }, 2600)
+
+    return () => {
+      clearTimeout(scrollTimer)
+      clearTimeout(clearTimer)
+    }
+  }, [focusTaskId, focusStage, checklistItems, checklistLoaded, onFocusHandled])
+
   const fetchTransaction = async () => {
     try {
       const response = await fetch(`/api/transactions/${transactionId}`)
@@ -216,6 +252,8 @@ export function TransactionTimeline({ transactionId }) {
     } catch (error) {
       console.error('Error fetching checklist:', error)
       setError('Failed to fetch checklist')
+    } finally {
+      setChecklistLoaded(true)
     }
   }
 
@@ -263,7 +301,6 @@ export function TransactionTimeline({ transactionId }) {
           assignee: '',
           due_date: '',
           notes: '',
-          weight: 1,
           parent_id: null
         })
         setIsAddingTask(false)
@@ -523,9 +560,14 @@ export function TransactionTimeline({ transactionId }) {
 
   const TaskItem = ({ item, indent = 0, isChild = false }) => {
     const StatusIcon = STATUS_CONFIG[item.status]?.icon || Circle
+    const isFocusedTask = highlightedTaskId === item.id
     
     return (
-      <Card className={`mb-3 hover:shadow-sm transition-shadow ${isChild ? 'bg-muted/30' : ''}`}>
+      <Card
+        id={`task-${item.id}`}
+        data-task-id={item.id}
+        className={`mb-3 hover:shadow-sm transition-shadow ${isChild ? 'bg-muted/30' : ''} ${isFocusedTask ? 'ring-2 ring-primary/60 shadow-md' : ''}`}
+      >
         <CardContent className={`p-4 ${isChild ? 'py-3' : ''}`}>
           <div className="flex items-start justify-between">
             <div className="flex items-start space-x-3 flex-1">
@@ -552,7 +594,6 @@ export function TransactionTimeline({ transactionId }) {
                   <Badge variant="outline" className={PRIORITY_CONFIG[item.priority]?.color}>
                     {PRIORITY_CONFIG[item.priority]?.label}
                   </Badge>
-                  <Badge variant="outline">w: {Number(item.weight ?? 1)}</Badge>
                   
                   {item.assignee && (
                     <div className="flex items-center gap-1">
@@ -903,38 +944,24 @@ export function TransactionTimeline({ transactionId }) {
               />
             </div>
 
-            <div className="grid grid-cols-2 gap-4">
-              <div className="space-y-2">
-                <Label htmlFor="task-weight">Weight</Label>
-                <Input
-                  id="task-weight"
-                  type="number"
-                  step="0.1"
-                  min="0"
-                  value={newTask.weight}
-                  onChange={(e) => setNewTask({ ...newTask, weight: Number(e.target.value) })}
-                />
-              </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="task-parent">Parent Task (optional)</Label>
-                <Select
-                  value={newTask.parent_id ?? '__none__'}
-                  onValueChange={(value) => setNewTask({ ...newTask, parent_id: value === '__none__' ? null : value })}
-                >
-                  <SelectTrigger id="task-parent">
-                    <SelectValue placeholder="None (Top-level)" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="__none__">None (Top-level)</SelectItem>
-                    {checklistItems
-                      .filter(i => i.stage === addTaskStage && !i.parent_id)
-                      .map(p => (
-                        <SelectItem key={p.id} value={p.id}>{p.title}</SelectItem>
-                      ))}
-                  </SelectContent>
-                </Select>
-              </div>
+            <div className="space-y-2">
+              <Label htmlFor="task-parent">Parent Task (optional)</Label>
+              <Select
+                value={newTask.parent_id ?? '__none__'}
+                onValueChange={(value) => setNewTask({ ...newTask, parent_id: value === '__none__' ? null : value })}
+              >
+                <SelectTrigger id="task-parent">
+                  <SelectValue placeholder="None (Top-level)" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__none__">None (Top-level)</SelectItem>
+                  {checklistItems
+                    .filter(i => i.stage === addTaskStage && !i.parent_id)
+                    .map(p => (
+                      <SelectItem key={p.id} value={p.id}>{p.title}</SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
             </div>
 
             <div className="flex justify-end space-x-2 pt-4">
@@ -952,7 +979,7 @@ export function TransactionTimeline({ transactionId }) {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Edit Task</DialogTitle>
-            <DialogDescription>Update task details, weight, and parent</DialogDescription>
+            <DialogDescription>Update task details and parent</DialogDescription>
           </DialogHeader>
 
           {editForm && (
@@ -1039,38 +1066,24 @@ export function TransactionTimeline({ transactionId }) {
                 />
               </div>
 
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label htmlFor="edit-weight">Weight</Label>
-                  <Input
-                    id="edit-weight"
-                    type="number"
-                    step="0.1"
-                    min="0"
-                    value={Number(editForm.weight ?? 1)}
-                    onChange={(e) => setEditForm({ ...editForm, weight: Number(e.target.value) })}
-                  />
-                </div>
-
-                <div className="space-y-2">
-                  <Label htmlFor="edit-parent">Parent Task</Label>
-                  <Select
-                    value={editForm.parent_id ?? '__none__'}
-                    onValueChange={(value) => setEditForm({ ...editForm, parent_id: value === '__none__' ? null : value })}
-                  >
-                    <SelectTrigger id="edit-parent">
-                      <SelectValue placeholder="None (Top-level)" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="__none__">None (Top-level)</SelectItem>
-                      {checklistItems
-                        .filter(i => !i.parent_id && i.id !== editForm.id)
-                        .map(p => (
-                          <SelectItem key={p.id} value={p.id}>{p.title}</SelectItem>
-                        ))}
-                    </SelectContent>
-                  </Select>
-                </div>
+              <div className="space-y-2">
+                <Label htmlFor="edit-parent">Parent Task</Label>
+                <Select
+                  value={editForm.parent_id ?? '__none__'}
+                  onValueChange={(value) => setEditForm({ ...editForm, parent_id: value === '__none__' ? null : value })}
+                >
+                  <SelectTrigger id="edit-parent">
+                    <SelectValue placeholder="None (Top-level)" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none__">None (Top-level)</SelectItem>
+                    {checklistItems
+                      .filter(i => !i.parent_id && i.id !== editForm.id)
+                      .map(p => (
+                        <SelectItem key={p.id} value={p.id}>{p.title}</SelectItem>
+                      ))}
+                  </SelectContent>
+                </Select>
               </div>
             </div>
           )}
@@ -1088,7 +1101,6 @@ export function TransactionTimeline({ transactionId }) {
                   due_date: editForm.due_date || '',
                   notes: editForm.notes || '',
                   status: editForm.status || 'not_started',
-                  weight: Number(editForm.weight) || 1,
                   parent_id: editForm.parent_id || null
                 }
                 await updateChecklistItem(editingItem.id, updates)

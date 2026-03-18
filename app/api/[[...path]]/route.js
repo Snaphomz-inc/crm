@@ -31,6 +31,37 @@ function getFieldValue(obj, field) {
   return current
 }
 
+function setFieldValue(obj, field, value) {
+  if (!field || typeof field !== 'string' || !isPlainObject(obj)) return
+  if (!field.includes('.')) {
+    obj[field] = value
+    return
+  }
+  const parts = field.split('.')
+  let current = obj
+  for (let i = 0; i < parts.length - 1; i++) {
+    const part = parts[i]
+    if (!isPlainObject(current[part])) current[part] = {}
+    current = current[part]
+  }
+  current[parts[parts.length - 1]] = value
+}
+
+function unsetFieldValue(obj, field) {
+  if (!field || typeof field !== 'string' || !isPlainObject(obj)) return
+  if (!field.includes('.')) {
+    delete obj[field]
+    return
+  }
+  const parts = field.split('.')
+  let current = obj
+  for (let i = 0; i < parts.length - 1; i++) {
+    current = current?.[parts[i]]
+    if (!isPlainObject(current)) return
+  }
+  delete current[parts[parts.length - 1]]
+}
+
 function toDateMillis(value) {
   if (value instanceof Date) {
     const t = value.getTime()
@@ -266,8 +297,35 @@ function createCollectionAdapter(loadAll, persistOne, removeByIds) {
       const index = docs.findIndex((doc) => matchesQuery(doc, filter))
       if (index === -1) return { matchedCount: 0, modifiedCount: 0 }
       const target = docs[index]
-      const patch = isPlainObject(update.$set) ? update.$set : {}
-      const nextDoc = { ...target, ...patch }
+      const nextDoc = cloneDoc(target)
+      const hasOperators = isPlainObject(update) && Object.keys(update).some((key) => key.startsWith('$'))
+
+      if (hasOperators) {
+        const setPatch = isPlainObject(update.$set) ? update.$set : {}
+        for (const [key, value] of Object.entries(setPatch)) {
+          setFieldValue(nextDoc, key, value)
+        }
+
+        const unsetPatch = isPlainObject(update.$unset) ? update.$unset : {}
+        for (const key of Object.keys(unsetPatch)) {
+          unsetFieldValue(nextDoc, key)
+        }
+
+        const pushPatch = isPlainObject(update.$push) ? update.$push : {}
+        for (const [key, rawValue] of Object.entries(pushPatch)) {
+          const existing = getFieldValue(nextDoc, key)
+          const arr = Array.isArray(existing) ? [...existing] : []
+          if (isPlainObject(rawValue) && Array.isArray(rawValue.$each)) {
+            arr.push(...rawValue.$each)
+          } else {
+            arr.push(rawValue)
+          }
+          setFieldValue(nextDoc, key, arr)
+        }
+      } else if (isPlainObject(update)) {
+        Object.assign(nextDoc, update)
+      }
+
       if (!nextDoc.id) nextDoc.id = String(target.id || uuidv4())
       await persistOne(nextDoc)
       return { matchedCount: 1, modifiedCount: 1 }
@@ -1348,15 +1406,25 @@ async function fetchProperties(filters = {}) {
 
     // Use the v2 MLSSearch endpoint (POST)
     const url = (process.env.PROPERTY_SEARCH_URL || 'https://api.realestateapi.com/v2/MLSSearch')
+    const apiKey = process.env.REAL_ESTATE_MLS_API_KEY || process.env.REAL_ESTATE_API_KEY
+    const userId = process.env.REAL_ESTATE_USER_ID || 'CRMApp'
+
+    const fallbackWithReason = (reason, details = undefined) => ({
+      ...generateFallbackProperties(filters),
+      live_attempted: reason !== 'missing_mls_api_key',
+      fallback_reason: reason,
+      fallback_details: details
+    })
+
+    if (!apiKey) {
+      console.warn('MLS search fallback: missing REAL_ESTATE_MLS_API_KEY / REAL_ESTATE_API_KEY')
+      return fallbackWithReason('missing_mls_api_key')
+    }
 
     // Build MLSSearch request body
     const requestBody = {
-      // core required filters per product decision
       size: Math.min(250, Number(limit) || 60),
-      active: true,
-      sold: false,
-      has_photos: true,
-      include_photos: true,
+      status: 'Active',
       // pass-through if provided
       property_type: property_type || undefined
     }
@@ -1367,7 +1435,7 @@ async function fetchProperties(filters = {}) {
 
     // Map filters -> MLSSearch schema
     if (beds) requestBody.bedrooms_min = Number(beds)
-    if (baths) requestBody.bathrooms_min = Number(baths)
+    if (baths) requestBody.bathrooms_min = Math.ceil(Number(baths))
     if (min_price) requestBody.listing_price_min = Number(min_price)
     if (max_price) requestBody.listing_price_max = Number(max_price)
 
@@ -1422,6 +1490,8 @@ async function fetchProperties(filters = {}) {
     // }
 
 
+    console.log('[MLSSearch] Request body:', JSON.stringify(requestBody, null, 2))
+
     // Use AbortController for a hard timeout (Node/Next fetch doesn't support a 'timeout' option)
     const controller = new AbortController()
     const timeoutMs = 10000
@@ -1434,8 +1504,8 @@ async function fetchProperties(filters = {}) {
           accept: 'application/json',
           'content-type': 'application/json',
           // Use MLS API key for MLSSearch
-          'x-api-key': process.env.REAL_ESTATE_MLS_API_KEY || process.env.REAL_ESTATE_API_KEY,
-          'x-user-id': process.env.REAL_ESTATE_USER_ID || 'CRMApp'
+          'x-api-key': apiKey,
+          'x-user-id': userId
         },
         body: JSON.stringify(requestBody),
         signal: controller.signal
@@ -1443,7 +1513,7 @@ async function fetchProperties(filters = {}) {
     } catch (err) {
       if (err && (err.name === 'AbortError' || /timed out/i.test(String(err.message || '')))) {
         console.error('Real Estate API request aborted (timeout):', err)
-        return generateFallbackProperties(filters)
+        return fallbackWithReason('mls_timeout')
       }
       throw err
     } finally {
@@ -1459,8 +1529,11 @@ async function fetchProperties(filters = {}) {
         response_body: errorBody
       })
       
-      // Return fallback/mock data for development
-      return generateFallbackProperties(filters)
+      // Return fallback/mock data only when live MLS request fails
+      return fallbackWithReason(`mls_http_${response.status}`, {
+        status: response.status,
+        statusText: response.statusText
+      })
     }
     
     const data = await response.json()
@@ -1712,6 +1785,8 @@ async function fetchProperties(filters = {}) {
     total: computedTotal ?? returnedCount,
     has_more: computedHasMore,
     filters_applied: filters,
+    is_fallback: false,
+    live_attempted: true,
     // Optional: include a raw provider sample for debugging (dev only)
     debug_provider_sample: filters && (filters.include_raw || filters.debug) ? (rawProps[0] || null) : undefined,
     debug_provider_keys: filters && (filters.include_raw || filters.debug) && rawProps[0]
@@ -1728,7 +1803,12 @@ async function fetchProperties(filters = {}) {
     console.error('Property Search Error:', error)
     
     // Return fallback data on error
-    return generateFallbackProperties(filters)
+    return {
+      ...generateFallbackProperties(filters),
+      live_attempted: true,
+      fallback_reason: 'mls_exception',
+      fallback_details: String(error?.message || error)
+    }
   }
 }
 
@@ -2294,29 +2374,95 @@ async function generateSmartAlerts(db) {
       if (transaction.closing_date) {
         const closingDate = new Date(transaction.closing_date)
         const daysToClosing = Math.ceil((closingDate - now) / (1000 * 60 * 60 * 24))
-        if (daysToClosing <= 7 && daysToClosing > 0) {
-          const currentStageItems = await db.collection('checklist_items')
+        if (!Number.isNaN(closingDate.getTime())) {
+          const stageHistory = Array.isArray(transaction.stage_history) ? transaction.stage_history : []
+          const txType = (transaction.transaction_type || 'sale').toLowerCase()
+          const scopedStages = new Set(
+            stageHistory
+              .filter((entry) => {
+                if (!entry || !entry.stage) return false
+                if (entry.forced === true) return true
+                // Backward-compatible heuristic for older history entries.
+                return entry?.validation_result?.valid === false
+              })
+              .flatMap((entry) => [entry.stage, entry.transitioned_from].filter(Boolean))
+          )
+          scopedStages.add(transaction.current_stage)
+
+          // Backward compatibility for previously force-transitioned records:
+          // older in-memory/Postgres adapter behavior did not persist `$push` stage_history updates.
+          const hasCurrentStageInHistory = stageHistory.some((entry) => entry?.stage === transaction.current_stage)
+          if (!hasCurrentStageInHistory) {
+            const allIncompleteForTx = await db.collection('checklist_items')
+              .find({
+                transaction_id: transaction.id,
+                status: { $ne: 'completed' }
+              })
+              .toArray()
+
+            const currentOrder = getStageOrder(transaction.current_stage, txType)
+            allIncompleteForTx.forEach((task) => {
+              const order = getStageOrder(task.stage, txType)
+              if (order <= currentOrder) scopedStages.add(task.stage)
+            })
+          }
+
+          const stagesToInclude = Array.from(scopedStages)
+
+          const incompleteItems = await db.collection('checklist_items')
             .find({
               transaction_id: transaction.id,
-              stage: transaction.current_stage,
+              stage: { $in: stagesToInclude },
               status: { $ne: 'completed' }
             })
             .toArray()
-          if (currentStageItems.length > 0) {
+          if (incompleteItems.length > 0) {
+            const openStages = Array.from(
+              new Set(incompleteItems.map((task) => task.stage).filter(Boolean))
+            ).sort((a, b) => getStageOrder(a, txType) - getStageOrder(b, txType))
+            const remainingTasks = [...incompleteItems]
+              .sort((a, b) => {
+                const ad = a?.due_date ? new Date(a.due_date).getTime() : Number.POSITIVE_INFINITY
+                const bd = b?.due_date ? new Date(b.due_date).getTime() : Number.POSITIVE_INFINITY
+                if (ad !== bd) return ad - bd
+                return String(a?.title || '').localeCompare(String(b?.title || ''))
+              })
+              .map((task) => ({
+                id: task.id,
+                title: task.title,
+                stage: task.stage,
+                due_date: task.due_date || null,
+                priority: task.priority || 'medium'
+              }))
+
+            const closingPriority = daysToClosing <= 3
+              ? 'urgent'
+              : daysToClosing <= 7
+                ? 'high'
+                : daysToClosing <= 14
+                  ? 'medium'
+                  : 'low'
+
             candidates.push({
               alert_type: 'closing_approaching',
-              priority: daysToClosing <= 3 ? 'urgent' : 'high',
+              priority: closingPriority,
               transaction_id: transaction.id,
               property_address: transaction.property_address,
               client_name: transaction.client_name,
               assigned_agent: transaction.assigned_agent,
-              title: `Closing in ${daysToClosing} Days`,
-              message: `${transaction.property_address} closes in ${daysToClosing} days with ${currentStageItems.length} incomplete tasks`,
+              title: daysToClosing > 0
+                ? `Closing in ${daysToClosing} Days`
+                : `Closing overdue by ${Math.abs(daysToClosing)} ${Math.abs(daysToClosing) === 1 ? 'Day' : 'Days'}`,
+              message: daysToClosing > 0
+                ? `${transaction.property_address} closes in ${daysToClosing} days with ${incompleteItems.length} incomplete tasks`
+                : `${transaction.property_address} is past closing by ${Math.abs(daysToClosing)} days with ${incompleteItems.length} incomplete tasks`,
               details: {
                 days_to_closing: daysToClosing,
                 closing_date: transaction.closing_date,
-                incomplete_tasks: currentStageItems.length,
-                current_stage: transaction.current_stage
+                incomplete_tasks: incompleteItems.length,
+                current_stage: transaction.current_stage,
+                open_stages: openStages,
+                remaining_tasks: remainingTasks
               }
             })
           }
@@ -2330,7 +2476,7 @@ async function generateSmartAlerts(db) {
     for (const cand of candidates) {
       const existing = await collection.findOne({ transaction_id: cand.transaction_id, alert_type: cand.alert_type })
       if (existing) {
-        const keepDismissed = existing.status === 'dismissed'
+        const keepDismissed = existing.status === 'dismissed' && cand.alert_type !== 'closing_approaching'
         const updateFields = {
           // Ensure all core fields are current
           priority: cand.priority,
@@ -2344,10 +2490,16 @@ async function generateSmartAlerts(db) {
         }
         // Backfill missing custom id for legacy docs
         if (!existing.id) updateFields.id = uuidv4()
-        // Only set status to active if it wasn't dismissed
+        // Reactivate all non-dismissed alerts and always reactivate closing alerts.
         if (!keepDismissed) updateFields.status = 'active'
         // Update by unique key (transaction_id, alert_type) to handle legacy docs without id
-        await collection.updateOne({ transaction_id: cand.transaction_id, alert_type: cand.alert_type }, { $set: updateFields })
+        await collection.updateOne(
+          { transaction_id: cand.transaction_id, alert_type: cand.alert_type },
+          {
+            $set: updateFields,
+            ...(!keepDismissed ? { $unset: { dismissed_at: '' } } : {})
+          }
+        )
         const doc = await collection.findOne({ transaction_id: cand.transaction_id, alert_type: cand.alert_type })
         if (doc && doc.status !== 'dismissed') {
           const { _id, ...rest } = doc
@@ -4379,6 +4531,7 @@ function heuristicAssistantParse(message = '') {
                 stage: target_stage,
                 entered_at: new Date(),
                 status: 'active',
+                forced: force,
                 transitioned_from: currentStage,
                 validation_result: validationResult
               }

@@ -29,6 +29,7 @@ export function HeaderAuthControls() {
   const { isSignedIn, userName, userEmail, isCognitoConfigured, signOut } = useAuth()
   const [authOpen, setAuthOpen] = useState(false)
   const [authMode, setAuthMode] = useState('signin')
+  const showDirectAuthTrigger = !isSignedIn
 
   const openAuth = (mode) => {
     setAuthMode(mode)
@@ -47,42 +48,57 @@ export function HeaderAuthControls() {
 
       <NotificationBell />
 
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button variant="ghost" size="icon" className="h-9 w-9 rounded-full p-0">
-            <Avatar className="h-9 w-9">
-              <AvatarFallback>{getInitials(userName || userEmail || 'u')}</AvatarFallback>
-            </Avatar>
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-56">
-          {isCognitoConfigured ? (
-            isSignedIn ? (
-              <>
-                <DropdownMenuLabel>
-                  <div className="font-medium">{userName || 'Signed in user'}</div>
-                  <div className="text-xs text-muted-foreground">{userEmail || ''}</div>
-                </DropdownMenuLabel>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={signOut}>Sign out</DropdownMenuItem>
-              </>
+      {showDirectAuthTrigger ? (
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-9 w-9 rounded-full p-0"
+          onClick={() => openAuth('signin')}
+          title="Sign in or create account"
+          aria-label="Sign in or create account"
+        >
+          <Avatar className="h-9 w-9">
+            <AvatarFallback>{getInitials(userName || userEmail || 'u')}</AvatarFallback>
+          </Avatar>
+        </Button>
+      ) : (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button variant="ghost" size="icon" className="h-9 w-9 rounded-full p-0">
+              <Avatar className="h-9 w-9">
+                <AvatarFallback>{getInitials(userName || userEmail || 'u')}</AvatarFallback>
+              </Avatar>
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-56">
+            {isCognitoConfigured ? (
+              isSignedIn ? (
+                <>
+                  <DropdownMenuLabel>
+                    <div className="font-medium">{userName || 'Signed in user'}</div>
+                    <div className="text-xs text-muted-foreground">{userEmail || ''}</div>
+                  </DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={signOut}>Sign out</DropdownMenuItem>
+                </>
+              ) : (
+                <>
+                  <DropdownMenuLabel>Account</DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={() => openAuth('signin')}>Sign in</DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => openAuth('signup')}>Create account</DropdownMenuItem>
+                </>
+              )
             ) : (
               <>
-                <DropdownMenuLabel>Account</DropdownMenuLabel>
+                <DropdownMenuLabel>Auth not configured</DropdownMenuLabel>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={() => openAuth('signin')}>Sign in</DropdownMenuItem>
-                <DropdownMenuItem onClick={() => openAuth('signup')}>Create account</DropdownMenuItem>
+                <DropdownMenuItem disabled>Set NEXT_PUBLIC_COGNITO_* in .env.local</DropdownMenuItem>
               </>
-            )
-          ) : (
-            <>
-              <DropdownMenuLabel>Auth not configured</DropdownMenuLabel>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem disabled>Set NEXT_PUBLIC_COGNITO_* in .env.local</DropdownMenuItem>
-            </>
-          )}
-        </DropdownMenuContent>
-      </DropdownMenu>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      )}
 
       <AuthDialog open={authOpen} onOpenChange={setAuthOpen} initialMode={authMode} />
     </div>

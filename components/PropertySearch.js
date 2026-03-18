@@ -70,6 +70,7 @@ export function PropertySearch() {
   const [hasMore, setHasMore] = useState(false)
   const [showFilters, setShowFilters] = useState(true)
   const [searchPerformed, setSearchPerformed] = useState(false)
+  const [searchMeta, setSearchMeta] = useState({ isFallback: false, fallbackReason: '' })
 
   // Gallery state
   const [galleryOpen, setGalleryOpen] = useState(false)
@@ -139,6 +140,10 @@ export function PropertySearch() {
         setTotalResults(data.total)
         const pageSize = Number(searchFilters.limit) || 60
         setHasMore(Boolean(data.has_more ?? (Array.isArray(data.properties) && data.properties.length >= pageSize)))
+        setSearchMeta({
+          isFallback: Boolean(data.is_fallback),
+          fallbackReason: String(data.fallback_reason || '')
+        })
         setSearchPerformed(true)
       } else {
         throw new Error(data.error || 'Search failed')
@@ -221,6 +226,7 @@ export function PropertySearch() {
     setProperties([])
     setTotalResults(0)
     setSearchPerformed(false)
+    setSearchMeta({ isFallback: false, fallbackReason: '' })
     setError(null)
   }
 
@@ -559,6 +565,13 @@ export function PropertySearch() {
                     Try Again
                   </Button>
                 </div>
+              </div>
+            )}
+
+            {!loading && !error && searchMeta.isFallback && (
+              <div className="mb-4 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                Showing fallback properties because live MLS request failed
+                {searchMeta.fallbackReason ? ` (${searchMeta.fallbackReason})` : ''}.
               </div>
             )}
 
