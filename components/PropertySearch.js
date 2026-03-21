@@ -202,7 +202,11 @@ export function PropertySearch() {
 
   const handleFilterChange = (key, value) => {
     // Treat the special 'any' option as an unset filter
-    const normalized = value === 'any' ? '' : value
+    let normalized = value === 'any' ? '' : value
+    if (key === 'baths' && normalized !== '') {
+      const num = Number(normalized)
+      normalized = Number.isFinite(num) ? String(Math.ceil(num)) : ''
+    }
     setFilters(prev => ({
       ...prev,
       [key]: normalized,
@@ -428,9 +432,7 @@ export function PropertySearch() {
                   <SelectContent>
                     <SelectItem value="any">Any</SelectItem>
                     <SelectItem value="1">1+</SelectItem>
-                    <SelectItem value="1.5">1.5+</SelectItem>
                     <SelectItem value="2">2+</SelectItem>
-                    <SelectItem value="2.5">2.5+</SelectItem>
                     <SelectItem value="3">3+</SelectItem>
                     <SelectItem value="4">4+</SelectItem>
                   </SelectContent>
