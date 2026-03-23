@@ -468,27 +468,33 @@ export function TransactionTimeline({ transactionId, focusTaskId = null, focusSt
       mr.onstop = async () => {
         try {
           const blob = new Blob(chunks, { type: mr.mimeType || 'audio/webm' })
-          const note = memoNotes[itemId] || ''
           const durationSec = recRef.current.elapsed || 0
           const form = new FormData()
           form.append('audio', blob, 'memo.webm')
-          if (note) form.append('note', note)
+          form.append('transcribe_only', 'true')
           form.append('duration', String(Math.round(durationSec)))
           const res = await fetch(`/api/checklist/${itemId}/voice`, { method: 'POST', body: form })
           const data = await res.json().catch(() => ({}))
           if (!res.ok || data?.success === false) {
             console.error('Upload failed', data)
-            alert(data?.error || 'Failed to upload voice memo')
-          } else {
-            // Replace item in checklist with updated one from server if provided
-            if (data.checklist_item) {
-              setChecklistItems((items) => items.map((it) => it.id === itemId ? data.checklist_item : it))
-            } else {
-              // fallback refresh
+            if (String(data?.error || '').toLowerCase().includes('checklist item not found')) {
               fetchChecklist()
+              alert('Task not found on server. Checklist was refreshed.')
+            } else {
+              alert(data?.error || 'Failed to upload voice memo')
             }
-            // clear note for that item
-            setMemoNotes((m) => ({ ...m, [itemId]: '' }))
+          } else {
+            if (typeof data?.transcript === 'string') {
+              const transcript = data.transcript.trim()
+              if (transcript) {
+                setMemoNotes((m) => ({ ...m, [itemId]: transcript }))
+              } else {
+                alert('No speech detected. You can type memo manually.')
+              }
+            } else if (data.checklist_item) {
+              // Backward compatibility if server still returns persisted checklist item.
+              setChecklistItems((items) => items.map((it) => it.id === itemId ? data.checklist_item : it))
+            }
           }
         } catch (err) {
           console.error('Error finalizing voice memo upload', err)
@@ -558,12 +564,47 @@ export function TransactionTimeline({ transactionId, focusTaskId = null, focusSt
     }
   }
 
-  const TaskItem = ({ item, indent = 0, isChild = false }) => {
+  const saveTextMemo = async (itemId) => {
+    const note = (memoNotes[itemId] || '').trim()
+    if (!note) return
+
+    try {
+      const res = await fetch(`/api/checklist/${itemId}/voice`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ note })
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || data?.success === false) {
+        console.error('Failed to save typed memo', data)
+        if (String(data?.error || '').toLowerCase().includes('checklist item not found')) {
+          fetchChecklist()
+          alert('Task not found on server. Checklist was refreshed.')
+        } else {
+          alert(data?.error || 'Failed to save memo note')
+        }
+        return
+      }
+
+      if (data.checklist_item) {
+        setChecklistItems((items) => items.map((it) => it.id === itemId ? data.checklist_item : it))
+      } else {
+        fetchChecklist()
+      }
+      setMemoNotes((m) => ({ ...m, [itemId]: '' }))
+    } catch (e) {
+      console.error('saveTextMemo error', e)
+      alert('Failed to save memo note')
+    }
+  }
+
+  const renderTaskItem = (item, indent = 0, isChild = false) => {
     const StatusIcon = STATUS_CONFIG[item.status]?.icon || Circle
     const isFocusedTask = highlightedTaskId === item.id
     
     return (
       <Card
+        key={item.id}
         id={`task-${item.id}`}
         data-task-id={item.id}
         className={`mb-3 hover:shadow-sm transition-shadow ${isChild ? 'bg-muted/30' : ''} ${isFocusedTask ? 'ring-2 ring-primary/60 shadow-md' : ''}`}
@@ -636,9 +677,15 @@ export function TransactionTimeline({ transactionId, focusTaskId = null, focusSt
                     <div className="flex items-center gap-2">
                       <Input
                         className={`h-8 ${isChild ? 'text-xs' : 'text-sm'}`}
-                        placeholder="Memo note (optional)"
+                        placeholder="Memo note (optional, press Enter to save)"
                         value={memoNotes[item.id] || ''}
                         onChange={(e) => setMemoNotes((m) => ({ ...m, [item.id]: e.target.value }))}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault()
+                            saveTextMemo(item.id)
+                          }
+                        }}
                         style={{ maxWidth: 240 }}
                       />
                       <Button size="sm" onClick={() => startRecording(item.id)}>
@@ -650,23 +697,37 @@ export function TransactionTimeline({ transactionId, focusTaskId = null, focusSt
                   {/* List of memos (transcriptions) */}
                   {Array.isArray(item.voice_memos) && item.voice_memos.length > 0 && (
                     <div className="space-y-2">
-                      {item.voice_memos.map((m) => (
-                        <div key={m.id} className="flex items-start justify-between bg-muted/40 p-2 rounded">
-                          <div className="flex-1 pr-2">
-                            <div className="text-foreground break-words"><strong>Transcript:</strong> {m.text || '(empty)'}
-                            </div>
-                            <div className="text-muted-foreground text-xs mt-1 flex items-center gap-2">
-                              {m.note && <span>Note: {m.note}</span>}
-                              {m.duration_sec != null && (
-                                <span>• {Math.round(m.duration_sec)}s</span>
+                      {item.voice_memos.map((m) => {
+                        const hasTranscript = !!(m.text || '').trim()
+                        return (
+                          <div
+                            key={m.id}
+                            className={`flex items-start justify-between p-2 rounded ${hasTranscript ? 'bg-muted/40' : 'bg-amber-50 border border-amber-100'}`}
+                          >
+                            <div className="flex-1 pr-2">
+                              {hasTranscript && (
+                                <div className="text-foreground break-words">
+                                  <strong>Transcript:</strong> {m.text}
+                                </div>
                               )}
+                              <div className={`text-muted-foreground text-xs flex items-center gap-2 ${hasTranscript ? 'mt-1' : ''}`}>
+                                {m.note && (
+                                  <span className="inline-flex items-start gap-1">
+                                    <FileText className="h-3 w-3 mt-0.5" />
+                                    <span className="break-words">{m.note}</span>
+                                  </span>
+                                )}
+                                {m.duration_sec != null && (
+                                  <span>{Math.round(m.duration_sec)}s</span>
+                                )}
+                              </div>
                             </div>
+                            <Button size="icon" variant="ghost" onClick={() => deleteVoiceMemo(item.id, m.id)}>
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
                           </div>
-                          <Button size="icon" variant="ghost" onClick={() => deleteVoiceMemo(item.id, m.id)}>
-                            <Trash2 className="h-4 w-4" />
-                          </Button>
-                        </div>
-                      ))}
+                        )
+                      })}
                     </div>
                   )}
                 </div>
@@ -843,11 +904,11 @@ export function TransactionTimeline({ transactionId, focusTaskId = null, focusSt
                             const children = checklistItems.filter(c => c.parent_id === parent.id && c.stage === stageKey)
                             return (
                               <div key={parent.id}>
-                                <TaskItem item={parent} />
+                                {renderTaskItem(parent)}
                                 {children.length > 0 && (
                                   <div className="mt-2 ml-6 pl-4 space-y-2 border-l border-muted-foreground/20">
                                     {children.map(child => (
-                                      <TaskItem key={child.id} item={child} indent={0} isChild={true} />
+                                      renderTaskItem(child, 0, true)
                                     ))}
                                   </div>
                                 )}

@@ -1,9 +1,11 @@
 ﻿import { Pool } from 'pg'
-import { v4 as uuidv4 } from 'uuid'
+import { randomUUID } from 'crypto'
 import { NextResponse } from 'next/server'
 import fs from 'fs'
 import nodePath from 'path'
 import crypto from 'crypto'
+
+const uuidv4 = () => randomUUID()
 
 // Database connection
 let pgPool
@@ -649,6 +651,19 @@ function getAiSearchBaseUrl() {
     return null
   }
   return raw.replace(/\/+$/, '')
+}
+
+async function findChecklistItemById(db, rawItemId) {
+  const itemId = String(rawItemId || '').trim()
+  if (!itemId) return null
+
+  let existing = await db.collection('checklist_items').findOne({ id: itemId })
+  if (existing) return existing
+
+  // Backward compatibility for legacy numeric/non-string IDs in stored docs.
+  const all = await db.collection('checklist_items').find({}).toArray()
+  existing = all.find((it) => String(it?.id ?? '') === itemId)
+  return existing || null
 }
 function isGreetingOrSmallTalk(message = '') {
   const raw = String(message || '').trim()
@@ -1601,9 +1616,7 @@ async function fetchProperties(filters = {}) {
     // Build MLSSearch request body
     const requestBody = {
       size: Math.min(250, Number(limit) || 60),
-      status: 'Active',
-      // pass-through if provided
-      property_type: property_type || undefined
+      status: 'Active'
     }
     // Pagination with MLSSearch uses resultIndex (1-based per API samples)
     if (Number(offset) > 0) {
@@ -1911,6 +1924,12 @@ async function fetchProperties(filters = {}) {
         src.apn || src.parcel_number || src.parcelNumber || src.property_identifier || null
       )
 
+      const propertySubType = Array.isArray(listing?.property?.propertySubType)
+        ? listing.property.propertySubType[0]
+        : (listing?.property?.propertySubType || null)
+      const propertyTypeMain = listing?.property?.propertyType || src.property_type || src.type || ''
+      const normalizedPropertyType = propertySubType || propertyTypeMain
+
       return {
         id: provider_id || `prop_${Date.now()}_${Math.random()}`,
         provider_id,
@@ -1926,7 +1945,9 @@ async function fetchProperties(filters = {}) {
         bedrooms: (listing?.property?.bedroomsTotal ?? src.bedrooms ?? src.beds ?? publicRec?.bedrooms ?? null),
         bathrooms: (listing?.property?.bathroomsTotal ?? src.bathrooms ?? src.baths ?? publicRec?.bathrooms ?? null),
         square_feet: (listing?.property?.livingArea ?? src.square_feet ?? src.sqft ?? (publicRec?.squareFeet ? Number(publicRec.squareFeet) : null)),
-        property_type: (listing?.property?.propertyType || (Array.isArray(listing?.property?.propertySubType) && listing.property.propertySubType[0]) || src.property_type || src.type || ''),
+        property_type: normalizedPropertyType,
+        property_type_main: propertyTypeMain || null,
+        property_type_sub: propertySubType || null,
         listing_status: (listing?.standardStatus || listing?.customStatus || src.listing_status || src.status || ''),
         description: src.description || '',
         images,
@@ -1942,6 +1963,14 @@ async function fetchProperties(filters = {}) {
       }
     })
 
+  // Apply property type filtering locally because MLS schema/category values differ from UI labels.
+  const typeFiltered = property_type
+    ? normalized.filter((p) => matchesPropertyTypeSelection(p, property_type))
+    : normalized
+
+  // Apply deterministic server-side sorting so UI order always matches selected sort option.
+  const sortedNormalized = sortPropertiesBySelection(typeFiltered, sort_by)
+
   // MLSDetail image enrichment removed: using MLSSearch include_photos and inline media.
 
   // Pagination & totals (MLSSearch uses resultCount/resultIndex)
@@ -1949,18 +1978,26 @@ async function fetchProperties(filters = {}) {
     typeof data.resultCount === 'number' ? data.resultCount :
     (typeof data.total === 'number' ? data.total : (typeof data.count === 'number' ? data.count : null))
   )
-  const returnedCount = Array.isArray(normalized) ? normalized.length : 0
+  const returnedCount = Array.isArray(sortedNormalized) ? sortedNormalized.length : 0
   const idx = typeof data.resultIndex === 'number' ? data.resultIndex : (Number(offset) || 1)
+  const providerTotalLooksValid = computedTotal !== null && Number.isFinite(computedTotal) && computedTotal >= returnedCount
   const computedHasMore = (typeof data.has_more === 'boolean')
     ? data.has_more
-    : (computedTotal !== null && Number.isFinite(idx)
+    : (providerTotalLooksValid && Number.isFinite(idx)
         ? ((idx - 1) + returnedCount) < computedTotal
         : (Number.isFinite(Number(limit)) ? returnedCount >= Number(limit) : false))
 
+  const hasLocalPropertyTypeFilter = Boolean(property_type)
+  const baseTotal = providerTotalLooksValid ? computedTotal : returnedCount
+  const effectiveTotal = hasLocalPropertyTypeFilter
+    ? returnedCount
+    : baseTotal
+  const effectiveHasMore = hasLocalPropertyTypeFilter ? false : computedHasMore
+
   return {
-    properties: normalized,
-    total: computedTotal ?? returnedCount,
-    has_more: computedHasMore,
+    properties: sortedNormalized,
+    total: effectiveTotal,
+    has_more: effectiveHasMore,
     filters_applied: filters,
     is_fallback: false,
     live_attempted: true,
@@ -2988,6 +3025,112 @@ function getDefaultTasksForStage(stage, transactionType = 'sale') {
   return templates[stage] || []
 }
 
+function toNumericComparable(value) {
+  if (value === null || value === undefined) return null
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  const parsed = Number(String(value).replace(/[^0-9.-]/g, ''))
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function toTimestampComparable(value) {
+  if (!value) return null
+  const ts = Date.parse(String(value))
+  return Number.isFinite(ts) ? ts : null
+}
+
+function normalizePropertyTypeToken(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+}
+
+function matchesPropertyTypeSelection(property = {}, selectedType = '') {
+  const selected = normalizePropertyTypeToken(selectedType)
+  if (!selected || selected === 'any') return true
+
+  const haystack = [
+    property?.property_type,
+    property?.property_type_main,
+    property?.property_type_sub
+  ]
+    .map(normalizePropertyTypeToken)
+    .filter(Boolean)
+    .join(' ')
+
+  if (!haystack) return false
+
+  if (selected === 'single family') {
+    // Keep this strict so "townhouse" and other residential categories don't leak in.
+    if (/townhouse|townhome|condo|condominium|multi family|multifamily|duplex|triplex|fourplex|quadplex|apartment|land|lot|farm|ranch|commercial/.test(haystack)) {
+      return false
+    }
+    return /single family residence|single family|singlefamily|detached|sfr/.test(haystack)
+  }
+  if (selected === 'condo') {
+    return /condo|condominium/.test(haystack)
+  }
+  if (selected === 'townhouse') {
+    return /townhouse|townhome/.test(haystack)
+  }
+  if (selected === 'multi family') {
+    return /multi family|multifamily|duplex|triplex|fourplex|quadplex|residential income|apartment/.test(haystack)
+  }
+  if (selected === 'land') {
+    return /land|lot|acreage|farm|ranch|agricultural/.test(haystack)
+  }
+
+  return haystack.includes(selected)
+}
+
+function sortPropertiesBySelection(properties = [], sortBy = 'price_asc') {
+  const list = Array.isArray(properties) ? [...properties] : []
+  const get = {
+    price: (p) => toNumericComparable(p?.price),
+    beds: (p) => toNumericComparable(p?.bedrooms),
+    baths: (p) => toNumericComparable(p?.bathrooms),
+    sqft: (p) => toNumericComparable(p?.square_feet),
+    // Prefer listing_date; fall back to days_on_market (lower is newer).
+    recency: (p) => {
+      const ts = toTimestampComparable(p?.listing_date)
+      if (ts !== null) return ts
+      const dom = toNumericComparable(p?.days_on_market)
+      return dom !== null ? -dom : null
+    }
+  }
+
+  const compareNullable = (a, b, direction = 'asc') => {
+    const av = a === null || a === undefined
+    const bv = b === null || b === undefined
+    if (av && bv) return 0
+    if (av) return 1
+    if (bv) return -1
+    if (a === b) return 0
+    return direction === 'asc' ? (a < b ? -1 : 1) : (a > b ? -1 : 1)
+  }
+
+  list.sort((a, b) => {
+    switch (sortBy) {
+      case 'price_desc':
+        return compareNullable(get.price(a), get.price(b), 'desc')
+      case 'date_desc':
+        return compareNullable(get.recency(a), get.recency(b), 'desc')
+      case 'beds_desc': {
+        const byBeds = compareNullable(get.beds(a), get.beds(b), 'desc')
+        if (byBeds !== 0) return byBeds
+        return compareNullable(get.baths(a), get.baths(b), 'desc')
+      }
+      case 'sqft_desc':
+        return compareNullable(get.sqft(a), get.sqft(b), 'desc')
+      case 'price_asc':
+      default:
+        return compareNullable(get.price(a), get.price(b), 'asc')
+    }
+  })
+
+  return list
+}
+
 function generateFallbackProperties(filters = {}) {
   const mockProperties = [
     {
@@ -3117,11 +3260,19 @@ function generateFallbackProperties(filters = {}) {
       p.state.toLowerCase().includes(location)
     )
   }
+  if (filters.property_type) {
+    filteredProperties = filteredProperties.filter(p => matchesPropertyTypeSelection(p, filters.property_type))
+  }
+
+  const sorted = sortPropertiesBySelection(filteredProperties, filters.sort_by)
+  const offset = Math.max(0, Number(filters.offset) || 0)
+  const limit = Math.max(1, Number(filters.limit) || sorted.length || 1)
+  const paged = sorted.slice(offset, offset + limit)
 
   return {
-    properties: filteredProperties,
-    total: filteredProperties.length,
-    has_more: false,
+    properties: paged,
+    total: sorted.length,
+    has_more: offset + paged.length < sorted.length,
     filters_applied: filters,
     is_fallback: true
   }
@@ -8592,100 +8743,139 @@ function heuristicAssistantParse(message = '') {
       }
     }
 
-    // POST /api/checklist/:id/voice - Upload a voice memo (multipart/form-data) and store transcription
+    // POST /api/checklist/:id/voice - Save a memo (voice/typed) or transcribe-only
     if (route.match(/^\/checklist\/[^\/]+\/voice$/) && method === 'POST') {
       try {
-        const itemId = path[1]
-        const existing = await db.collection('checklist_items').findOne({ id: itemId })
+        const itemId = String(path[1] || '').trim()
+        const existing = await findChecklistItemById(db, itemId)
         if (!existing) {
           return handleCORS(NextResponse.json({ success: false, error: 'Checklist item not found' }, { status: 404 }))
         }
+        const canonicalItemId = String(existing.id)
 
-        // Parse multipart form data
-        let form
-        try {
-          form = await request.formData()
-        } catch (_) {
-          return handleCORS(NextResponse.json({ success: false, error: 'Expected multipart/form-data with an "audio" file' }, { status: 400 }))
+        let file = null
+        let note = ''
+        let durationSec = Number.NaN
+        let transcribeOnly = false
+        const contentType = (request.headers.get('content-type') || '').toLowerCase()
+
+        if (contentType.includes('application/json')) {
+          let body
+          try {
+            body = await request.json()
+          } catch (_) {
+            return handleCORS(NextResponse.json({ success: false, error: 'Invalid JSON body' }, { status: 400 }))
+          }
+          note = (body?.note || '').toString().trim()
+          durationSec = Number(body?.duration)
+          transcribeOnly = Boolean(body?.transcribe_only || body?.transcribeOnly)
+        } else {
+          // Parse multipart form data
+          let form
+          try {
+            form = await request.formData()
+          } catch (_) {
+            return handleCORS(NextResponse.json({ success: false, error: 'Expected JSON { note } or multipart/form-data' }, { status: 400 }))
+          }
+          file = form.get('audio')
+          note = (form.get('note') || '').toString().trim()
+          durationSec = Number(form.get('duration'))
+          const rawTranscribeOnly = String(form.get('transcribe_only') || '').toLowerCase()
+          transcribeOnly = rawTranscribeOnly === 'true' || rawTranscribeOnly === '1' || rawTranscribeOnly === 'yes'
         }
 
-        const file = form.get('audio')
-        if (!file || typeof file.arrayBuffer !== 'function') {
-          return handleCORS(NextResponse.json({ success: false, error: 'Missing audio file in form field "audio"' }, { status: 400 }))
+        const hasAudio = !!file && typeof file.arrayBuffer === 'function'
+        if (transcribeOnly && !hasAudio) {
+          return handleCORS(NextResponse.json({ success: false, error: 'Audio file is required when transcribe_only is true' }, { status: 400 }))
         }
-        const note = (form.get('note') || '').toString()
-        const durationSec = Number(form.get('duration'))
-        const mime = (file.type || 'audio/webm').toString()
-
-        // Transcribe using provider-compatible audio transcription API
-        const transcriptionKey = process.env.OPENAI_API_KEY || process.env.GROQ_API_KEY
-        if (!transcriptionKey) {
-          return handleCORS(NextResponse.json({ success: false, error: 'OPENAI_API_KEY or GROQ_API_KEY not configured for transcription' }, { status: 500 }))
+        if (!hasAudio && !note) {
+          return handleCORS(NextResponse.json({ success: false, error: 'Provide an audio file or a memo note' }, { status: 400 }))
         }
+        const mime = hasAudio ? (file.type || 'audio/webm').toString() : 'audio/webm'
         const memoId = uuidv4()
-        const fileName = `${itemId}-${memoId}.webm`
-        const buffer = Buffer.from(await file.arrayBuffer())
 
         let transcriptText = ''
-        try {
-          const fd = new FormData()
-          fd.append('model', 'whisper-1')
-          // Use a Blob so multipart/form-data boundary and filename are correct
-          const blob = new Blob([buffer], { type: mime || 'audio/webm' })
-          fd.append('file', blob, fileName)
-          // Optional: language hint if known; comment out if undesired
-          // fd.append('language', 'en')
-
-          const transcriptionBase = process.env.TRANSCRIPTION_BASE_URL || openaiUtility.baseURL
-          const transcriptionUrl = `${transcriptionBase.replace(/\/$/, '')}/audio/transcriptions`
-          const res = await fetch(transcriptionUrl, {
-            method: 'POST',
-            headers: { Authorization: `Bearer ${transcriptionKey}` },
-            body: fd
-          })
-          if (!res.ok) {
-            const errTxt = await res.text().catch(() => '')
-            throw new Error(`Transcription failed: ${res.status} ${errTxt}`)
+        if (hasAudio) {
+          // Transcribe using provider-compatible audio transcription API
+          const transcriptionKey = process.env.TRANSCRIPTION_API_KEY || process.env.OPENAI_API_KEY || process.env.GROQ_API_KEY
+          if (!transcriptionKey) {
+            return handleCORS(NextResponse.json({ success: false, error: 'TRANSCRIPTION_API_KEY, OPENAI_API_KEY, or GROQ_API_KEY not configured for transcription' }, { status: 500 }))
           }
-          const json = await res.json()
-          transcriptText = (json.text || '').toString()
-        } catch (e) {
-          console.error('OpenAI transcription error', e)
-          return handleCORS(NextResponse.json({ success: false, error: 'Failed to transcribe audio' }, { status: 502 }))
+          const fileName = `${canonicalItemId}-${memoId}.webm`
+          const buffer = Buffer.from(await file.arrayBuffer())
+          try {
+            const fd = new FormData()
+            fd.append('model', 'whisper-1')
+            // Use a Blob so multipart/form-data boundary and filename are correct
+            const blob = new Blob([buffer], { type: mime || 'audio/webm' })
+            fd.append('file', blob, fileName)
+            // Optional: language hint if known; comment out if undesired
+            // fd.append('language', 'en')
+
+            const transcriptionBase = process.env.TRANSCRIPTION_BASE_URL || openaiUtility.baseURL
+            const transcriptionUrl = `${transcriptionBase.replace(/\/$/, '')}/audio/transcriptions`
+            const res = await fetch(transcriptionUrl, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${transcriptionKey}` },
+              body: fd
+            })
+            if (!res.ok) {
+              const errTxt = await res.text().catch(() => '')
+              throw new Error(`Transcription failed: ${res.status} ${errTxt}`)
+            }
+            const json = await res.json()
+            transcriptText = (json.text || '').toString()
+          } catch (e) {
+            console.error('OpenAI transcription error', e)
+            const safeMessage = String(e?.message || 'Failed to transcribe audio')
+              .replace(/sk-[A-Za-z0-9_-]+/g, 'sk-***')
+              .slice(0, 320)
+            return handleCORS(NextResponse.json({ success: false, error: safeMessage }, { status: 502 }))
+          }
+        }
+
+        if (transcribeOnly) {
+          return handleCORS(NextResponse.json({
+            success: true,
+            transcript: transcriptText,
+            duration_sec: Number.isFinite(durationSec) ? durationSec : null
+          }))
         }
 
         const memo = {
           id: memoId,
           text: transcriptText,
           note,
-          duration_sec: Number.isFinite(durationSec) ? durationSec : null,
+          duration_sec: hasAudio && Number.isFinite(durationSec) ? durationSec : null,
+          source: hasAudio ? 'voice' : 'typed',
           created_at: new Date()
         }
 
         const existingMemos = Array.isArray(existing.voice_memos) ? existing.voice_memos : []
         await db.collection('checklist_items').updateOne(
-          { id: itemId },
+          { id: canonicalItemId },
           { $set: { voice_memos: [...existingMemos, memo], updated_at: new Date() } }
         )
 
-        const updated = await db.collection('checklist_items').findOne({ id: itemId })
+        const updated = await db.collection('checklist_items').findOne({ id: canonicalItemId })
         const { _id, ...cleaned } = updated
         return handleCORS(NextResponse.json({ success: true, memo, checklist_item: cleaned }, { status: 201 }))
       } catch (error) {
-        console.error('Error uploading voice memo:', error)
-        return handleCORS(NextResponse.json({ success: false, error: 'Failed to upload voice memo' }, { status: 500 }))
+        console.error('Error saving memo:', error)
+        return handleCORS(NextResponse.json({ success: false, error: 'Failed to save memo' }, { status: 500 }))
       }
     }
 
     // DELETE /api/checklist/:id/voice/:memoId - Delete a transcribed memo
     if (route.match(/^\/checklist\/[^\/]+\/voice\/[^\/]+$/) && method === 'DELETE') {
       try {
-        const itemId = path[1]
+        const itemId = String(path[1] || '').trim()
         const memoId = path[3]
-        const existing = await db.collection('checklist_items').findOne({ id: itemId })
+        const existing = await findChecklistItemById(db, itemId)
         if (!existing) {
           return handleCORS(NextResponse.json({ success: false, error: 'Checklist item not found' }, { status: 404 }))
         }
+        const canonicalItemId = String(existing.id)
         const memos = Array.isArray(existing.voice_memos) ? existing.voice_memos : []
         const memo = memos.find(m => m.id === memoId)
         if (!memo) {
@@ -8693,7 +8883,7 @@ function heuristicAssistantParse(message = '') {
         }
         const filtered = memos.filter(m => m.id !== memoId)
         await db.collection('checklist_items').updateOne(
-          { id: itemId },
+          { id: canonicalItemId },
           { $set: { voice_memos: filtered, updated_at: new Date() } }
         )
         return handleCORS(NextResponse.json({ success: true }))
