@@ -7,8 +7,16 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { Separator } from '@/components/ui/separator'
 import { ScrollArea } from '@/components/ui/scroll-area'
+import { toast } from '@/hooks/use-toast'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { 
   Search, 
   Filter,
@@ -16,17 +24,15 @@ import {
   Bath,
   Square,
   MapPin,
-  DollarSign,
   Calendar,
   Home,
-  Building,
   Car,
   Droplets,
   Flame,
   Loader2,
   AlertCircle,
   RefreshCw,
-  SlidersHorizontal,
+  UserPlus,
   X,
   ChevronLeft,
   ChevronRight,
@@ -68,9 +74,15 @@ export function PropertySearch() {
   const [error, setError] = useState(null)
   const [totalResults, setTotalResults] = useState(0)
   const [hasMore, setHasMore] = useState(false)
-  const [showFilters, setShowFilters] = useState(true)
+  const [filtersDialogOpen, setFiltersDialogOpen] = useState(false)
   const [searchPerformed, setSearchPerformed] = useState(false)
   const [searchMeta, setSearchMeta] = useState({ isFallback: false, fallbackReason: '' })
+  const [leadAssignDialogOpen, setLeadAssignDialogOpen] = useState(false)
+  const [leads, setLeads] = useState([])
+  const [leadsLoading, setLeadsLoading] = useState(false)
+  const [addingToLead, setAddingToLead] = useState(false)
+  const [selectedLeadId, setSelectedLeadId] = useState('')
+  const [propertyToAssign, setPropertyToAssign] = useState(null)
 
   // Gallery state
   const [galleryOpen, setGalleryOpen] = useState(false)
@@ -100,6 +112,61 @@ export function PropertySearch() {
     if (!num) return 'N/A'
     return new Intl.NumberFormat('en-US').format(num)
   }
+
+  const getPropertyAddressLine = (property = {}) => (
+    typeof property.address === 'object'
+      ? (property.address.street || property.address.address || '')
+      : (property.address || '')
+  )
+
+  const getPropertyLocationLine = (property = {}) => (
+    [property.city, property.state, property.zipcode].filter(Boolean).join(', ')
+  )
+
+  const normalizeCompareText = (value) => String(value || '').trim().toLowerCase()
+
+  const buildInterestedPropertyPayload = (property = {}) => {
+    const addressLine = getPropertyAddressLine(property)
+    const fallbackImage = Array.isArray(property.images) && property.images.length > 0 ? property.images[0] : null
+    return {
+      property_id: property.id || property.property_id || property.mls_number || null,
+      mls_number: property.mls_number || null,
+      address: addressLine || null,
+      city: property.city || null,
+      state: property.state || null,
+      zipcode: property.zipcode || null,
+      price: property.price ?? null,
+      bedrooms: property.bedrooms ?? null,
+      bathrooms: property.bathrooms ?? null,
+      square_feet: property.square_feet ?? null,
+      property_type: property.property_type || null,
+      primary_image: property.primary_image || fallbackImage || null,
+      source: 'property_search',
+      added_at: new Date().toISOString()
+    }
+  }
+
+  const fetchLeadsForDialog = useCallback(async () => {
+    setLeadsLoading(true)
+    try {
+      const response = await fetch('/api/leads')
+      if (!response.ok) {
+        throw new Error(`Failed to fetch leads: ${response.status}`)
+      }
+      const data = await response.json()
+      const leadList = Array.isArray(data) ? data : (Array.isArray(data?.leads) ? data.leads : [])
+      setLeads(leadList)
+    } catch (error) {
+      console.error('Failed to fetch leads for property assignment:', error)
+      toast({
+        title: 'Could not load leads',
+        description: error?.message || 'Please try again.',
+        variant: 'destructive'
+      })
+    } finally {
+      setLeadsLoading(false)
+    }
+  }, [])
 
   const performSearch = useCallback(async (searchFilters, resetResults = true) => {
     if (!searchFilters.location && !searchFilters.beds && !searchFilters.baths && 
@@ -168,6 +235,12 @@ export function PropertySearch() {
     }
   }, [debouncedFilters, performSearch, searchPerformed])
 
+  useEffect(() => {
+    if (leadAssignDialogOpen) {
+      fetchLeadsForDialog()
+    }
+  }, [leadAssignDialogOpen, fetchLeadsForDialog])
+
   // Keyboard navigation for gallery
   useEffect(() => {
     if (!galleryOpen) return
@@ -227,11 +300,116 @@ export function PropertySearch() {
       limit: 60,
       offset: 0
     })
+    setFiltersDialogOpen(false)
     setProperties([])
     setTotalResults(0)
     setSearchPerformed(false)
     setSearchMeta({ isFallback: false, fallbackReason: '' })
     setError(null)
+  }
+
+  const clearOptionalFilters = () => {
+    setFilters(prev => ({
+      ...prev,
+      beds: '',
+      baths: '',
+      min_price: '',
+      max_price: '',
+      property_type: '',
+      offset: 0
+    }))
+  }
+
+  const hasLocationQuery = Boolean(filters.location?.trim())
+  const activeOptionalFilters = [filters.beds, filters.baths, filters.min_price, filters.max_price, filters.property_type]
+    .filter(Boolean)
+    .length
+
+  const openLeadAssignDialog = (property) => {
+    setPropertyToAssign(property)
+    setSelectedLeadId('')
+    setLeadAssignDialogOpen(true)
+  }
+
+  const handleLeadAssignDialogOpenChange = (open) => {
+    setLeadAssignDialogOpen(open)
+    if (!open) {
+      setSelectedLeadId('')
+      setPropertyToAssign(null)
+    }
+  }
+
+  const handleAddPropertyToLead = async () => {
+    if (!propertyToAssign || !selectedLeadId) return
+
+    setAddingToLead(true)
+    try {
+      const leadResponse = await fetch(`/api/leads/${selectedLeadId}`)
+      if (!leadResponse.ok) {
+        throw new Error(`Failed to load lead: ${leadResponse.status}`)
+      }
+      const lead = await leadResponse.json()
+      const existing = Array.isArray(lead?.interested_properties) ? lead.interested_properties : []
+      const candidate = buildInterestedPropertyPayload(propertyToAssign)
+
+      const candidateKey = [
+        normalizeCompareText(candidate.property_id),
+        normalizeCompareText(candidate.mls_number),
+        normalizeCompareText(candidate.address),
+        normalizeCompareText(candidate.city),
+        normalizeCompareText(candidate.state),
+        normalizeCompareText(candidate.zipcode)
+      ].join('|')
+
+      const alreadyAdded = existing.some((item) => {
+        const existingKey = [
+          normalizeCompareText(item?.property_id),
+          normalizeCompareText(item?.mls_number),
+          normalizeCompareText(item?.address),
+          normalizeCompareText(item?.city),
+          normalizeCompareText(item?.state),
+          normalizeCompareText(item?.zipcode)
+        ].join('|')
+        return existingKey === candidateKey
+      })
+
+      if (alreadyAdded) {
+        toast({
+          title: 'Property already added',
+          description: `${lead?.name || 'This lead'} already has this property in interested homes.`
+        })
+        handleLeadAssignDialogOpenChange(false)
+        return
+      }
+
+      const updateResponse = await fetch(`/api/leads/${selectedLeadId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          interested_properties: [candidate, ...existing]
+        })
+      })
+
+      if (!updateResponse.ok) {
+        throw new Error(`Failed to update lead: ${updateResponse.status}`)
+      }
+
+      const updatedLead = await updateResponse.json()
+      toast({
+        title: 'Property added to lead',
+        description: `${updatedLead?.name || 'Lead'} can now be tracked for this property.`
+      })
+      handleLeadAssignDialogOpenChange(false)
+    } catch (error) {
+      console.error('Failed adding property to lead:', error)
+      toast({
+        title: 'Could not add property',
+        description: error?.message || 'Please try again.',
+        variant: 'destructive'
+      })
+    } finally {
+      setAddingToLead(false)
+    }
   }
 
   const PropertyCard = ({ property }) => {
@@ -347,9 +525,13 @@ export function PropertySearch() {
               </div>
             )}
           </div>
-          <div className="pt-4">
+          <div className="pt-4 flex gap-2">
             <Button variant="outline" size="sm" onClick={() => openGallery(property)}>
               View Photos
+            </Button>
+            <Button size="sm" onClick={() => openLeadAssignDialog(property)} className="flex items-center gap-1">
+              <UserPlus className="h-4 w-4" />
+              Add to Lead
             </Button>
           </div>
         </CardContent>
@@ -367,126 +549,50 @@ export function PropertySearch() {
   return (
     <div className="space-y-6">
       {/* Search Header */}
-      <div className="flex items-center justify-between">
+      <div>
         <div>
           <h2 className="text-2xl font-bold">Property Search</h2>
-          <p className="text-muted-foreground">Find properties with advanced filters</p>
+          <p className="text-muted-foreground">Search by location, city, state, ZIP, or full address</p>
         </div>
-        <Button
-          variant="outline"
-          onClick={() => setShowFilters(!showFilters)}
-          className="flex items-center gap-2"
-        >
-          <SlidersHorizontal className="h-4 w-4" />
-          {showFilters ? 'Hide' : 'Show'} Filters
-        </Button>
       </div>
 
-      {/* Search Filters */}
-      {showFilters && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-lg flex items-center gap-2">
-              <Filter className="h-5 w-5" />
-              Search Filters
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-              {/* Location */}
-              <div className="space-y-2">
-                <Label htmlFor="location">Location</Label>
-                <Input
-                  id="location"
-                  placeholder="City, State, or ZIP"
-                  value={filters.location}
-                  onChange={(e) => handleFilterChange('location', e.target.value)}
-                />
-              </div>
-
-              {/* Bedrooms */}
-              <div className="space-y-2">
-                <Label htmlFor="beds">Bedrooms</Label>
-                <Select value={filters.beds || 'any'} onValueChange={(value) => handleFilterChange('beds', value)}>
-                  <SelectTrigger>
-                    <SelectValue placeholder="Any" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="any">Any</SelectItem>
-                    <SelectItem value="1">1+</SelectItem>
-                    <SelectItem value="2">2+</SelectItem>
-                    <SelectItem value="3">3+</SelectItem>
-                    <SelectItem value="4">4+</SelectItem>
-                    <SelectItem value="5">5+</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-
-              {/* Bathrooms */}
-              <div className="space-y-2">
-                <Label htmlFor="baths">Bathrooms</Label>
-                <Select value={filters.baths || 'any'} onValueChange={(value) => handleFilterChange('baths', value)}>
-                  <SelectTrigger>
-                    <SelectValue placeholder="Any" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="any">Any</SelectItem>
-                    <SelectItem value="1">1+</SelectItem>
-                    <SelectItem value="2">2+</SelectItem>
-                    <SelectItem value="3">3+</SelectItem>
-                    <SelectItem value="4">4+</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-
-              {/* Min Price */}
-              <div className="space-y-2">
-                <Label htmlFor="min_price">Min Price</Label>
-                <Input
-                  id="min_price"
-                  type="number"
-                  placeholder="$0"
-                  value={filters.min_price}
-                  onChange={(e) => handleFilterChange('min_price', e.target.value)}
-                />
-              </div>
-
-              {/* Max Price */}
-              <div className="space-y-2">
-                <Label htmlFor="max_price">Max Price</Label>
-                <Input
-                  id="max_price"
-                  type="number"
-                  placeholder="No limit"
-                  value={filters.max_price}
-                  onChange={(e) => handleFilterChange('max_price', e.target.value)}
-                />
-              </div>
-
-              {/* Property Type */}
-              <div className="space-y-2">
-                <Label htmlFor="property_type">Property Type</Label>
-                <Select value={filters.property_type || 'any'} onValueChange={(value) => handleFilterChange('property_type', value)}>
-                  <SelectTrigger>
-                    <SelectValue placeholder="Any" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="any">Any</SelectItem>
-                    <SelectItem value="Single Family">Single Family</SelectItem>
-                    <SelectItem value="Condo">Condo</SelectItem>
-                    <SelectItem value="Townhouse">Townhouse</SelectItem>
-                    <SelectItem value="Multi Family">Multi Family</SelectItem>
-                    <SelectItem value="Land">Land</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
+      <Card>
+        <CardContent className="space-y-4 pt-6">
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_auto_16rem] lg:items-end">
+            <div className="space-y-2">
+              <Label htmlFor="location">Location Search</Label>
+              <Input
+                id="location"
+                placeholder="Enter city, state, ZIP, neighborhood, or full address"
+                value={filters.location}
+                onChange={(e) => handleFilterChange('location', e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && hasLocationQuery && !loading) {
+                    handleManualSearch()
+                  }
+                }}
+              />
             </div>
 
-            {/* Sort By */}
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setFiltersDialogOpen(true)}
+              className="flex items-center gap-2 lg:h-10"
+            >
+              <Filter className="h-4 w-4" />
+              Filters
+              {activeOptionalFilters > 0 && (
+                <Badge variant="secondary" className="ml-1">
+                  {activeOptionalFilters}
+                </Badge>
+              )}
+            </Button>
+
             <div className="space-y-2">
               <Label htmlFor="sort_by">Sort By</Label>
               <Select value={filters.sort_by} onValueChange={(value) => handleFilterChange('sort_by', value)}>
-                <SelectTrigger className="w-full md:w-48">
+                <SelectTrigger id="sort_by">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -498,30 +604,180 @@ export function PropertySearch() {
                 </SelectContent>
               </Select>
             </div>
+          </div>
 
-            <Separator />
+          <div className="flex flex-wrap gap-2">
+            <Button
+              onClick={handleManualSearch}
+              disabled={loading || !hasLocationQuery}
+              className="flex items-center gap-2"
+            >
+              {loading ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Search className="h-4 w-4" />
+              )}
+              Search Properties
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
 
-            {/* Action Buttons */}
-            <div className="flex gap-2">
-              <Button 
-                onClick={handleManualSearch} 
-                disabled={loading}
-                className="flex items-center gap-2"
-              >
-                {loading ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Search className="h-4 w-4" />
-                )}
-                Search Properties
-              </Button>
-              <Button variant="outline" onClick={clearFilters}>
-                Clear Filters
-              </Button>
+      <Dialog open={filtersDialogOpen} onOpenChange={setFiltersDialogOpen}>
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Optional Filters</DialogTitle>
+            <DialogDescription>
+              Add beds, baths, price range, and property type to narrow your location search.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <div className="space-y-2">
+              <Label htmlFor="beds">Bedrooms</Label>
+              <Select value={filters.beds || 'any'} onValueChange={(value) => handleFilterChange('beds', value)}>
+                <SelectTrigger id="beds">
+                  <SelectValue placeholder="Any" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="any">Any</SelectItem>
+                  <SelectItem value="1">1+</SelectItem>
+                  <SelectItem value="2">2+</SelectItem>
+                  <SelectItem value="3">3+</SelectItem>
+                  <SelectItem value="4">4+</SelectItem>
+                  <SelectItem value="5">5+</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
-          </CardContent>
-        </Card>
-      )}
+
+            <div className="space-y-2">
+              <Label htmlFor="baths">Bathrooms</Label>
+              <Select value={filters.baths || 'any'} onValueChange={(value) => handleFilterChange('baths', value)}>
+                <SelectTrigger id="baths">
+                  <SelectValue placeholder="Any" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="any">Any</SelectItem>
+                  <SelectItem value="1">1+</SelectItem>
+                  <SelectItem value="2">2+</SelectItem>
+                  <SelectItem value="3">3+</SelectItem>
+                  <SelectItem value="4">4+</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="min_price">Min Price</Label>
+              <Input
+                id="min_price"
+                type="number"
+                placeholder="$0"
+                value={filters.min_price}
+                onChange={(e) => handleFilterChange('min_price', e.target.value)}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="max_price">Max Price</Label>
+              <Input
+                id="max_price"
+                type="number"
+                placeholder="No limit"
+                value={filters.max_price}
+                onChange={(e) => handleFilterChange('max_price', e.target.value)}
+              />
+            </div>
+
+            <div className="space-y-2 md:col-span-2">
+              <Label htmlFor="property_type">Property Type</Label>
+              <Select value={filters.property_type || 'any'} onValueChange={(value) => handleFilterChange('property_type', value)}>
+                <SelectTrigger id="property_type">
+                  <SelectValue placeholder="Any" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="any">Any</SelectItem>
+                  <SelectItem value="Single Family">Single Family</SelectItem>
+                  <SelectItem value="Condo">Condo</SelectItem>
+                  <SelectItem value="Townhouse">Townhouse</SelectItem>
+                  <SelectItem value="Multi Family">Multi Family</SelectItem>
+                  <SelectItem value="Land">Land</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={clearOptionalFilters}>
+              Clear Optional Filters
+            </Button>
+            <Button type="button" onClick={() => setFiltersDialogOpen(false)}>
+              Done
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={leadAssignDialogOpen} onOpenChange={handleLeadAssignDialogOpenChange}>
+        <DialogContent className="sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>Add Property To Lead</DialogTitle>
+            <DialogDescription>
+              Select a lead to save this property as an interested home.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            {propertyToAssign && (
+              <div className="rounded-md border p-3">
+                <p className="font-medium">
+                  {getPropertyAddressLine(propertyToAssign) || 'Selected property'}
+                </p>
+                <p className="text-sm text-muted-foreground">
+                  {getPropertyLocationLine(propertyToAssign) || 'Location unavailable'}
+                </p>
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <Label htmlFor="lead_select">Lead</Label>
+              <Select value={selectedLeadId} onValueChange={setSelectedLeadId} disabled={leadsLoading || leads.length === 0}>
+                <SelectTrigger id="lead_select">
+                  <SelectValue placeholder={leadsLoading ? 'Loading leads...' : 'Select lead'} />
+                </SelectTrigger>
+                <SelectContent>
+                  {leads.map((lead) => (
+                    <SelectItem key={lead.id} value={lead.id}>
+                      {lead.name}
+                      {lead.lead_type ? ` (${lead.lead_type})` : ''}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {!leadsLoading && leads.length === 0 && (
+                <p className="text-sm text-muted-foreground">
+                  No leads found. Create a lead first, then add this property.
+                </p>
+              )}
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => handleLeadAssignDialogOpenChange(false)} disabled={addingToLead}>
+              Cancel
+            </Button>
+            <Button type="button" onClick={handleAddPropertyToLead} disabled={addingToLead || !selectedLeadId || leadsLoading}>
+              {addingToLead ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Adding...
+                </>
+              ) : (
+                'Add To Lead'
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Search Results */}
       {searchPerformed && (
@@ -623,9 +879,9 @@ export function PropertySearch() {
             <Search className="mx-auto h-12 w-12 text-muted-foreground mb-4" />
             <h3 className="text-lg font-semibold mb-2">Find Your Perfect Property</h3>
             <p className="text-muted-foreground mb-4">
-              Enter your search criteria and click "Search Properties" to get started
+              Enter a location, city, state, ZIP, or address and click "Search Properties" to get started
             </p>
-            <Button onClick={handleManualSearch}>
+            <Button onClick={handleManualSearch} disabled={loading || !hasLocationQuery}>
               <Search className="mr-2 h-4 w-4" />
               Start Searching
             </Button>

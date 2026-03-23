@@ -1672,7 +1672,7 @@ async function fetchProperties(filters = {}) {
     if (max_price) requestBody.listing_price_max = Number(max_price)
 
     if (location) {
-      // Normalize location: support ZIP, ZIP+4, "City, ST", full state name, or 2-letter state code
+      // Normalize location: support full address, ZIP, ZIP+4, "City, ST", full state name, or 2-letter state code
       const stateMap = {
         alabama: 'AL', alaska: 'AK', arizona: 'AZ', arkansas: 'AR', california: 'CA', colorado: 'CO',
         connecticut: 'CT', delaware: 'DE', 'district of columbia': 'DC', florida: 'FL', georgia: 'GA',
@@ -1691,9 +1691,20 @@ async function fetchProperties(filters = {}) {
         const key = t.toLowerCase()
         return stateMap[key] || null
       }
+      const isLikelyStreetAddress = (input) => {
+        const text = String(input || '').trim()
+        if (!text) return false
+        const hasStreetNumber = /^\d{1,6}\s+/.test(text)
+        const hasStreetType = /\b(st|street|ave|avenue|rd|road|dr|drive|blvd|boulevard|ln|lane|ct|court|way|pkwy|parkway|pl|place|trl|trail|cir|circle|hwy|highway)\b/i.test(text)
+        const hasUnit = /\b(apt|unit|ste|suite|#)\b/i.test(text)
+        const looksLikeAddressWithComma = /,\s*[A-Za-z]/.test(text)
+        return hasStreetNumber && (hasStreetType || hasUnit || looksLikeAddressWithComma)
+      }
       const loc = String(location).trim()
       if (/^\d{5}(-\d{4})?$/.test(loc)) {
          requestBody.zip = loc.slice(0, 5)
+      } else if (isLikelyStreetAddress(loc)) {
+        requestBody.address = loc
       } else if (loc.includes(',')) {
         const [cityPart, statePart] = loc.split(',').map(s => s.trim()).slice(0, 2)
         if (cityPart) requestBody.city = cityPart
@@ -1791,6 +1802,8 @@ async function fetchProperties(filters = {}) {
 
     // Normalize price from various possible sources
     const priceTuples = [
+        [listing?.listPrice, 'listing.listPrice'],
+        [listing?.listPriceAmount, 'listing.listPriceAmount'],
         [listing?.leadTypes?.mlsListingPrice, 'listing.leadTypes.mlsListingPrice'],
         [listing?.listPriceLow, 'listing.listPriceLow'],
         [src.price, 'price'],
@@ -2005,10 +2018,28 @@ async function fetchProperties(filters = {}) {
       }
     })
 
+  // Apply listing status intent locally so "for_sale" doesn't surface rental-rate results.
+  const normalizedListingStatus = String(listing_status || 'for_sale').toLowerCase()
+  const statusFiltered = normalized.filter((p) => {
+    const status = String(p?.listing_status || '').toLowerCase()
+    const numericPrice = Number(p?.price)
+    const hasNumericPrice = Number.isFinite(numericPrice) && numericPrice > 0
+    const isLikelyRentalStatus = /(rent|rental|lease)/i.test(status)
+    const isLikelyMonthlyRent = hasNumericPrice && numericPrice < 10000
+
+    if (normalizedListingStatus === 'for_sale') {
+      return !isLikelyRentalStatus && !isLikelyMonthlyRent
+    }
+    if (normalizedListingStatus === 'for_rent') {
+      return isLikelyRentalStatus || isLikelyMonthlyRent
+    }
+    return true
+  })
+
   // Apply property type filtering locally because MLS schema/category values differ from UI labels.
   const typeFiltered = property_type
-    ? normalized.filter((p) => matchesPropertyTypeSelection(p, property_type))
-    : normalized
+    ? statusFiltered.filter((p) => matchesPropertyTypeSelection(p, property_type))
+    : statusFiltered
 
   // Apply deterministic server-side sorting so UI order always matches selected sort option.
   const sortedNormalized = sortPropertiesBySelection(typeFiltered, sort_by)
