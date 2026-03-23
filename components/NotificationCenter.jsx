@@ -5,6 +5,7 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/co
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Switch } from "@/components/ui/switch";
 import { Bell, RefreshCcw, Check, Clock, Trash2 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -105,17 +106,20 @@ export function NotificationCenter({ onAnyAction }) {
   const [loading, setLoading] = useState(false)
   const [notifications, setNotifications] = useState([])
   const [alerts, setAlerts] = useState([])
+  const [preferences, setPreferences] = useState(null)
   const { toast } = useToast()
 
   const loadAll = async () => {
     setLoading(true)
     try {
-      const [notifRes, alertRes] = await Promise.all([
+      const [notifRes, alertRes, prefRes] = await Promise.all([
         fetchJSON(apiUrl('/api/notifications?limit=100')),
-        fetchJSON(apiUrl('/api/alerts/smart'))
+        fetchJSON(apiUrl('/api/alerts/smart')),
+        fetchJSON(apiUrl('/api/preferences/notifications'))
       ])
-      setNotifications(notifRes.notifications || [])
+      setNotifications(notifRes.items || [])
       setAlerts(alertRes.alerts || [])
+      setPreferences(prefRes.preferences || null)
     } catch (e) {
       toast({ title: 'Failed to load notifications', description: e.message || 'Please try again', variant: 'destructive' })
     } finally {
@@ -158,10 +162,28 @@ export function NotificationCenter({ onAnyAction }) {
   const dismissAlert = async (id) => {
     try { await fetchJSON(apiUrl(`/api/alerts/dismiss/${id}`), { method: 'POST' }); await loadAll(); onAnyAction && onAnyAction() } catch {}
   }
+  const updatePreferences = async (patch = {}) => {
+    try {
+      const res = await fetchJSON(apiUrl('/api/preferences/notifications'), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch || {})
+      })
+      if (res?.success) {
+        setPreferences(res.preferences || null)
+      }
+    } catch (e) {
+      toast({
+        title: 'Could not update preferences',
+        description: e.message || 'Please try again',
+        variant: 'destructive'
+      })
+    }
+  }
 
   const fmt = (d) => {
     const dt = new Date(d)
-    if (isNaN(dt.getTime())) return '—'
+    if (isNaN(dt.getTime())) return '-'
     return dt.toLocaleString()
   }
 
@@ -184,6 +206,26 @@ export function NotificationCenter({ onAnyAction }) {
       </div>
 
       <div className="text-xs text-muted-foreground">Unread: {unreadCount}</div>
+      <div className="rounded-md border p-3">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-sm font-medium">Email Notifications</div>
+            <div className="text-xs text-muted-foreground">
+              Optional. Turn this on only if you want alert emails.
+            </div>
+          </div>
+          <Switch
+            checked={Boolean(preferences?.channels?.email)}
+            onCheckedChange={(checked) => {
+              const nextChannels = {
+                ...(preferences?.channels || {}),
+                email: Boolean(checked)
+              }
+              updatePreferences({ channels: nextChannels })
+            }}
+          />
+        </div>
+      </div>
 
       <div className="max-h-[70vh] overflow-auto space-y-2 pr-1">
         {allItems.length === 0 && (
@@ -236,4 +278,5 @@ export function NotificationCenter({ onAnyAction }) {
     </div>
   )
 }
+
 

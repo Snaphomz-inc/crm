@@ -8,6 +8,7 @@ import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -128,7 +129,8 @@ export function TransactionManagement() {
     transaction_type: 'sale',
     assigned_agent: '',
     listing_price: '',
-    closing_date: ''
+    closing_date: '',
+    add_to_calendar: false
   })
 
   useEffect(() => {
@@ -353,15 +355,6 @@ export function TransactionManagement() {
     return nextState
   }
 
-  const savePendingCalendarTransaction = (transactionPayload = {}) => {
-    if (typeof window === 'undefined') return
-    const payload = {
-      transaction: transactionPayload,
-      created_at: Date.now()
-    }
-    window.sessionStorage.setItem(PENDING_CALENDAR_TRANSACTION_KEY, JSON.stringify(payload))
-  }
-
   const loadPendingCalendarTransaction = () => {
     if (typeof window === 'undefined') return null
     try {
@@ -459,26 +452,6 @@ export function TransactionManagement() {
     setIsCalendarConnectDialogOpen(true)
   }
 
-  const requireCalendarConnectionForTransaction = (transactionPayload = {}) => {
-    if (!userEmail) {
-      toast({
-        title: 'Sign in required',
-        description: 'Please sign in before connecting a calendar.'
-      })
-      return false
-    }
-
-    savePendingCalendarTransaction(transactionPayload)
-    setIsAddDialogOpen(false)
-    setCalendarConnectReason('event_create')
-    setIsCalendarConnectDialogOpen(true)
-    toast({
-      title: 'Connect your calendar',
-      description: 'To sync this event, please connect your calendar.'
-    })
-    return true
-  }
-
   const disconnectCalendar = async () => {
     const connectedProvider = Array.isArray(calendarStatus.connected_providers) && calendarStatus.connected_providers.length > 0
       ? calendarStatus.connected_providers[0]
@@ -540,7 +513,8 @@ export function TransactionManagement() {
     const sourcePayload = isClickEventPayload ? newTransaction : transactionPayload
     const payload = {
       ...sourcePayload,
-      closing_date: sourcePayload?.closing_date || ''
+      closing_date: sourcePayload?.closing_date || '',
+      add_to_calendar: Boolean(sourcePayload?.add_to_calendar)
     }
 
     if (!payload.property_address || !payload.client_name) {
@@ -549,10 +523,7 @@ export function TransactionManagement() {
     }
 
     const selectedClosingDate = payload.closing_date
-    if (selectedClosingDate && !calendarStatus.connected && !options?.skipConnectionGate) {
-      requireCalendarConnectionForTransaction(payload)
-      return
-    }
+    const wantsCalendarSync = Boolean(payload.add_to_calendar) && Boolean(selectedClosingDate)
 
     setLoading(true)
     try {
@@ -575,7 +546,8 @@ export function TransactionManagement() {
           transaction_type: 'sale',
           assigned_agent: '',
           listing_price: '',
-          closing_date: ''
+          closing_date: '',
+          add_to_calendar: false
         })
         setIsAddDialogOpen(false)
 
@@ -591,9 +563,9 @@ export function TransactionManagement() {
           .map((entry) => getCalendarProviderLabel(entry.provider))
           .filter(Boolean)
         const firstEventLink = successfulProviders.find((entry) => entry?.event_link)?.event_link || calendarResult?.event_link || null
-        const manualQuickAddUrl = selectedClosingDate ? responseQuickAddUrl : null
+        const manualQuickAddUrl = wantsCalendarSync ? responseQuickAddUrl : null
 
-        if (calendarResult?.success && successfulProviders.length > 0) {
+        if (wantsCalendarSync && calendarResult?.success && successfulProviders.length > 0) {
           toast({
             title: 'Transaction created and synced',
             description: successfulProviderNames.length > 0
@@ -608,14 +580,14 @@ export function TransactionManagement() {
               </ToastAction>
             ) : undefined
           })
-        } else if (calendarResult?.partial_success && successfulProviders.length > 0) {
+        } else if (wantsCalendarSync && calendarResult?.partial_success && successfulProviders.length > 0) {
           toast({
             title: 'Transaction created, calendar partially synced',
             description: successfulProviderNames.length > 0
               ? `Synced to ${successfulProviderNames.join(', ')}. ${calendarResult?.error || ''}`.trim()
               : (calendarResult?.error || 'Some calendar providers could not be synced.')
           })
-        } else if (selectedClosingDate && manualQuickAddUrl) {
+        } else if (wantsCalendarSync && manualQuickAddUrl) {
           if (manualQuickAddUrl) {
             console.log('OUTLOOK URL:', manualQuickAddUrl)
             window.open(manualQuickAddUrl, '_blank', 'noopener,noreferrer')
@@ -634,7 +606,7 @@ export function TransactionManagement() {
               </ToastAction>
             )
           })
-        } else if (selectedClosingDate && calendarResult?.attempted && !calendarResult?.success) {
+        } else if (wantsCalendarSync && calendarResult?.attempted && !calendarResult?.success) {
           if (attemptedOutlook) {
             window.open(OUTLOOK_CALENDAR_FALLBACK_URL, '_blank', 'noopener,noreferrer')
           }
@@ -642,13 +614,20 @@ export function TransactionManagement() {
             title: 'Transaction created, calendar sync failed',
             description: calendarResult?.error || 'Please reconnect your calendar and try again.'
           })
-        } else if (selectedClosingDate && !calendarResult?.success) {
+        } else if (wantsCalendarSync && !calendarResult?.success) {
           if (attemptedOutlook) {
             window.open(OUTLOOK_CALENDAR_FALLBACK_URL, '_blank', 'noopener,noreferrer')
           }
           toast({
             title: 'Transaction created',
             description: 'Calendar sync is pending. Reconnect your calendar to sync this closing date.'
+          })
+        } else {
+          toast({
+            title: 'Transaction created',
+            description: wantsCalendarSync
+              ? 'Transaction saved. Connect a calendar anytime to sync future events.'
+              : 'Saved without calendar sync.'
           })
         }
       } else {
@@ -1129,8 +1108,47 @@ export function TransactionManagement() {
                   id="closing-date"
                   type="date"
                   value={newTransaction.closing_date}
-                  onChange={(e) => setNewTransaction({...newTransaction, closing_date: e.target.value})}
+                  onChange={(e) => {
+                    const nextDate = e.target.value
+                    setNewTransaction((prev) => ({
+                      ...prev,
+                      closing_date: nextDate,
+                      add_to_calendar: nextDate ? prev.add_to_calendar : false
+                    }))
+                  }}
                 />
+              </div>
+              <div className="rounded-md border p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <Label htmlFor="add-calendar-toggle" className="text-sm font-medium">Add this to calendar</Label>
+                    <p className="text-xs text-muted-foreground">
+                      Optional. Enable only if you want this transaction synced to Google/Outlook.
+                    </p>
+                  </div>
+                  <Switch
+                    id="add-calendar-toggle"
+                    checked={Boolean(newTransaction.add_to_calendar)}
+                    onCheckedChange={(checked) => {
+                      const hasClosingDate = Boolean(newTransaction.closing_date)
+                      setNewTransaction((prev) => ({
+                        ...prev,
+                        add_to_calendar: hasClosingDate ? Boolean(checked) : false
+                      }))
+                    }}
+                    disabled={!newTransaction.closing_date}
+                  />
+                </div>
+                {!newTransaction.closing_date && (
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    Add a closing date first to enable calendar sync.
+                  </p>
+                )}
+                {newTransaction.closing_date && newTransaction.add_to_calendar && !calendarStatus.connected && (
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    No calendar connected. Transaction will still be created; you can connect later from the top button.
+                  </p>
+                )}
               </div>
             </div>
           </div>

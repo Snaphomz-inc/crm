@@ -75,7 +75,7 @@ function AttachForm({ item, txList = [], onSubmit }) {
         <div className="text-xs text-muted-foreground mb-1">Transaction</div>
         <select className="w-full border rounded px-2 py-1 bg-background" value={txId} onChange={(e) => { setTxId(e.target.value); const tx = txList.find(t => t.id === e.target.value); setStage(tx?.stage || (tx?.type === 'purchase' ? 'pre_approval' : 'pre_listing')) }}>
           {txList.map(tx => (
-            <option key={tx.id} value={tx.id}>{tx.title}{tx.client ? ` â€¢ ${tx.client}` : ''}</option>
+            <option key={tx.id} value={tx.id}>{tx.title}{tx.client ? ` | ${tx.client}` : ''}</option>
           ))}
         </select>
       </div>
@@ -108,16 +108,16 @@ function AttachForm({ item, txList = [], onSubmit }) {
 }
 
 function formatDate(d) {
-  if (!d) return 'â€”'
+  if (!d) return '-'
   const date = new Date(d)
-  if (isNaN(date.getTime())) return 'â€”'
+  if (isNaN(date.getTime())) return '-'
   return date.toLocaleDateString()
 }
 
 function formatTime(d) {
-  if (!d) return 'â€”'
+  if (!d) return '-'
   const date = new Date(d)
-  if (isNaN(date.getTime())) return 'â€”'
+  if (isNaN(date.getTime())) return '-'
   try {
     return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
   } catch {
@@ -138,7 +138,7 @@ function formatPlanWindow(meta) {
   const dateStr = startDt.toLocaleDateString()
   const start = formatTime(startDt)
   const end = endDt && !isNaN(endDt.getTime()) ? formatTime(endDt) : ''
-  return end ? `${dateStr} ${start}â€“${end}` : `${dateStr} ${start}`
+  return end ? `${dateStr} ${start} - ${end}` : `${dateStr} ${start}`
 }
 
 function daysDiff(from, to = new Date()) {
@@ -794,10 +794,10 @@ export function AssistantPanel() {
     await requestPlan(keys, { roll_to_next_workday: true, context: 'schedule' })
   }
 
-  // One-click: Plan My Day â€” auto-schedule the day's Next Best Actions 9â€“5
+  // One-click: Plan My Day - auto-schedule the day's Next Best Actions 9-5
   const planMyDay = async () => {
     try {
-      try { showToast({ title: 'Planning your dayâ€¦', description: 'Generating an optimized schedule for 9â€“5' }) } catch {}
+      try { showToast({ title: 'Planning your day...', description: 'Generating an optimized schedule for 9-5' }) } catch {}
       const todayKey = new Date().toISOString().slice(0,10)
       const start = new Date(`${todayKey}T09:00:00`)
       // Open dialog immediately in Grid view with default window
@@ -1042,8 +1042,8 @@ export function AssistantPanel() {
               </div>
               <p className="text-sm text-muted-foreground">
                 {summary.active_deals ? `${summary.active_deals} active deals` : ''}
-                {summary.overdue_tasks ? ` â€¢ ${summary.overdue_tasks} tasks overdue` : ''}
-                {summary.new_leads ? ` â€¢ ${summary.new_leads} new leads` : ''}
+                {summary.overdue_tasks ? ` | ${summary.overdue_tasks} tasks overdue` : ''}
+                {summary.new_leads ? ` | ${summary.new_leads} new leads` : ''}
               </p>
             </div>
             <Link href="/plan">
@@ -1111,7 +1111,7 @@ export function AssistantPanel() {
           <div className="flex items-center gap-3 px-3 py-2 rounded-md shadow-md bg-amber-100 dark:bg-amber-900/40 border border-amber-300 dark:border-amber-800">
             <div className="text-sm">Batch completed.</div>
             <Button size="sm" variant="outline" onClick={() => setShowUndo(false)} disabled={undoRunning}>Dismiss</Button>
-            <Button size="sm" onClick={undoLastBatch} disabled={undoRunning}>{undoRunning ? 'Undoingâ€¦' : 'Undo'}</Button>
+            <Button size="sm" onClick={undoLastBatch} disabled={undoRunning}>{undoRunning ? 'Undoing...' : 'Undo'}</Button>
           </div>
         </div>
       )}
@@ -1170,12 +1170,12 @@ export function AssistantPanel() {
                       <div className="font-medium text-sm">{it.label}</div>
                       {(it.client_name || it.property_address) && (
                         <div className="text-[11px] text-muted-foreground">
-                          {it.client_name && it.property_address ? `${it.client_name} â€¢ ${it.property_address}` : (it.client_name || it.property_address)}
+                          {it.client_name && it.property_address ? `${it.client_name} | ${it.property_address}` : (it.client_name || it.property_address)}
                         </div>
                       )}
                       <div className="text-xs text-muted-foreground">
                         {it.scheduled_start && it.scheduled_end
-                          ? `${new Date(it.scheduled_start).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}â€“${new Date(it.scheduled_end).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
+                          ? `${new Date(it.scheduled_start).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })} - ${new Date(it.scheduled_end).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
                           : 'unscheduled'}
                       </div>
                     </div>
@@ -1206,8 +1206,8 @@ export function AssistantPanel() {
                     <DropdownMenuContent align="end">
                       <DropdownMenuLabel>Selected</DropdownMenuLabel>
                       <DropdownMenuItem onClick={batchCompleteSelected}>Batch Complete</DropdownMenuItem>
-                      <DropdownMenuItem onClick={guidedRunSelected}>Guided Runâ€¦</DropdownMenuItem>
-                      <DropdownMenuItem onClick={scheduleSelected}>Scheduleâ€¦</DropdownMenuItem>
+                      <DropdownMenuItem onClick={guidedRunSelected}>Guided Run...</DropdownMenuItem>
+                      <DropdownMenuItem onClick={scheduleSelected}>Schedule...</DropdownMenuItem>
                       <DropdownMenuSeparator />
                       <DropdownMenuLabel>Quick</DropdownMenuLabel>
                       <DropdownMenuItem onClick={runQuickBatch}>Run Top</DropdownMenuItem>
@@ -1245,7 +1245,7 @@ export function AssistantPanel() {
                       </div>
                       <div className="text-xs text-muted-foreground">
                         {(item.type === 'task' ? getTaskTransactionLabel(item.id) : 'Alert') || 'Client/Listing'}
-                        {item.est_duration_min ? ` â€¢ ~${item.est_duration_min} min` : ''}
+                        {item.est_duration_min ? ` | ~${item.est_duration_min} min` : ''}
                       </div>
                       {item.reason && (
                         <div className="text-xs text-muted-foreground mt-0.5">{item.reason}</div>
@@ -1329,7 +1329,7 @@ export function AssistantPanel() {
                   <div className="pr-3">
                     <div className="font-medium text-sm">{t.title}</div>
                     <div className="text-xs text-muted-foreground">
-                      {(getTaskTransactionLabel(t.id) || 'Client/Listing')} â€¢ Due {formatDate(t.due_date)} â€¢ Priority {t.priority || 'â€”'} {t.stage ? `â€¢ ${t.stage}` : ''}
+                      {(getTaskTransactionLabel(t.id) || 'Client/Listing')} | Due {formatDate(t.due_date)} | Priority {t.priority || '-'} {t.stage ? `| ${t.stage}` : ''}
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
@@ -1357,7 +1357,7 @@ export function AssistantPanel() {
                   <div className="pr-3">
                     <div className="font-medium text-sm">{t.title}</div>
                     <div className="text-xs text-muted-foreground">
-                      {(getTaskTransactionLabel(t.id) || 'Client/Listing')} â€¢ Due {formatDate(t.due_date)} {t.stage ? `â€¢ ${t.stage}` : ''}
+                      {(getTaskTransactionLabel(t.id) || 'Client/Listing')} | Due {formatDate(t.due_date)} {t.stage ? `| ${t.stage}` : ''}
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
@@ -1385,7 +1385,7 @@ export function AssistantPanel() {
                   <div className="pr-3">
                     <div className="font-medium text-sm">{t.title}</div>
                     <div className="text-xs text-muted-foreground">
-                      {(getTaskTransactionLabel(t.id) || 'Client/Listing')} â€¢ Due {formatDate(t.due_date)} {t.stage ? `â€¢ ${t.stage}` : ''}
+                      {(getTaskTransactionLabel(t.id) || 'Client/Listing')} | Due {formatDate(t.due_date)} {t.stage ? `| ${t.stage}` : ''}
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
@@ -1418,7 +1418,7 @@ export function AssistantPanel() {
                       <Home className="h-4 w-4" /> {d.property_address || 'TBD'}
                     </div>
                     <div className="text-xs text-muted-foreground">
-                      {d.client_name ? `Client: ${d.client_name} â€¢ ` : ''}Stage: {d.current_stage} â€¢ {d.days_inactive ?? '?'} days inactive
+                      {d.client_name ? `Client: ${d.client_name} | ` : ''}Stage: {d.current_stage} | {d.days_inactive ?? '?'} days inactive
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
@@ -1481,7 +1481,7 @@ export function AssistantPanel() {
                       {l.lead_type && <Badge variant={l.lead_type === 'buyer' ? 'default' : 'secondary'}>{l.lead_type}</Badge>}
                     </div>
                     <div className="text-xs text-muted-foreground">
-                      {l.email || 'â€”'} {l.phone ? `â€¢ ${l.phone}` : ''} â€¢ Added {formatDate(l.created_at)}
+                      {l.email || '-'} {l.phone ? `| ${l.phone}` : ''} | Added {formatDate(l.created_at)}
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
@@ -1507,8 +1507,8 @@ export function AssistantPanel() {
               {(data?.recent_activity || []).slice(0, 6).map((c) => (
                 <div key={c.id} className={`${sectionBox.item} mb-2 last:mb-0`}>
                   <div className="pr-3">
-                    <div className="font-medium text-sm">{c.ai_response ? String(c.ai_response).slice(0, 80) + (String(c.ai_response).length > 80 ? 'â€¦' : '') : 'Conversation'}</div>
-                    <div className="text-xs text-muted-foreground">{formatDate(c.created_at)} â€¢ Properties: {c.properties_found ?? 0}</div>
+                    <div className="font-medium text-sm">{c.ai_response ? String(c.ai_response).slice(0, 80) + (String(c.ai_response).length > 80 ? '...' : '') : 'Conversation'}</div>
+                    <div className="text-xs text-muted-foreground">{formatDate(c.created_at)} | Properties: {c.properties_found ?? 0}</div>
                   </div>
                   <div className="flex items-center gap-2">
                     <Button size="sm" variant="outline" onClick={() => openActivityDetails(c)}>
@@ -1525,7 +1525,7 @@ export function AssistantPanel() {
         </Card>
       </div>
 
-      <div className="text-xs text-muted-foreground">Updated {data?.generated_at ? new Date(data.generated_at).toLocaleString() : 'â€”'}</div>
+      <div className="text-xs text-muted-foreground">Updated {data?.generated_at ? new Date(data.generated_at).toLocaleString() : '-'}</div>
 
       {/* Plan Dialog */}
       <Dialog open={planOpen} onOpenChange={setPlanOpen}>
@@ -1573,7 +1573,7 @@ export function AssistantPanel() {
                     )}
                     <div className="text-xs text-muted-foreground">
                       {it.scheduled_start && it.scheduled_end
-                        ? `${new Date(it.scheduled_start).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}â€“${new Date(it.scheduled_end).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
+                        ? `${new Date(it.scheduled_start).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })} - ${new Date(it.scheduled_end).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
                         : 'unscheduled'}
                     </div>
                   </div>
@@ -1599,7 +1599,7 @@ export function AssistantPanel() {
             <DialogDescription>Full details for the selected lead.</DialogDescription>
           </DialogHeader>
           {!selectedLead && leadLoading && (
-            <div className="text-sm text-muted-foreground">Loadingâ€¦</div>
+            <div className="text-sm text-muted-foreground">Loading...</div>
           )}
           {selectedLead && selectedLead.error && (
             <div className="text-sm text-red-600">{selectedLead.error}</div>
@@ -1628,19 +1628,19 @@ export function AssistantPanel() {
               <div className="grid grid-cols-2 gap-3 text-sm">
                 <div>
                   <div className="text-muted-foreground">Email</div>
-                  <div>{selectedLead.email || 'â€”'}</div>
+                  <div>{selectedLead.email || '-'}</div>
                 </div>
                 <div>
                   <div className="text-muted-foreground">Phone</div>
-                  <div>{selectedLead.phone || 'â€”'}</div>
+                  <div>{selectedLead.phone || '-'}</div>
                 </div>
                 <div>
                   <div className="text-muted-foreground">Assigned Agent</div>
-                  <div>{selectedLead.assigned_agent || 'â€”'}</div>
+                  <div>{selectedLead.assigned_agent || '-'}</div>
                 </div>
                 <div>
                   <div className="text-muted-foreground">Source</div>
-                  <div>{selectedLead.source || 'â€”'}</div>
+                  <div>{selectedLead.source || '-'}</div>
                 </div>
               </div>
 
@@ -1651,7 +1651,7 @@ export function AssistantPanel() {
                     {Object.entries(selectedLead.preferences).map(([k, v]) => (
                       <div key={k} className="flex justify-between">
                         <div className="text-muted-foreground capitalize">{k.replace(/_/g, ' ')}</div>
-                        <div>{String(v || 'â€”')}</div>
+                        <div>{String(v || '-')}</div>
                       </div>
                     ))}
                   </div>
@@ -1683,7 +1683,7 @@ export function AssistantPanel() {
             <div className="space-y-4">
               <div className="flex items-center justify-between text-sm">
                 <div className="text-muted-foreground">When</div>
-                <div>{formatDate(selectedActivity.created_at)}{selectedActivity.created_at ? ` â€¢ ${new Date(selectedActivity.created_at).toLocaleTimeString()}` : ''}</div>
+                <div>{formatDate(selectedActivity.created_at)}{selectedActivity.created_at ? ` | ${new Date(selectedActivity.created_at).toLocaleTimeString()}` : ''}</div>
               </div>
 
               <div className="flex items-center justify-between text-sm">
@@ -1737,5 +1737,6 @@ export function AssistantPanel() {
     </div>
   )
 }
+
 
 

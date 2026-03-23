@@ -1,9 +1,10 @@
-﻿import { Pool } from 'pg'
+import { Pool } from 'pg'
 import { randomUUID } from 'crypto'
 import { NextResponse } from 'next/server'
 import fs from 'fs'
 import nodePath from 'path'
 import crypto from 'crypto'
+import { AsyncLocalStorage } from 'async_hooks'
 
 const uuidv4 = () => randomUUID()
 
@@ -41,6 +42,32 @@ const CALENDAR_PROVIDER_OUTLOOK = 'outlook'
 const CALENDAR_PROVIDER_IDS = [CALENDAR_PROVIDER_GOOGLE, CALENDAR_PROVIDER_OUTLOOK]
 const CALENDAR_TOKEN_ENCRYPTION_PREFIX = 'enc:v1'
 const GRAPH_API_BASE_URL = 'https://graph.microsoft.com/v1.0'
+const CRM_USER_SCOPED_COLLECTIONS = new Set([
+  'transactions',
+  'checklist_items',
+  'leads',
+  'smart_alerts',
+  'assistant_conversations',
+  'property_searches',
+  'pmd_plans',
+  'assistant_plans',
+  'notifications',
+  'notification_preferences',
+  'notification_email_log'
+])
+const requestScopeStorage = new AsyncLocalStorage()
+
+function buildOwnerScopedFilter(filter = {}, ownerUserId = null) {
+  const normalized = isPlainObject(filter) ? filter : {}
+  if (!ownerUserId) return normalized
+  if (Object.keys(normalized).length === 0) return { owner_user_id: ownerUserId }
+  return { $and: [{ owner_user_id: ownerUserId }, normalized] }
+}
+
+function withOwnerUserId(doc = {}, ownerUserId = null) {
+  if (!ownerUserId || !isPlainObject(doc)) return doc
+  return { ...doc, owner_user_id: ownerUserId }
+}
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Date) && !(value instanceof RegExp)
@@ -294,39 +321,52 @@ function createCursor(loadDocs, query = {}) {
   }
 }
 
-function createCollectionAdapter(loadAll, persistOne, removeByIds) {
+function createCollectionAdapter(loadAll, persistOne, removeByIds, { collectionName = '' } = {}) {
+  const resolveOwnerUserId = () => {
+    const scopedName = String(collectionName || '')
+    if (!CRM_USER_SCOPED_COLLECTIONS.has(scopedName)) return null
+    const scope = requestScopeStorage.getStore()
+    if (!scope || !scope.userKey) return null
+    return normalizeUserKey(scope.userKey)
+  }
+
+  const scopeFilter = (filter = {}) => buildOwnerScopedFilter(filter, resolveOwnerUserId())
+
   return {
     find(query = {}) {
-      return createCursor(loadAll, query)
+      return createCursor(loadAll, scopeFilter(query))
     },
     async findOne(filter = {}) {
       const docs = await loadAll()
-      const found = docs.find((doc) => matchesQuery(doc, filter))
+      const found = docs.find((doc) => matchesQuery(doc, scopeFilter(filter)))
       return found ? cloneDoc(found) : null
     },
     async countDocuments(filter = {}) {
       const docs = await loadAll()
-      return docs.filter((doc) => matchesQuery(doc, filter)).length
+      return docs.filter((doc) => matchesQuery(doc, scopeFilter(filter))).length
     },
     async insertOne(doc = {}) {
+      const ownerUserId = resolveOwnerUserId()
       const id = String(doc.id || uuidv4())
-      const payload = { ...doc, id }
+      const payload = withOwnerUserId({ ...doc, id }, ownerUserId)
       await persistOne(payload)
       return { insertedId: id }
     },
     async insertMany(docs = []) {
+      const ownerUserId = resolveOwnerUserId()
       const insertedIds = {}
       for (let i = 0; i < docs.length; i++) {
         const doc = docs[i]
         const id = String(doc.id || uuidv4())
-        await persistOne({ ...doc, id })
+        await persistOne(withOwnerUserId({ ...doc, id }, ownerUserId))
         insertedIds[i] = id
       }
       return { insertedCount: docs.length, insertedIds }
     },
     async updateOne(filter = {}, update = {}) {
+      const ownerUserId = resolveOwnerUserId()
       const docs = await loadAll()
-      const index = docs.findIndex((doc) => matchesQuery(doc, filter))
+      const index = docs.findIndex((doc) => matchesQuery(doc, scopeFilter(filter)))
       if (index === -1) return { matchedCount: 0, modifiedCount: 0 }
       const target = docs[index]
       const nextDoc = cloneDoc(target)
@@ -358,20 +398,21 @@ function createCollectionAdapter(loadAll, persistOne, removeByIds) {
         Object.assign(nextDoc, update)
       }
 
+      if (ownerUserId) nextDoc.owner_user_id = ownerUserId
       if (!nextDoc.id) nextDoc.id = String(target.id || uuidv4())
       await persistOne(nextDoc)
       return { matchedCount: 1, modifiedCount: 1 }
     },
     async deleteOne(filter = {}) {
       const docs = await loadAll()
-      const target = docs.find((doc) => matchesQuery(doc, filter))
+      const target = docs.find((doc) => matchesQuery(doc, scopeFilter(filter)))
       if (!target?.id) return { deletedCount: 0 }
       const deleted = await removeByIds([String(target.id)])
       return { deletedCount: deleted }
     },
     async deleteMany(filter = {}) {
       const docs = await loadAll()
-      const ids = docs.filter((doc) => matchesQuery(doc, filter)).map((doc) => String(doc.id)).filter(Boolean)
+      const ids = docs.filter((doc) => matchesQuery(doc, scopeFilter(filter))).map((doc) => String(doc.id)).filter(Boolean)
       if (!ids.length) return { deletedCount: 0 }
       const deleted = await removeByIds(ids)
       return { deletedCount: deleted }
@@ -399,7 +440,8 @@ function createInMemoryDb() {
           list.length = 0
           keep.forEach((item) => list.push(item))
           return deletedCount
-        }
+        },
+        { collectionName: name }
       )
     }
   }
@@ -568,7 +610,7 @@ function createPostgresDb(pool) {
         )
         return rowCount || 0
       }
-      return createCollectionAdapter(loadAll, persistOne, removeByIds)
+      return createCollectionAdapter(loadAll, persistOne, removeByIds, { collectionName: name })
     }
   }
 }
@@ -3346,22 +3388,35 @@ function parseJwtPayloadUnsafe(token) {
   }
 }
 
+function isEmailLike(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return false
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(raw)
+}
+
 function normalizeUserKey(value) {
   const raw = String(value || '').trim().toLowerCase()
   return raw || 'anonymous'
 }
 
 function getRequestAuthContext(request) {
-  const authHeader = request.headers.get('authorization') || request.headers.get('Authorization') || ''
+  const headers = request?.headers && typeof request.headers.get === 'function' ? request.headers : null
+  const readHeader = (name) => headers ? (headers.get(name) || '') : ''
+  const authHeader = readHeader('authorization') || readHeader('Authorization') || ''
   const token = parseBearerToken(authHeader)
   const claims = token ? parseJwtPayloadUnsafe(token) : null
-  const email = String(claims?.email || request.headers.get('x-user-email') || '').trim().toLowerCase() || null
+  const candidateEmail =
+    claims?.email ||
+    readHeader('x-user-email') ||
+    (isEmailLike(claims?.['cognito:username']) ? claims?.['cognito:username'] : '') ||
+    (isEmailLike(claims?.username) ? claims?.username : '')
+  const email = String(candidateEmail || '').trim().toLowerCase() || null
   const userKey = normalizeUserKey(
     email ||
     claims?.sub ||
     claims?.['cognito:username'] ||
     claims?.username ||
-    request.headers.get('x-user-id') ||
+    readHeader('x-user-id') ||
     'anonymous'
   )
 
@@ -3372,6 +3427,337 @@ function getRequestAuthContext(request) {
     userKey,
     isAuthenticated: Boolean(token && claims)
   }
+}
+
+const NOTIFICATION_PREFS_DOC_ID = 'default'
+const DEFAULT_NOTIFICATION_CHANNELS = {
+  in_app: true,
+  email: true,
+  calendar: false
+}
+const DEFAULT_NOTIFICATION_TYPES = {
+  general: true,
+  nudge: true,
+  checklist_slip: true,
+  stalled_deal: true,
+  new_lead: true,
+  overdue_tasks: true,
+  deal_inactivity: true,
+  closing_approaching: true
+}
+
+function getEmailNotificationsConfig() {
+  return {
+    enabled: String(process.env.EMAIL_NOTIFICATIONS_ENABLED || '').trim().toLowerCase() === 'true',
+    provider: String(process.env.EMAIL_PROVIDER || 'resend').trim().toLowerCase() || 'resend',
+    fromEmail: String(process.env.EMAIL_FROM || '').trim(),
+    resendApiKey: String(process.env.RESEND_API_KEY || '').trim(),
+    appName: String(process.env.EMAIL_APP_NAME || 'Snaphomz').trim() || 'Snaphomz',
+    appUrl: String(process.env.APP_BASE_URL || process.env.NEXT_PUBLIC_APP_URL || '').trim()
+  }
+}
+
+function toClockMinutes(clock = '00:00') {
+  const raw = String(clock || '').trim()
+  const match = raw.match(/^([01]?\d|2[0-3]):([0-5]\d)$/)
+  if (!match) return null
+  return Number(match[1]) * 60 + Number(match[2])
+}
+
+function isQuietHoursNow(now = new Date(), quietHours = {}) {
+  if (!quietHours?.enabled) return false
+  const start = toClockMinutes(quietHours.start || '21:00')
+  const end = toClockMinutes(quietHours.end || '08:00')
+  if (start === null || end === null) return false
+  const mins = now.getHours() * 60 + now.getMinutes()
+  if (start === end) return false
+  if (start < end) return mins >= start && mins < end
+  return mins >= start || mins < end
+}
+
+function normalizeNotificationPreferences(input = {}, email = '') {
+  const raw = isPlainObject(input) ? input : {}
+  const channels = isPlainObject(raw.channels) ? raw.channels : {}
+  const types = isPlainObject(raw.types) ? raw.types : {}
+  const quietHours = isPlainObject(raw.quiet_hours) ? raw.quiet_hours : {}
+  return {
+    id: NOTIFICATION_PREFS_DOC_ID,
+    email: String(raw.email || email || '').trim().toLowerCase() || null,
+    channels: {
+      ...DEFAULT_NOTIFICATION_CHANNELS,
+      ...channels,
+      in_app: true
+    },
+    timing: raw.timing === 'digest' ? 'digest' : 'immediate',
+    quiet_hours: {
+      enabled: Boolean(quietHours.enabled),
+      start: String(quietHours.start || '21:00'),
+      end: String(quietHours.end || '08:00')
+    },
+    types: {
+      ...DEFAULT_NOTIFICATION_TYPES,
+      ...types
+    },
+    updated_at: new Date()
+  }
+}
+
+async function getNotificationPreferences(db, request, { createIfMissing = true, authOverride = null } = {}) {
+  const baseAuth = getRequestAuthContext(request)
+  const override = isPlainObject(authOverride) ? authOverride : {}
+  const fallbackEmailFromUserKey = isEmailLike(override.userKey)
+    ? String(override.userKey).trim().toLowerCase()
+    : (isEmailLike(baseAuth.userKey) ? String(baseAuth.userKey).trim().toLowerCase() : '')
+  const effectiveEmail = String(override.email || baseAuth.email || fallbackEmailFromUserKey || '').trim().toLowerCase() || null
+  const effectiveUserKey = normalizeUserKey(override.userKey || effectiveEmail || baseAuth.userKey || 'anonymous')
+  const auth = {
+    ...baseAuth,
+    email: effectiveEmail,
+    userKey: effectiveUserKey
+  }
+  const ownerUserId = normalizeUserKey(auth?.userKey || auth?.email || 'anonymous')
+  const coll = db.collection('notification_preferences')
+  const ownerQuery = { id: NOTIFICATION_PREFS_DOC_ID, owner_user_id: ownerUserId }
+  const existing = await coll.findOne(ownerQuery)
+  if (existing) {
+    if (!existing?.email && auth?.email) {
+      try {
+        await coll.updateOne(ownerQuery, { $set: { email: auth.email, updated_at: new Date() } })
+      } catch (_) {}
+    }
+    return {
+      auth: { ...auth, userKey: ownerUserId },
+      prefs: normalizeNotificationPreferences(existing, auth.email || '')
+    }
+  }
+
+  const defaults = normalizeNotificationPreferences({}, auth.email || '')
+  if (createIfMissing) {
+    try {
+      await coll.insertOne({ ...defaults, owner_user_id: ownerUserId, created_at: new Date() })
+    } catch (_) {}
+  }
+  return { auth: { ...auth, userKey: ownerUserId }, prefs: defaults }
+}
+
+async function upsertNotificationPreferences(db, request, patch = {}) {
+  const { auth, prefs: current } = await getNotificationPreferences(db, request, { createIfMissing: true })
+  const ownerUserId = normalizeUserKey(auth?.userKey || auth?.email || 'anonymous')
+  const merged = normalizeNotificationPreferences({ ...current, ...(isPlainObject(patch) ? patch : {}) }, auth.email || current.email || '')
+  const coll = db.collection('notification_preferences')
+  const ownerQuery = { id: NOTIFICATION_PREFS_DOC_ID, owner_user_id: ownerUserId }
+  const existing = await coll.findOne(ownerQuery)
+  if (existing) {
+    await coll.updateOne(
+      ownerQuery,
+      {
+        $set: {
+          email: merged.email,
+          channels: merged.channels,
+          timing: merged.timing,
+          quiet_hours: merged.quiet_hours,
+          types: merged.types,
+          updated_at: new Date()
+        }
+      }
+    )
+  } else {
+    await coll.insertOne({
+      ...merged,
+      owner_user_id: ownerUserId,
+      created_at: new Date()
+    })
+  }
+  return merged
+}
+
+async function wasEmailRecentlySent(db, dedupeKey, cooldownMinutes = 60 * 24) {
+  if (!dedupeKey) return false
+  const coll = db.collection('notification_email_log')
+  const existing = await coll.findOne({ dedupe_key: dedupeKey })
+  if (!existing) return false
+  const sentAt = new Date(existing.last_sent_at || existing.created_at || 0)
+  if (Number.isNaN(sentAt.getTime())) return false
+  return (Date.now() - sentAt.getTime()) < (Math.max(1, Number(cooldownMinutes) || (60 * 24)) * 60 * 1000)
+}
+
+async function markEmailSent(db, dedupeKey, payload = {}) {
+  if (!dedupeKey) return
+  const coll = db.collection('notification_email_log')
+  const existing = await coll.findOne({ dedupe_key: dedupeKey })
+  if (existing) {
+    await coll.updateOne(
+      { id: existing.id },
+      {
+        $set: {
+          ...payload,
+          dedupe_key: dedupeKey,
+          last_sent_at: new Date(),
+          updated_at: new Date()
+        }
+      }
+    )
+    return
+  }
+  await coll.insertOne({
+    id: uuidv4(),
+    dedupe_key: dedupeKey,
+    ...payload,
+    last_sent_at: new Date(),
+    created_at: new Date(),
+    updated_at: new Date()
+  })
+}
+
+async function sendEmailViaResend(config, { to, subject, text, html }) {
+  const apiKey = String(config?.resendApiKey || '').trim()
+  const from = String(config?.fromEmail || '').trim()
+  if (!apiKey || !from) {
+    return { success: false, reason: 'missing_provider_config' }
+  }
+
+  try {
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from,
+        to: [to],
+        subject,
+        text,
+        html
+      })
+    })
+    const payload = await response.json().catch(() => ({}))
+    if (!response.ok) {
+      return {
+        success: false,
+        reason: 'provider_error',
+        error: String(payload?.message || payload?.error || `HTTP ${response.status}`)
+      }
+    }
+    return { success: true, provider_message_id: payload?.id || null }
+  } catch (error) {
+    return {
+      success: false,
+      reason: 'network_error',
+      error: String(error?.message || 'Email send failed')
+    }
+  }
+}
+
+async function sendNotificationEmail({
+  db,
+  request,
+  authOverride = null,
+  notificationType = 'general',
+  priority = 'medium',
+  dedupeKey = '',
+  subject,
+  message,
+  html = null,
+  cooldownMinutes = 60 * 24,
+  metadata = {}
+}) {
+  const config = getEmailNotificationsConfig()
+  if (!config.enabled) return { success: false, reason: 'email_channel_disabled' }
+
+  const { auth, prefs } = await getNotificationPreferences(db, request, { createIfMissing: true, authOverride })
+  const channels = prefs?.channels || DEFAULT_NOTIFICATION_CHANNELS
+  if (!channels.email) return { success: false, reason: 'email_pref_disabled' }
+  const isTypeEnabled = prefs?.types?.[notificationType]
+  if (isTypeEnabled === false) return { success: false, reason: 'type_pref_disabled' }
+  if (prefs?.timing === 'digest') return { success: false, reason: 'digest_mode' }
+
+  const normalizedPriority = String(priority || 'medium').toLowerCase()
+  const bypassQuietHours = normalizedPriority === 'urgent' || normalizedPriority === 'high'
+  if (!bypassQuietHours && isQuietHoursNow(new Date(), prefs?.quiet_hours || {})) {
+    return { success: false, reason: 'quiet_hours' }
+  }
+
+  const recipient = String(
+    prefs?.email ||
+    auth?.email ||
+    (isEmailLike(auth?.userKey) ? auth.userKey : '') ||
+    ''
+  ).trim().toLowerCase()
+  if (!recipient) return { success: false, reason: 'missing_recipient_email' }
+
+  if (dedupeKey && await wasEmailRecentlySent(db, dedupeKey, cooldownMinutes)) {
+    return { success: false, reason: 'duplicate_suppressed' }
+  }
+
+  const safeSubject = String(subject || '').trim() || `[${config.appName}] Notification`
+  const safeMessage = String(message || '').trim() || 'You have a new update in CRM.'
+  const appUrl = config.appUrl || ''
+  const textBody = appUrl ? `${safeMessage}\n\nOpen CRM: ${appUrl}` : safeMessage
+  const htmlBody = html || `<p>${safeMessage}</p>${appUrl ? `<p><a href="${appUrl}">Open CRM</a></p>` : ''}`
+
+  const sendResult = config.provider === 'resend'
+    ? await sendEmailViaResend(config, { to: recipient, subject: safeSubject, text: textBody, html: htmlBody })
+    : { success: false, reason: 'unsupported_provider' }
+
+  if (!sendResult.success) return sendResult
+
+  if (dedupeKey) {
+    await markEmailSent(db, dedupeKey, {
+      notification_type: notificationType,
+      recipient,
+      priority: normalizedPriority,
+      provider: config.provider,
+      provider_message_id: sendResult.provider_message_id || null,
+      metadata
+    })
+  }
+  return { success: true, recipient }
+}
+
+async function sendNotificationRecordEmail(db, request, notification = {}, options = {}) {
+  const notif = notification || {}
+  const type = String(notif.type || 'general')
+  const title = String(notif.title || 'CRM Notification').trim()
+  const body = String(notif.message || '').trim() || 'You have a new CRM update.'
+  const dedupeKey = `notification:${type}:${String(notif.id || '').trim() || body.toLowerCase().slice(0, 120)}`
+  return sendNotificationEmail({
+    db,
+    request,
+    authOverride: options?.authOverride || null,
+    notificationType: type,
+    priority: String(notif?.meta?.priority || 'medium'),
+    dedupeKey,
+    subject: `[Snaphomz] ${title}`,
+    message: body,
+    metadata: {
+      notification_id: notif.id || null,
+      kind: type
+    }
+  })
+}
+
+async function sendSmartAlertEmail(db, request, alert = {}, options = {}) {
+  const type = String(alert?.alert_type || 'general')
+  const title = String(alert?.title || 'Smart Alert').trim()
+  const message = String(alert?.message || '').trim() || 'You have a smart alert in CRM.'
+  const dedupeWindow = new Date().toISOString().slice(0, 10)
+  const dedupeKey = `smart_alert:${String(alert?.id || '')}:${dedupeWindow}`
+  return sendNotificationEmail({
+    db,
+    request,
+    authOverride: options?.authOverride || null,
+    notificationType: type,
+    priority: String(alert?.priority || 'medium'),
+    dedupeKey,
+    subject: `[Snaphomz] ${title}`,
+    message,
+    metadata: {
+      alert_id: alert?.id || null,
+      transaction_id: alert?.transaction_id || null,
+      alert_type: type
+    }
+  })
 }
 
 function sanitizeReturnPath(returnTo = '/') {
@@ -6585,6 +6971,7 @@ async function handleRoute(request, { params }) {
   const { path = [] } = params
   const route = `/${path.join('/')}`
   const method = request.method
+  requestScopeStorage.enterWith({ userKey: getRequestAuthContext(request).userKey })
 
   try {
     if (route === '/health/db' && method === 'GET') {
@@ -7875,6 +8262,7 @@ function heuristicAssistantParse(message = '') {
               listing_price: listingPrice,
               contract_price: contractPrice,
               closing_date: closingDate,
+              add_to_calendar: false,
               created_at: new Date(),
               updated_at: new Date(),
               stage_history: [{
@@ -8054,6 +8442,7 @@ function heuristicAssistantParse(message = '') {
       try {
         const body = await request.json()
         const closingDate = toDateOnlyString(body?.closing_date)
+        const addToCalendar = Boolean(body?.add_to_calendar)
         
         if (!body.property_address || !body.client_name) {
           return handleCORS(NextResponse.json({
@@ -8076,6 +8465,7 @@ function heuristicAssistantParse(message = '') {
           listing_price: body.listing_price,
           contract_price: body.contract_price,
           closing_date: closingDate,
+          add_to_calendar: addToCalendar,
           created_at: new Date(),
           updated_at: new Date(),
           stage_history: [{
@@ -8094,7 +8484,7 @@ function heuristicAssistantParse(message = '') {
           reason: 'not_attempted',
           quick_add_url: null
         })
-        if (closingDate) {
+        if (closingDate && addToCalendar) {
           try {
             const auth = getRequestAuthContext(request)
             const calendarService = new CalendarService({ db, logger: console })
@@ -8155,6 +8545,14 @@ function heuristicAssistantParse(message = '') {
               quick_add_url: null
             })
           }
+        } else if (closingDate && !addToCalendar) {
+          calendarSync = baseCalendarSyncResult({
+            attempted: false,
+            connected: false,
+            success: false,
+            reason: 'skipped_by_user',
+            quick_add_url: null
+          })
         }
 
         const { _id, ...cleanedTransaction } = transaction
@@ -9240,6 +9638,13 @@ function heuristicAssistantParse(message = '') {
     if (route === '/alerts/generate' && method === 'POST') {
       try {
         const upserted = await generateSmartAlerts(db)
+        let emailed = 0
+        try {
+          const emailRuns = await Promise.allSettled(
+            upserted.map((alert) => sendSmartAlertEmail(db, request, alert))
+          )
+          emailed = emailRuns.filter((run) => run.status === 'fulfilled' && run.value?.success).length
+        } catch (_) {}
         // SSE broadcast so UI refreshes immediately
         try {
           const g = globalThis
@@ -9252,7 +9657,8 @@ function heuristicAssistantParse(message = '') {
         return handleCORS(NextResponse.json({
           success: true,
           message: "Alerts generated successfully",
-          generated: upserted.length
+          generated: upserted.length,
+          emailed
         }))
       } catch (error) {
         console.error('Alert generation error:', error)
@@ -9698,7 +10104,7 @@ function heuristicAssistantParse(message = '') {
             reasonBits.push(`Due in ${daysLeft} day${daysLeft === 1 ? '' : 's'}`)
           }
           if (t.client_name) reasonBits.push(`Client: ${t.client_name}`)
-          const labelDue = isNaN(due) ? 'ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â' : (urgency === 'due_today' ? 'today' : `due ${due.toLocaleDateString()}`)
+          const labelDue = isNaN(due) ? 'unscheduled' : (urgency === 'due_today' ? 'today' : `due ${due.toLocaleDateString()}`)
           nbaItems.push({
             key: `task:${t.id}`,
             type: 'task',
@@ -9711,7 +10117,7 @@ function heuristicAssistantParse(message = '') {
             priority_score,
             urgency,
             impact: 'medium',
-            reason: reasonBits.join(' ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ '),
+            reason: reasonBits.join(' | '),
             can_auto_complete: false,
             source: tag
           })
@@ -9863,7 +10269,7 @@ function heuristicAssistantParse(message = '') {
             const { est_duration_min, priority_score, urgency } = estimateTask(t)
             const tx = txMap.get(t.transaction_id)
             const due = t.due_date ? new Date(t.due_date) : null
-            const labelDue = due ? (due.toDateString() === new Date().toDateString() ? 'today' : `due ${due.toLocaleDateString()}`) : 'ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â'
+            const labelDue = due ? (due.toDateString() === new Date().toDateString() ? 'today' : `due ${due.toLocaleDateString()}`) : 'unscheduled'
             items.push({
               key: `task:${t.id}`,
               type: 'task',
@@ -9913,7 +10319,7 @@ function heuristicAssistantParse(message = '') {
           items = tasks.map(t => {
             const { est_duration_min, priority_score, urgency } = estimateTask(t)
             const due = t.due_date ? new Date(t.due_date) : null
-            const labelDue = due ? (due >= startOfToday && due <= endOfToday ? 'today' : `due ${due.toLocaleDateString()}`) : 'ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â'
+            const labelDue = due ? (due >= startOfToday && due <= endOfToday ? 'today' : `due ${due.toLocaleDateString()}`) : 'unscheduled'
             const tx = txMap.get(t.transaction_id)
             return {
               key: `task:${t.id}`,
@@ -10229,6 +10635,55 @@ function heuristicAssistantParse(message = '') {
       return handleCORS(NextResponse.json(stats))
     }
 
+    // GET /api/preferences/notifications - Per-user notification channel preferences
+    if (route === '/preferences/notifications' && method === 'GET') {
+      try {
+        const { prefs } = await getNotificationPreferences(db, request, { createIfMissing: true })
+        return handleCORS(NextResponse.json({
+          success: true,
+          preferences: {
+            id: prefs.id,
+            email: prefs.email,
+            channels: prefs.channels,
+            timing: prefs.timing,
+            quiet_hours: prefs.quiet_hours,
+            types: prefs.types
+          }
+        }))
+      } catch (error) {
+        console.error('Notification preferences fetch error:', error)
+        return handleCORS(NextResponse.json({
+          success: false,
+          error: 'Failed to fetch notification preferences'
+        }, { status: 500 }))
+      }
+    }
+
+    // PUT /api/preferences/notifications - Update per-user notification preferences
+    if (route === '/preferences/notifications' && (method === 'PUT' || method === 'PATCH')) {
+      try {
+        const body = await request.json().catch(() => ({}))
+        const updated = await upsertNotificationPreferences(db, request, body || {})
+        return handleCORS(NextResponse.json({
+          success: true,
+          preferences: {
+            id: updated.id,
+            email: updated.email,
+            channels: updated.channels,
+            timing: updated.timing,
+            quiet_hours: updated.quiet_hours,
+            types: updated.types
+          }
+        }))
+      } catch (error) {
+        console.error('Notification preferences update error:', error)
+        return handleCORS(NextResponse.json({
+          success: false,
+          error: 'Failed to update notification preferences'
+        }, { status: 500 }))
+      }
+    }
+
     // --- Notifications API ---
     // GET /api/notifications
     if (route === '/notifications' && method === 'GET') {
@@ -10267,6 +10722,7 @@ function heuristicAssistantParse(message = '') {
         }
         const coll = (await connectToMongo()).collection('notifications')
         await coll.insertOne(notif)
+        try { await sendNotificationRecordEmail(db, request, notif) } catch (_) {}
         // SSE broadcast
         try {
           const g = globalThis
@@ -10395,7 +10851,7 @@ if (!globalThis.__crmNudgeScheduler) {
       const now = new Date()
 
       // Overdue checklist tasks
-      const overdueTasks = await db.collection('checklist').find({
+      const overdueTasks = await db.collection('checklist_items').find({
         status: { $ne: 'completed' },
         due_date: { $lte: now }
       }).limit(5).toArray()
@@ -10414,17 +10870,26 @@ if (!globalThis.__crmNudgeScheduler) {
           const nid = `nudge:${payload.id}:${now.toISOString().slice(0, 13)}`
           const exists = await coll.findOne({ id: nid })
           if (!exists) {
-            await coll.insertOne({
+            const ownerUserId = normalizeUserKey(t?.owner_user_id || 'anonymous')
+            const ownerEmail = ownerUserId.includes('@') ? ownerUserId : null
+            const notificationDoc = {
               id: nid,
               type: 'nudge',
               title: 'Overdue task',
               message: payload.message,
               meta: payload,
+              owner_user_id: ownerUserId,
               status: 'unread',
               created_at: new Date(),
               updated_at: new Date(),
               snooze_until: null
-            })
+            }
+            await coll.insertOne(notificationDoc)
+            try {
+              await sendNotificationRecordEmail(db, null, notificationDoc, {
+                authOverride: { userKey: ownerUserId, email: ownerEmail }
+              })
+            } catch (_) {}
           }
         } catch (_) {}
       }
@@ -10450,17 +10915,26 @@ if (!globalThis.__crmNudgeScheduler) {
           const nid = `nudge:${payload.id}:${now.toISOString().slice(0, 13)}`
           const exists = await coll.findOne({ id: nid })
           if (!exists) {
-            await coll.insertOne({
+            const ownerUserId = normalizeUserKey(tx?.owner_user_id || 'anonymous')
+            const ownerEmail = ownerUserId.includes('@') ? ownerUserId : null
+            const notificationDoc = {
               id: nid,
               type: 'nudge',
               title: 'Stalled deal',
               message: payload.message,
               meta: payload,
+              owner_user_id: ownerUserId,
               status: 'unread',
               created_at: new Date(),
               updated_at: new Date(),
               snooze_until: null
-            })
+            }
+            await coll.insertOne(notificationDoc)
+            try {
+              await sendNotificationRecordEmail(db, null, notificationDoc, {
+                authOverride: { userKey: ownerUserId, email: ownerEmail }
+              })
+            } catch (_) {}
           }
         } catch (_) {}
       }
@@ -10482,17 +10956,26 @@ if (!globalThis.__crmNudgeScheduler) {
           const nid = `nudge:${payload.id}:${now.toISOString().slice(0, 13)}`
           const exists = await coll.findOne({ id: nid })
           if (!exists) {
-            await coll.insertOne({
+            const ownerUserId = normalizeUserKey(lead?.owner_user_id || 'anonymous')
+            const ownerEmail = ownerUserId.includes('@') ? ownerUserId : null
+            const notificationDoc = {
               id: nid,
               type: 'nudge',
               title: 'New lead',
               message: payload.message,
               meta: payload,
+              owner_user_id: ownerUserId,
               status: 'unread',
               created_at: new Date(),
               updated_at: new Date(),
               snooze_until: null
-            })
+            }
+            await coll.insertOne(notificationDoc)
+            try {
+              await sendNotificationRecordEmail(db, null, notificationDoc, {
+                authOverride: { userKey: ownerUserId, email: ownerEmail }
+              })
+            } catch (_) {}
           }
         } catch (_) {}
       }
@@ -10534,6 +11017,18 @@ if (!globalThis.__crmSnoozeScheduler) {
         try { pushSSE('notifications:changed', { action: 'unsnoozed', id: n.id }) } catch {}
         // Proactively remind the user with a payload (toast/browser notification on client)
         try { pushSSE('notifications:remind', { id: n.id, type: n.type, title: n.title || 'Reminder', message: n.message, meta: n.meta || {} }) } catch {}
+        try {
+          const ownerUserId = normalizeUserKey(n?.owner_user_id || 'anonymous')
+          const ownerEmail = ownerUserId.includes('@') ? ownerUserId : null
+          await sendNotificationRecordEmail(db, null, {
+            ...n,
+            status: 'unread',
+            snooze_until: null,
+            updated_at: new Date()
+          }, {
+            authOverride: { userKey: ownerUserId, email: ownerEmail }
+          })
+        } catch (_) {}
       }
     } catch (e) {
       console.warn('Snooze scan error', e)
@@ -10551,6 +11046,8 @@ export const POST = handleRoute
 export const PUT = handleRoute
 export const DELETE = handleRoute
 export const PATCH = handleRoute
+
+
 
 
 
