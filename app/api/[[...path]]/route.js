@@ -3,12 +3,42 @@ import { v4 as uuidv4 } from 'uuid'
 import { NextResponse } from 'next/server'
 import fs from 'fs'
 import nodePath from 'path'
+import crypto from 'crypto'
 
 // Database connection
 let pgPool
 let db
+let dbInitPromise = null
+let dbMode = 'uninitialized'
+let dbConnectedLogEmitted = false
+let dbMissingConfigLogEmitted = false
+let dbConnectErrorLogEmitted = false
+let dbInMemoryLogEmitted = false
 
 const PG_DOC_TABLE = 'crm_documents'
+const GOOGLE_CALENDAR_CONNECTIONS_COLLECTION = 'google_calendar_connections'
+const CALENDAR_CONNECTIONS_COLLECTION = 'calendar_connections'
+const CALENDAR_EVENTS_COLLECTION = 'calendar_events'
+const GOOGLE_STATE_TTL_MS = 10 * 60 * 1000
+const CALENDAR_STATE_TTL_MS = 10 * 60 * 1000
+const GOOGLE_OAUTH_SCOPES = [
+  'openid',
+  'email',
+  'profile',
+  'https://www.googleapis.com/auth/calendar.events'
+]
+const OUTLOOK_OAUTH_SCOPES = [
+  'openid',
+  'profile',
+  'email',
+  'offline_access',
+  'Calendars.ReadWrite'
+]
+const CALENDAR_PROVIDER_GOOGLE = 'google'
+const CALENDAR_PROVIDER_OUTLOOK = 'outlook'
+const CALENDAR_PROVIDER_IDS = [CALENDAR_PROVIDER_GOOGLE, CALENDAR_PROVIDER_OUTLOOK]
+const CALENDAR_TOKEN_ENCRYPTION_PREFIX = 'enc:v1'
+const GRAPH_API_BASE_URL = 'https://graph.microsoft.com/v1.0'
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value) && !(value instanceof Date) && !(value instanceof RegExp)
@@ -385,11 +415,127 @@ async function ensurePgSchema(pool) {
     )
   `)
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_${PG_DOC_TABLE}_collection ON ${PG_DOC_TABLE} (collection_name)`)
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS calendar_connections (
+      id UUID PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      provider TEXT NOT NULL CHECK (provider IN ('google', 'outlook')),
+      connected_email TEXT,
+      access_token TEXT,
+      refresh_token TEXT,
+      token_type TEXT,
+      scope TEXT,
+      calendar_id TEXT,
+      expires_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (user_id, provider)
+    )
+  `)
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_calendar_connections_user_id
+    ON calendar_connections (user_id)
+  `)
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS calendar_events (
+      id UUID PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      start_time TIMESTAMPTZ NOT NULL,
+      end_time TIMESTAMPTZ NOT NULL,
+      description TEXT,
+      location TEXT,
+      attendees JSONB NOT NULL DEFAULT '[]'::jsonb,
+      source_type TEXT,
+      source_id TEXT,
+      transaction_id TEXT,
+      sync_status TEXT NOT NULL DEFAULT 'pending',
+      sync_error TEXT,
+      synced_at TIMESTAMPTZ,
+      status TEXT NOT NULL DEFAULT 'active',
+      deleted_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `)
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_calendar_events_user_start_time
+    ON calendar_events (user_id, start_time)
+  `)
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_calendar_events_transaction_id
+    ON calendar_events (transaction_id)
+  `)
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS event_provider_mapping (
+      id UUID PRIMARY KEY,
+      event_id UUID NOT NULL REFERENCES calendar_events(id) ON DELETE CASCADE,
+      connection_id UUID NOT NULL REFERENCES calendar_connections(id) ON DELETE CASCADE,
+      external_event_id TEXT NOT NULL,
+      external_event_link TEXT,
+      sync_status TEXT NOT NULL DEFAULT 'pending',
+      sync_error TEXT,
+      last_synced_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (event_id, connection_id),
+      UNIQUE (connection_id, external_event_id)
+    )
+  `)
+
+  // Backward-compatible shape evolution (safe no-op when columns already exist)
+  await pool.query(`ALTER TABLE calendar_connections ADD COLUMN IF NOT EXISTS token_type TEXT`)
+  await pool.query(`ALTER TABLE calendar_connections ADD COLUMN IF NOT EXISTS scope TEXT`)
+  await pool.query(`ALTER TABLE calendar_connections ADD COLUMN IF NOT EXISTS calendar_id TEXT`)
+  await pool.query(`ALTER TABLE calendar_connections ALTER COLUMN access_token DROP NOT NULL`)
+  await pool.query(`ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS attendees JSONB NOT NULL DEFAULT '[]'::jsonb`)
+  await pool.query(`ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS source_type TEXT`)
+  await pool.query(`ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS source_id TEXT`)
+  await pool.query(`ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS sync_status TEXT NOT NULL DEFAULT 'pending'`)
+  await pool.query(`ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS sync_error TEXT`)
+  await pool.query(`ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS synced_at TIMESTAMPTZ`)
+  await pool.query(`ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'`)
+  await pool.query(`ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`)
 }
 
 function shouldUseSsl(connectionString) {
   const value = String(connectionString || '').toLowerCase()
   return value.includes('sslmode=require') || value.includes('ssl=true')
+}
+
+function isDevInMemoryDbEnabled() {
+  return String(process.env.DEV_IN_MEMORY_DB || '').trim().toLowerCase() === 'true'
+}
+
+function getDatabaseConnectionString() {
+  return String(process.env.POSTGRES_URL || process.env.DATABASE_URL || '').trim()
+}
+
+function buildDbConfigError() {
+  const error = new Error(
+    'Missing DATABASE_URL (or POSTGRES_URL). Configure a PostgreSQL connection. ' +
+    'Use DEV_IN_MEMORY_DB=true only for temporary local development.'
+  )
+  error.code = 'DB_CONFIG_MISSING'
+  return error
+}
+
+function buildDbConnectError(cause) {
+  const error = new Error(`Failed to connect to PostgreSQL: ${String(cause?.message || cause || 'unknown error')}`)
+  error.code = 'DB_CONNECT_FAILED'
+  return error
+}
+
+function getDbRuntimeStatus() {
+  return {
+    mode: dbMode,
+    configured: Boolean(getDatabaseConnectionString()),
+    in_memory_enabled: isDevInMemoryDbEnabled(),
+    connected: dbMode === 'postgres'
+  }
 }
 
 function createPostgresDb(pool) {
@@ -428,40 +574,71 @@ function createPostgresDb(pool) {
 async function connectToMongo() {
   // Kept for compatibility with existing route handlers.
   if (db) return db
+  if (dbInitPromise) return dbInitPromise
 
-  const connectionString = process.env.POSTGRES_URL || process.env.DATABASE_URL
-  if (!connectionString) {
-    if (process.env.NODE_ENV !== 'production') {
-      console.warn('POSTGRES_URL or DATABASE_URL not set - using in-memory stub DB (development only).')
-      db = createInMemoryDb()
-      return db
+  dbInitPromise = (async () => {
+    const connectionString = getDatabaseConnectionString()
+    const allowInMemory = isDevInMemoryDbEnabled() && process.env.NODE_ENV !== 'production'
+    if (!connectionString) {
+      if (allowInMemory) {
+        if (!dbInMemoryLogEmitted) {
+          console.warn('[DB] DEV_IN_MEMORY_DB=true - using in-memory stub database.')
+          dbInMemoryLogEmitted = true
+        }
+        dbMode = 'in-memory'
+        db = createInMemoryDb()
+        return db
+      }
+      if (!dbMissingConfigLogEmitted) {
+        console.error('[DB] Missing DATABASE_URL - cannot start DB')
+        dbMissingConfigLogEmitted = true
+      }
+      throw buildDbConfigError()
     }
-    throw new Error('POSTGRES_URL or DATABASE_URL not configured')
-  }
 
-  try {
-    if (!pgPool) {
-      pgPool = new Pool({
-        connectionString,
-        ssl: shouldUseSsl(connectionString) ? { rejectUnauthorized: false } : undefined
-      })
-    }
-    await pgPool.query('SELECT 1')
-    await ensurePgSchema(pgPool)
-    db = createPostgresDb(pgPool)
-    return db
-  } catch (error) {
-    console.error('Postgres connection failed:', error?.message || error)
-    try { if (pgPool) await pgPool.end() } catch (_) {}
-    pgPool = null
-    db = null
-    if (process.env.NODE_ENV !== 'production') {
-      console.warn('Postgres unavailable - falling back to in-memory stub DB (development only).')
-      db = createInMemoryDb()
+    try {
+      if (!pgPool) {
+        pgPool = new Pool({
+          connectionString,
+          ssl: shouldUseSsl(connectionString) ? { rejectUnauthorized: false } : undefined
+        })
+      }
+      await pgPool.query('SELECT 1')
+      await ensurePgSchema(pgPool)
+      db = createPostgresDb(pgPool)
+      dbMode = 'postgres'
+      if (!dbConnectedLogEmitted) {
+        console.info('[DB] Connected to PostgreSQL')
+        dbConnectedLogEmitted = true
+      }
       return db
+    } catch (error) {
+      try { if (pgPool) await pgPool.end() } catch (_) {}
+      pgPool = null
+      db = null
+      dbMode = 'uninitialized'
+
+      if (allowInMemory) {
+        if (!dbInMemoryLogEmitted) {
+          console.warn('[DB] PostgreSQL unavailable and DEV_IN_MEMORY_DB=true - using in-memory stub database.')
+          dbInMemoryLogEmitted = true
+        }
+        dbMode = 'in-memory'
+        db = createInMemoryDb()
+        return db
+      }
+
+      if (!dbConnectErrorLogEmitted) {
+        console.error('[DB] Failed to connect to PostgreSQL:', error?.message || error)
+        dbConnectErrorLogEmitted = true
+      }
+      throw buildDbConnectError(error)
+    } finally {
+      dbInitPromise = null
     }
-    throw error
-  }
+  })()
+
+  return dbInitPromise
 }
 
 function getAiSearchBaseUrl() {
@@ -2959,6 +3136,3154 @@ function handleCORS(response) {
   return response
 }
 
+function getGoogleOAuthConfig() {
+  return {
+    clientId: String(process.env.GOOGLE_CLIENT_ID || process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || '').trim(),
+    clientSecret: String(process.env.GOOGLE_CLIENT_SECRET || '').trim(),
+    redirectUri: String(
+      process.env.GOOGLE_REDIRECT_URI ||
+      process.env.NEXT_PUBLIC_GOOGLE_REDIRECT_URI ||
+      'http://localhost:3000/api/google/callback'
+    ).trim(),
+    calendarId: String(process.env.GOOGLE_CALENDAR_ID || 'primary').trim() || 'primary',
+    stateSecret: String(
+      process.env.GOOGLE_OAUTH_STATE_SECRET ||
+      process.env.NEXTAUTH_SECRET ||
+      process.env.GOOGLE_CLIENT_SECRET ||
+      ''
+    ).trim()
+  }
+}
+
+function isGoogleOAuthConfigured(config = getGoogleOAuthConfig()) {
+  return Boolean(config.clientId && config.clientSecret && config.redirectUri && config.stateSecret)
+}
+
+function toBase64Url(value) {
+  const buffer = Buffer.isBuffer(value) ? value : Buffer.from(String(value), 'utf8')
+  return buffer.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+}
+
+function fromBase64Url(value) {
+  const normalized = String(value || '').replace(/-/g, '+').replace(/_/g, '/')
+  const padLength = (4 - (normalized.length % 4)) % 4
+  return Buffer.from(normalized + '='.repeat(padLength), 'base64')
+}
+
+function safeTimingEqual(left, right) {
+  const a = Buffer.from(String(left || ''), 'utf8')
+  const b = Buffer.from(String(right || ''), 'utf8')
+  if (a.length !== b.length) return false
+  return crypto.timingSafeEqual(a, b)
+}
+
+function parseBearerToken(headerValue) {
+  const raw = String(headerValue || '').trim()
+  if (!raw) return ''
+  const match = raw.match(/^Bearer\s+(.+)$/i)
+  return String(match?.[1] || raw).trim()
+}
+
+function parseJwtPayloadUnsafe(token) {
+  try {
+    const parts = String(token || '').split('.')
+    if (parts.length < 2) return null
+    const payloadRaw = fromBase64Url(parts[1]).toString('utf8')
+    return JSON.parse(payloadRaw)
+  } catch {
+    return null
+  }
+}
+
+function normalizeUserKey(value) {
+  const raw = String(value || '').trim().toLowerCase()
+  return raw || 'anonymous'
+}
+
+function getRequestAuthContext(request) {
+  const authHeader = request.headers.get('authorization') || request.headers.get('Authorization') || ''
+  const token = parseBearerToken(authHeader)
+  const claims = token ? parseJwtPayloadUnsafe(token) : null
+  const email = String(claims?.email || request.headers.get('x-user-email') || '').trim().toLowerCase() || null
+  const userKey = normalizeUserKey(
+    email ||
+    claims?.sub ||
+    claims?.['cognito:username'] ||
+    claims?.username ||
+    request.headers.get('x-user-id') ||
+    'anonymous'
+  )
+
+  return {
+    token,
+    claims,
+    email,
+    userKey,
+    isAuthenticated: Boolean(token && claims)
+  }
+}
+
+function sanitizeReturnPath(returnTo = '/') {
+  const raw = String(returnTo || '/').trim()
+  if (!raw.startsWith('/')) return '/'
+  if (raw.startsWith('//')) return '/'
+  return raw
+}
+
+function buildReturnPathWithParams(returnPath = '/', params = {}) {
+  const safePath = sanitizeReturnPath(returnPath)
+  const url = new URL(safePath, 'http://localhost')
+  for (const [key, value] of Object.entries(params || {})) {
+    if (value === undefined || value === null || value === '') continue
+    url.searchParams.set(key, String(value))
+  }
+  return `${url.pathname}${url.search}${url.hash}`
+}
+
+function createGoogleOAuthState({ userKey, returnTo = '/', config = getGoogleOAuthConfig() }) {
+  const payload = {
+    user_key: normalizeUserKey(userKey),
+    return_to: sanitizeReturnPath(returnTo),
+    ts: Date.now(),
+    nonce: uuidv4()
+  }
+  const encodedPayload = toBase64Url(JSON.stringify(payload))
+  const signature = toBase64Url(crypto.createHmac('sha256', config.stateSecret).update(encodedPayload).digest())
+  return `${encodedPayload}.${signature}`
+}
+
+function verifyGoogleOAuthState(state, config = getGoogleOAuthConfig()) {
+  try {
+    const [encodedPayload, signature] = String(state || '').split('.')
+    if (!encodedPayload || !signature) return null
+    const expected = toBase64Url(crypto.createHmac('sha256', config.stateSecret).update(encodedPayload).digest())
+    if (!safeTimingEqual(signature, expected)) return null
+
+    const payload = JSON.parse(fromBase64Url(encodedPayload).toString('utf8'))
+    const createdAt = Number(payload?.ts || 0)
+    if (!Number.isFinite(createdAt)) return null
+    if (Math.abs(Date.now() - createdAt) > GOOGLE_STATE_TTL_MS) return null
+
+    return {
+      userKey: normalizeUserKey(payload?.user_key),
+      returnTo: sanitizeReturnPath(payload?.return_to || '/')
+    }
+  } catch {
+    return null
+  }
+}
+
+function parseDateToEpochMillis(value) {
+  if (!value) return null
+  if (value instanceof Date) {
+    const epoch = value.getTime()
+    return Number.isFinite(epoch) ? epoch : null
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  const parsed = Date.parse(String(value))
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function toDateOnlyString(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw
+  const parsed = new Date(raw)
+  if (Number.isNaN(parsed.getTime())) return null
+  const y = parsed.getUTCFullYear()
+  const m = String(parsed.getUTCMonth() + 1).padStart(2, '0')
+  const d = String(parsed.getUTCDate()).padStart(2, '0')
+  return `${y}-${m}-${d}`
+}
+
+function addDaysToDateOnly(dateOnly, days = 1) {
+  const base = new Date(`${dateOnly}T00:00:00.000Z`)
+  if (Number.isNaN(base.getTime())) return null
+  base.setUTCDate(base.getUTCDate() + Number(days || 0))
+  const y = base.getUTCFullYear()
+  const m = String(base.getUTCMonth() + 1).padStart(2, '0')
+  const d = String(base.getUTCDate()).padStart(2, '0')
+  return `${y}-${m}-${d}`
+}
+
+function buildTransactionCalendarSummary(transaction) {
+  const type = String(transaction?.transaction_type || 'sale').toLowerCase()
+  const typeLabel = type === 'purchase' ? 'Purchase' : type === 'lease' ? 'Lease' : 'Sale'
+  return `${typeLabel} closing - ${transaction?.property_address || 'Real Estate Transaction'}`
+}
+
+function buildTransactionCalendarDetails(transaction) {
+  return [
+    `Client: ${transaction?.client_name || 'Unknown'}`,
+    transaction?.client_email ? `Email: ${transaction.client_email}` : null,
+    transaction?.client_phone ? `Phone: ${transaction.client_phone}` : null,
+    transaction?.assigned_agent ? `Assigned Agent: ${transaction.assigned_agent}` : null,
+    transaction?.listing_price ? `Listing Price: $${Number(transaction.listing_price).toLocaleString('en-US')}` : null,
+    '',
+    `Transaction ID: ${transaction?.id || ''}`
+  ].filter(Boolean).join('\n')
+}
+
+function buildTransactionCalendarEvent(transaction, closingDate) {
+  const summary = buildTransactionCalendarSummary(transaction)
+  const endDate = addDaysToDateOnly(closingDate, 1)
+  const details = buildTransactionCalendarDetails(transaction)
+  return {
+    summary,
+    description: details,
+    location: transaction?.property_address || undefined,
+    start: { date: closingDate },
+    end: { date: endDate || closingDate },
+    reminders: { useDefault: true }
+  }
+}
+
+function buildGoogleCalendarTemplateUrl(transaction, closingDate) {
+  const dateOnly = toDateOnlyString(closingDate)
+  if (!dateOnly) return null
+
+  const endDateOnly = addDaysToDateOnly(dateOnly, 1) || dateOnly
+  const start = dateOnly.replace(/-/g, '')
+  const end = endDateOnly.replace(/-/g, '')
+  if (!start || !end) return null
+
+  const params = new URLSearchParams()
+  params.set('action', 'TEMPLATE')
+  params.set('text', buildTransactionCalendarSummary(transaction))
+  params.set('dates', `${start}/${end}`)
+
+  const details = buildTransactionCalendarDetails(transaction)
+  if (details) params.set('details', details)
+
+  const location = String(transaction?.property_address || '').trim()
+  if (location) params.set('location', location)
+
+  return `https://calendar.google.com/calendar/render?${params.toString()}`
+}
+
+function buildOutlookCalendarComposeUrl(transaction, closingDate) {
+  const dateOnly = toDateOnlyString(closingDate)
+  if (!dateOnly) return null
+
+  const endDateOnly = addDaysToDateOnly(dateOnly, 1) || dateOnly
+  const params = new URLSearchParams()
+  params.set('path', '/calendar/action/compose')
+  params.set('rru', 'addevent')
+  params.set('subject', buildTransactionCalendarSummary(transaction))
+  params.set('startdt', dateOnly)
+  params.set('enddt', endDateOnly)
+  params.set('allday', 'true')
+
+  const details = buildTransactionCalendarDetails(transaction)
+  if (details) params.set('body', details)
+
+  const location = String(transaction?.property_address || '').trim()
+  if (location) params.set('location', location)
+
+  return `https://outlook.live.com/calendar/0/deeplink/compose?${params.toString()}`
+}
+
+function googleApiErrorMessage(payload, fallback = 'Google API request failed') {
+  if (!payload) return fallback
+  if (typeof payload === 'string') return payload || fallback
+  if (payload?.error?.message) return String(payload.error.message)
+  if (payload?.error_description) return String(payload.error_description)
+  if (payload?.error) return String(payload.error)
+  return fallback
+}
+
+async function findGoogleCalendarConnection(db, userKey) {
+  const key = normalizeUserKey(userKey)
+  return db.collection(GOOGLE_CALENDAR_CONNECTIONS_COLLECTION).findOne({ user_key: key })
+}
+
+async function upsertGoogleCalendarConnection(db, userKey, updates = {}) {
+  const key = normalizeUserKey(userKey)
+  const coll = db.collection(GOOGLE_CALENDAR_CONNECTIONS_COLLECTION)
+  const existing = await coll.findOne({ user_key: key })
+  const now = new Date()
+
+  if (existing) {
+    const next = {
+      ...existing,
+      ...updates,
+      user_key: key,
+      updated_at: now
+    }
+    await coll.updateOne({ id: existing.id }, { $set: next })
+    return next
+  }
+
+  const created = {
+    id: uuidv4(),
+    user_key: key,
+    created_at: now,
+    updated_at: now,
+    ...updates
+  }
+  await coll.insertOne(created)
+  return created
+}
+
+async function deleteGoogleCalendarConnection(db, userKey) {
+  const key = normalizeUserKey(userKey)
+  return db.collection(GOOGLE_CALENDAR_CONNECTIONS_COLLECTION).deleteOne({ user_key: key })
+}
+
+function getGoogleConnectionPublicStatus(connection, config) {
+  return {
+    configured: isGoogleOAuthConfigured(config),
+    connected: Boolean(connection),
+    connected_email: connection?.connected_email || null,
+    calendar_id: connection?.calendar_id || config.calendarId || 'primary',
+    expires_at: connection?.expires_at || null,
+    has_refresh_token: Boolean(connection?.refresh_token)
+  }
+}
+
+async function exchangeGoogleCodeForTokens({ code, config }) {
+  const params = new URLSearchParams()
+  params.set('code', String(code || ''))
+  params.set('client_id', config.clientId)
+  params.set('client_secret', config.clientSecret)
+  params.set('redirect_uri', config.redirectUri)
+  params.set('grant_type', 'authorization_code')
+
+  const response = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString()
+  })
+  const payload = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    throw new Error(googleApiErrorMessage(payload, `Google token exchange failed (${response.status})`))
+  }
+  return payload
+}
+
+async function refreshGoogleAccessToken({ refreshToken, config }) {
+  const params = new URLSearchParams()
+  params.set('refresh_token', String(refreshToken || ''))
+  params.set('client_id', config.clientId)
+  params.set('client_secret', config.clientSecret)
+  params.set('grant_type', 'refresh_token')
+
+  const response = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString()
+  })
+  const payload = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    throw new Error(googleApiErrorMessage(payload, `Google refresh failed (${response.status})`))
+  }
+  return payload
+}
+
+async function fetchGoogleUserProfile(accessToken) {
+  if (!accessToken) return null
+  const response = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  })
+  if (!response.ok) return null
+  return response.json().catch(() => null)
+}
+
+async function createGoogleCalendarEvent({ accessToken, calendarId = 'primary', event }) {
+  const response = await fetch(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(event)
+  })
+
+  const payload = await response.json().catch(() => null)
+  return {
+    ok: response.ok,
+    status: response.status,
+    payload
+  }
+}
+
+async function ensureGoogleAccessToken({ db, connection, config }) {
+  if (!connection) return { success: false, error: 'Google Calendar is not connected' }
+  let current = connection
+  let accessToken = String(current.access_token || '').trim()
+  const expiresAt = parseDateToEpochMillis(current.expires_at)
+  const expiresSoon = expiresAt !== null && expiresAt <= Date.now() + 60 * 1000
+
+  if ((!accessToken || expiresSoon) && current.refresh_token) {
+    const refreshed = await refreshGoogleAccessToken({ refreshToken: current.refresh_token, config })
+    current = await upsertGoogleCalendarConnection(db, current.user_key, {
+      access_token: refreshed.access_token || accessToken,
+      refresh_token: current.refresh_token,
+      token_type: refreshed.token_type || current.token_type || 'Bearer',
+      scope: refreshed.scope || current.scope || GOOGLE_OAUTH_SCOPES.join(' '),
+      expires_at: refreshed.expires_in
+        ? new Date(Date.now() + Math.max(0, Number(refreshed.expires_in) - 30) * 1000).toISOString()
+        : current.expires_at,
+      connected_email: current.connected_email || null,
+      calendar_id: current.calendar_id || config.calendarId
+    })
+    accessToken = String(current.access_token || '').trim()
+  }
+
+  if (!accessToken) {
+    return { success: false, error: 'Missing Google access token' }
+  }
+
+  return { success: true, accessToken, connection: current }
+}
+
+async function syncTransactionClosingDateToGoogleCalendar({ db, request, transaction }) {
+  const closingDate = toDateOnlyString(transaction?.closing_date)
+  const quickAddUrl = buildGoogleCalendarTemplateUrl(transaction, closingDate)
+  if (!closingDate) {
+    return {
+      attempted: false,
+      connected: false,
+      success: false,
+      reason: 'closing_date_missing',
+      quick_add_url: null
+    }
+  }
+
+  const config = getGoogleOAuthConfig()
+  if (!isGoogleOAuthConfigured(config)) {
+    return {
+      attempted: false,
+      connected: false,
+      success: false,
+      reason: 'google_oauth_not_configured',
+      quick_add_url: quickAddUrl
+    }
+  }
+
+  const auth = getRequestAuthContext(request)
+  const connection = await findGoogleCalendarConnection(db, auth.userKey)
+  if (!connection) {
+    return {
+      attempted: false,
+      connected: false,
+      success: false,
+      reason: 'google_not_connected',
+      quick_add_url: quickAddUrl
+    }
+  }
+
+  const ensured = await ensureGoogleAccessToken({ db, connection, config })
+  if (!ensured.success) {
+    return {
+      attempted: true,
+      connected: true,
+      success: false,
+      reason: 'google_token_unavailable',
+      error: ensured.error,
+      quick_add_url: quickAddUrl
+    }
+  }
+
+  const eventPayload = buildTransactionCalendarEvent(transaction, closingDate)
+  let insertion = await createGoogleCalendarEvent({
+    accessToken: ensured.accessToken,
+    calendarId: ensured.connection?.calendar_id || config.calendarId,
+    event: eventPayload
+  })
+
+  if (!insertion.ok && insertion.status === 401 && ensured.connection?.refresh_token) {
+    const refreshed = await refreshGoogleAccessToken({ refreshToken: ensured.connection.refresh_token, config })
+    const refreshedConnection = await upsertGoogleCalendarConnection(db, ensured.connection.user_key, {
+      access_token: refreshed.access_token || ensured.accessToken,
+      refresh_token: ensured.connection.refresh_token,
+      token_type: refreshed.token_type || ensured.connection.token_type || 'Bearer',
+      scope: refreshed.scope || ensured.connection.scope || GOOGLE_OAUTH_SCOPES.join(' '),
+      expires_at: refreshed.expires_in
+        ? new Date(Date.now() + Math.max(0, Number(refreshed.expires_in) - 30) * 1000).toISOString()
+        : ensured.connection.expires_at,
+      connected_email: ensured.connection.connected_email || null,
+      calendar_id: ensured.connection.calendar_id || config.calendarId
+    })
+    insertion = await createGoogleCalendarEvent({
+      accessToken: refreshedConnection.access_token,
+      calendarId: refreshedConnection.calendar_id || config.calendarId,
+      event: eventPayload
+    })
+  }
+
+  if (!insertion.ok) {
+    return {
+      attempted: true,
+      connected: true,
+      success: false,
+      reason: 'google_event_create_failed',
+      error: googleApiErrorMessage(insertion.payload, `Google Calendar insert failed (${insertion.status})`),
+      quick_add_url: quickAddUrl
+    }
+  }
+
+  const createdEvent = insertion.payload || {}
+  const syncFields = {
+    google_calendar_event_id: createdEvent.id || null,
+    google_calendar_event_link: createdEvent.htmlLink || null,
+    google_calendar_synced_at: new Date(),
+    updated_at: new Date()
+  }
+
+  await db.collection('transactions').updateOne({ id: transaction.id }, { $set: syncFields })
+
+  return {
+    attempted: true,
+    connected: true,
+    success: true,
+    event_id: createdEvent.id || null,
+    event_link: createdEvent.htmlLink || null,
+    calendar_id: ensured.connection?.calendar_id || config.calendarId,
+    quick_add_url: null
+  }
+}
+
+function getCalendarOAuthStateSecret() {
+  return String(
+    process.env.CALENDAR_OAUTH_STATE_SECRET ||
+    process.env.GOOGLE_OAUTH_STATE_SECRET ||
+    process.env.NEXTAUTH_SECRET ||
+    process.env.MICROSOFT_CLIENT_SECRET ||
+    process.env.GOOGLE_CLIENT_SECRET ||
+    ''
+  ).trim()
+}
+
+function getOutlookOAuthConfig() {
+  const tenant = String(process.env.MICROSOFT_TENANT || 'common').trim() || 'common'
+  return {
+    clientId: String(process.env.MICROSOFT_CLIENT_ID || '').trim(),
+    clientSecret: String(process.env.MICROSOFT_CLIENT_SECRET || '').trim(),
+    tenant,
+    redirectUri: String(
+      process.env.MICROSOFT_REDIRECT_URI ||
+      process.env.REDIRECT_URI ||
+      'http://localhost:3000/api/calendar/outlook/callback'
+    ).trim(),
+    stateSecret: getCalendarOAuthStateSecret(),
+    authorizationUrl: `https://login.microsoftonline.com/${encodeURIComponent(tenant)}/oauth2/v2.0/authorize`,
+    tokenUrl: `https://login.microsoftonline.com/${encodeURIComponent(tenant)}/oauth2/v2.0/token`
+  }
+}
+
+function isOutlookOAuthConfigured(config = getOutlookOAuthConfig()) {
+  return Boolean(config.clientId && config.clientSecret && config.redirectUri && config.stateSecret)
+}
+
+function getCalendarTokenEncryptionSecret() {
+  return String(
+    process.env.CALENDAR_TOKEN_ENCRYPTION_SECRET ||
+    process.env.NEXTAUTH_SECRET ||
+    process.env.CALENDAR_OAUTH_STATE_SECRET ||
+    process.env.MICROSOFT_CLIENT_SECRET ||
+    process.env.GOOGLE_CLIENT_SECRET ||
+    ''
+  ).trim()
+}
+
+function getCalendarTokenEncryptionKey(secret = getCalendarTokenEncryptionSecret()) {
+  if (!secret) return null
+  return crypto.createHash('sha256').update(secret).digest()
+}
+
+function encryptCalendarToken(value, secret = getCalendarTokenEncryptionSecret()) {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  if (raw.startsWith(`${CALENDAR_TOKEN_ENCRYPTION_PREFIX}:`)) return raw
+  const key = getCalendarTokenEncryptionKey(secret)
+  if (!key) return raw
+  const iv = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
+  const encrypted = Buffer.concat([cipher.update(raw, 'utf8'), cipher.final()])
+  const tag = cipher.getAuthTag()
+  return `${CALENDAR_TOKEN_ENCRYPTION_PREFIX}:${toBase64Url(iv)}:${toBase64Url(tag)}:${toBase64Url(encrypted)}`
+}
+
+function decryptCalendarToken(value, secret = getCalendarTokenEncryptionSecret()) {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  if (!raw.startsWith(`${CALENDAR_TOKEN_ENCRYPTION_PREFIX}:`)) return raw
+  const key = getCalendarTokenEncryptionKey(secret)
+  if (!key) return null
+  const [, ivPart, tagPart, dataPart] = raw.split(':')
+  if (!ivPart || !tagPart || !dataPart) return null
+  try {
+    const iv = fromBase64Url(ivPart)
+    const tag = fromBase64Url(tagPart)
+    const encrypted = fromBase64Url(dataPart)
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv)
+    decipher.setAuthTag(tag)
+    const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()])
+    return decrypted.toString('utf8')
+  } catch {
+    return null
+  }
+}
+
+function normalizeCalendarProvider(provider) {
+  const normalized = String(provider || '').trim().toLowerCase()
+  return CALENDAR_PROVIDER_IDS.includes(normalized) ? normalized : null
+}
+
+function providerDisplayName(provider) {
+  if (provider === CALENDAR_PROVIDER_GOOGLE) return 'Google Calendar'
+  if (provider === CALENDAR_PROVIDER_OUTLOOK) return 'Outlook Calendar'
+  return 'Calendar'
+}
+
+function computeExpiryIso(expiresInSeconds, fallback = null) {
+  const parsed = Number(expiresInSeconds || 0)
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return new Date(Date.now() + Math.max(0, parsed - 30) * 1000).toISOString()
+  }
+  return fallback || null
+}
+
+function createCalendarOAuthState({ userKey, provider, returnTo = '/' }) {
+  const normalizedProvider = normalizeCalendarProvider(provider)
+  const stateSecret = getCalendarOAuthStateSecret()
+  if (!normalizedProvider || !stateSecret) return null
+  const payload = {
+    user_key: normalizeUserKey(userKey),
+    provider: normalizedProvider,
+    return_to: sanitizeReturnPath(returnTo),
+    ts: Date.now(),
+    nonce: uuidv4()
+  }
+  const encodedPayload = toBase64Url(JSON.stringify(payload))
+  const signature = toBase64Url(crypto.createHmac('sha256', stateSecret).update(encodedPayload).digest())
+  return `${encodedPayload}.${signature}`
+}
+
+function verifyCalendarOAuthState(state, providerHint = null) {
+  const stateSecret = getCalendarOAuthStateSecret()
+  if (!stateSecret) return null
+  try {
+    const [encodedPayload, signature] = String(state || '').split('.')
+    if (!encodedPayload || !signature) return null
+    const expected = toBase64Url(crypto.createHmac('sha256', stateSecret).update(encodedPayload).digest())
+    if (!safeTimingEqual(signature, expected)) return null
+
+    const payload = JSON.parse(fromBase64Url(encodedPayload).toString('utf8'))
+    const createdAt = Number(payload?.ts || 0)
+    if (!Number.isFinite(createdAt)) return null
+    if (Math.abs(Date.now() - createdAt) > CALENDAR_STATE_TTL_MS) return null
+    const provider = normalizeCalendarProvider(payload?.provider)
+    if (!provider) return null
+    if (providerHint && provider !== normalizeCalendarProvider(providerHint)) return null
+
+    return {
+      userKey: normalizeUserKey(payload?.user_key),
+      provider,
+      returnTo: sanitizeReturnPath(payload?.return_to || '/')
+    }
+  } catch {
+    return null
+  }
+}
+
+function hydrateCalendarConnection(stored = null) {
+  if (!stored) return null
+  const hydrated = { ...stored }
+  hydrated.access_token = decryptCalendarToken(stored.access_token) || null
+  hydrated.refresh_token = decryptCalendarToken(stored.refresh_token) || null
+  return hydrated
+}
+
+function toStoredCalendarConnection(connection = {}) {
+  const stored = { ...connection }
+  if (Object.prototype.hasOwnProperty.call(stored, 'access_token')) {
+    stored.access_token = encryptCalendarToken(stored.access_token)
+  }
+  if (Object.prototype.hasOwnProperty.call(stored, 'refresh_token')) {
+    stored.refresh_token = encryptCalendarToken(stored.refresh_token)
+  }
+  return stored
+}
+
+async function migrateLegacyGoogleConnectionIfNeeded(db, userKey) {
+  const legacy = await findGoogleCalendarConnection(db, userKey)
+  if (!legacy) return null
+  const migrated = await upsertCalendarConnection(db, userKey, CALENDAR_PROVIDER_GOOGLE, {
+    connected_email: legacy.connected_email || null,
+    access_token: legacy.access_token || null,
+    refresh_token: legacy.refresh_token || null,
+    token_type: legacy.token_type || 'Bearer',
+    scope: legacy.scope || GOOGLE_OAUTH_SCOPES.join(' '),
+    expires_at: legacy.expires_at || null,
+    calendar_id: legacy.calendar_id || getGoogleOAuthConfig().calendarId
+  })
+  return migrated
+}
+
+function isCalendarSqlStorageEnabled() {
+  return dbMode === 'postgres' && Boolean(pgPool)
+}
+
+function parseDbJson(value, fallback) {
+  if (value === null || value === undefined) return fallback
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value)
+    } catch {
+      return fallback
+    }
+  }
+  return value
+}
+
+function normalizeDbCalendarEventRow(eventRow = null, mappingRow = null) {
+  if (!eventRow) return null
+  const attendees = parseDbJson(eventRow.attendees, [])
+  return {
+    id: String(eventRow.id),
+    title: eventRow.title,
+    start_time: eventRow.start_time ? new Date(eventRow.start_time).toISOString() : null,
+    end_time: eventRow.end_time ? new Date(eventRow.end_time).toISOString() : null,
+    user_id: String(eventRow.user_id || ''),
+    description: eventRow.description || null,
+    location: eventRow.location || null,
+    attendees: Array.isArray(attendees) ? attendees : [],
+    source_type: eventRow.source_type || null,
+    source_id: eventRow.source_id || null,
+    transaction_id: eventRow.transaction_id || null,
+    sync_status: eventRow.sync_status || 'pending',
+    sync_error: eventRow.sync_error || null,
+    synced_at: eventRow.synced_at ? new Date(eventRow.synced_at).toISOString() : null,
+    status: eventRow.status || 'active',
+    deleted_at: eventRow.deleted_at ? new Date(eventRow.deleted_at).toISOString() : null,
+    created_at: eventRow.created_at || null,
+    updated_at: eventRow.updated_at || null,
+    provider: mappingRow?.provider || null,
+    external_event_id: mappingRow?.external_event_id || null,
+    external_event_link: mappingRow?.external_event_link || null
+  }
+}
+
+async function getPrimaryEventProviderMapping(eventId) {
+  if (!isCalendarSqlStorageEnabled()) return null
+  const { rows } = await pgPool.query(
+    `
+      SELECT
+        m.id,
+        m.event_id,
+        m.connection_id,
+        m.external_event_id,
+        m.external_event_link,
+        m.sync_status,
+        m.sync_error,
+        m.last_synced_at,
+        m.created_at,
+        m.updated_at,
+        c.provider,
+        c.user_id
+      FROM event_provider_mapping m
+      JOIN calendar_connections c ON c.id = m.connection_id
+      WHERE m.event_id = $1
+      ORDER BY m.updated_at DESC, m.created_at DESC
+      LIMIT 1
+    `,
+    [String(eventId)]
+  )
+  return rows?.[0] || null
+}
+
+async function upsertEventProviderMappingForUserProvider({
+  userId,
+  provider,
+  eventId,
+  externalEventId,
+  externalEventLink = null,
+  syncStatus = 'synced',
+  syncError = null,
+  lastSyncedAt = null
+}) {
+  if (!isCalendarSqlStorageEnabled()) return null
+  const normalizedProvider = normalizeCalendarProvider(provider)
+  if (!normalizedProvider || !eventId) return null
+
+  const { rows: connectionRows } = await pgPool.query(
+    `
+      SELECT id
+      FROM calendar_connections
+      WHERE user_id = $1 AND provider = $2
+      LIMIT 1
+    `,
+    [normalizeUserKey(userId), normalizedProvider]
+  )
+  const connectionId = connectionRows?.[0]?.id
+  if (!connectionId) return null
+
+  const trimmedExternalId = String(externalEventId || '').trim() || null
+  if (!trimmedExternalId) return null
+
+  const { rows } = await pgPool.query(
+    `
+      INSERT INTO event_provider_mapping (
+        id,
+        event_id,
+        connection_id,
+        external_event_id,
+        external_event_link,
+        sync_status,
+        sync_error,
+        last_synced_at,
+        created_at,
+        updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+      ON CONFLICT (event_id, connection_id)
+      DO UPDATE SET
+        external_event_id = EXCLUDED.external_event_id,
+        external_event_link = EXCLUDED.external_event_link,
+        sync_status = EXCLUDED.sync_status,
+        sync_error = EXCLUDED.sync_error,
+        last_synced_at = EXCLUDED.last_synced_at,
+        updated_at = NOW()
+      RETURNING *
+    `,
+    [
+      uuidv4(),
+      String(eventId),
+      String(connectionId),
+      trimmedExternalId,
+      externalEventLink || null,
+      syncStatus || 'synced',
+      syncError || null,
+      lastSyncedAt ? new Date(lastSyncedAt) : null
+    ]
+  )
+
+  const mapping = rows?.[0] || null
+  if (!mapping) return null
+  return { ...mapping, provider: normalizedProvider, user_id: normalizeUserKey(userId) }
+}
+
+async function findCalendarEventDocInSql(userId, eventId) {
+  if (!isCalendarSqlStorageEnabled()) return null
+  const { rows } = await pgPool.query(
+    `
+      SELECT *
+      FROM calendar_events
+      WHERE id = $1 AND user_id = $2
+      LIMIT 1
+    `,
+    [String(eventId), normalizeUserKey(userId)]
+  )
+  const eventRow = rows?.[0] || null
+  if (!eventRow) return null
+  const mappingRow = await getPrimaryEventProviderMapping(eventRow.id)
+  return normalizeDbCalendarEventRow(eventRow, mappingRow)
+}
+
+async function insertCalendarEventDocInSql(eventDoc = {}) {
+  if (!isCalendarSqlStorageEnabled()) return eventDoc
+  const row = {
+    id: String(eventDoc.id || uuidv4()),
+    user_id: normalizeUserKey(eventDoc.user_id),
+    title: String(eventDoc.title || '').trim(),
+    start_time: toIsoDateTime(eventDoc.start_time),
+    end_time: toIsoDateTime(eventDoc.end_time),
+    description: eventDoc.description || null,
+    location: eventDoc.location || null,
+    attendees: Array.isArray(eventDoc.attendees) ? eventDoc.attendees : [],
+    source_type: eventDoc.source_type || null,
+    source_id: eventDoc.source_id ? String(eventDoc.source_id) : null,
+    transaction_id: eventDoc.transaction_id ? String(eventDoc.transaction_id) : null,
+    sync_status: eventDoc.sync_status || 'pending',
+    sync_error: eventDoc.sync_error || null,
+    synced_at: eventDoc.synced_at ? new Date(eventDoc.synced_at) : null,
+    status: eventDoc.status || 'active',
+    deleted_at: eventDoc.deleted_at ? new Date(eventDoc.deleted_at) : null
+  }
+
+  const { rows } = await pgPool.query(
+    `
+      INSERT INTO calendar_events (
+        id,
+        user_id,
+        title,
+        start_time,
+        end_time,
+        description,
+        location,
+        attendees,
+        source_type,
+        source_id,
+        transaction_id,
+        sync_status,
+        sync_error,
+        synced_at,
+        status,
+        deleted_at,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13, $14, $15, $16, NOW(), NOW()
+      )
+      RETURNING *
+    `,
+    [
+      row.id,
+      row.user_id,
+      row.title,
+      row.start_time,
+      row.end_time,
+      row.description,
+      row.location,
+      JSON.stringify(row.attendees),
+      row.source_type,
+      row.source_id,
+      row.transaction_id,
+      row.sync_status,
+      row.sync_error,
+      row.synced_at,
+      row.status,
+      row.deleted_at
+    ]
+  )
+
+  const inserted = rows?.[0] || null
+  if (!inserted) return null
+
+  if (eventDoc.provider && eventDoc.external_event_id) {
+    await upsertEventProviderMappingForUserProvider({
+      userId: row.user_id,
+      provider: eventDoc.provider,
+      eventId: inserted.id,
+      externalEventId: eventDoc.external_event_id,
+      externalEventLink: eventDoc.external_event_link || null,
+      syncStatus: row.sync_status,
+      syncError: row.sync_error,
+      lastSyncedAt: row.synced_at
+    })
+  }
+
+  return findCalendarEventDocInSql(row.user_id, inserted.id)
+}
+
+async function updateCalendarEventDocInSql(eventId, patch = {}) {
+  if (!isCalendarSqlStorageEnabled()) return null
+  const { rows: existingRows } = await pgPool.query(
+    `SELECT * FROM calendar_events WHERE id = $1 LIMIT 1`,
+    [String(eventId)]
+  )
+  const existing = existingRows?.[0] || null
+  if (!existing) return null
+
+  const setFragments = []
+  const values = [String(eventId)]
+  const assign = (column, value) => {
+    values.push(value)
+    setFragments.push(`${column} = $${values.length}`)
+  }
+
+  if (Object.prototype.hasOwnProperty.call(patch, 'title')) assign('title', String(patch.title || '').trim() || existing.title)
+  if (Object.prototype.hasOwnProperty.call(patch, 'start_time')) assign('start_time', toIsoDateTime(patch.start_time) || existing.start_time)
+  if (Object.prototype.hasOwnProperty.call(patch, 'end_time')) assign('end_time', toIsoDateTime(patch.end_time) || existing.end_time)
+  if (Object.prototype.hasOwnProperty.call(patch, 'description')) assign('description', patch.description || null)
+  if (Object.prototype.hasOwnProperty.call(patch, 'location')) assign('location', patch.location || null)
+  if (Object.prototype.hasOwnProperty.call(patch, 'attendees')) {
+    const attendees = Array.isArray(patch.attendees) ? patch.attendees : []
+    assign('attendees', JSON.stringify(attendees))
+    setFragments[setFragments.length - 1] = `attendees = $${values.length}::jsonb`
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, 'source_type')) assign('source_type', patch.source_type || null)
+  if (Object.prototype.hasOwnProperty.call(patch, 'source_id')) assign('source_id', patch.source_id ? String(patch.source_id) : null)
+  if (Object.prototype.hasOwnProperty.call(patch, 'transaction_id')) assign('transaction_id', patch.transaction_id ? String(patch.transaction_id) : null)
+  if (Object.prototype.hasOwnProperty.call(patch, 'sync_status')) assign('sync_status', patch.sync_status || 'pending')
+  if (Object.prototype.hasOwnProperty.call(patch, 'sync_error')) assign('sync_error', patch.sync_error || null)
+  if (Object.prototype.hasOwnProperty.call(patch, 'synced_at')) assign('synced_at', patch.synced_at ? new Date(patch.synced_at) : null)
+  if (Object.prototype.hasOwnProperty.call(patch, 'status')) assign('status', patch.status || existing.status || 'active')
+  if (Object.prototype.hasOwnProperty.call(patch, 'deleted_at')) assign('deleted_at', patch.deleted_at ? new Date(patch.deleted_at) : null)
+
+  if (setFragments.length > 0) {
+    await pgPool.query(
+      `
+        UPDATE calendar_events
+        SET ${setFragments.join(', ')}, updated_at = NOW()
+        WHERE id = $1
+      `,
+      values
+    )
+  }
+
+  const needsMappingUpdate =
+    Object.prototype.hasOwnProperty.call(patch, 'provider') ||
+    Object.prototype.hasOwnProperty.call(patch, 'external_event_id') ||
+    Object.prototype.hasOwnProperty.call(patch, 'external_event_link')
+
+  if (needsMappingUpdate) {
+    const current = await findCalendarEventDocInSql(existing.user_id, existing.id)
+    const provider = normalizeCalendarProvider(
+      Object.prototype.hasOwnProperty.call(patch, 'provider') ? patch.provider : current?.provider
+    )
+    const externalEventId = Object.prototype.hasOwnProperty.call(patch, 'external_event_id')
+      ? patch.external_event_id
+      : current?.external_event_id
+    const externalEventLink = Object.prototype.hasOwnProperty.call(patch, 'external_event_link')
+      ? patch.external_event_link
+      : current?.external_event_link
+
+    if (provider && externalEventId) {
+      await upsertEventProviderMappingForUserProvider({
+        userId: existing.user_id,
+        provider,
+        eventId: existing.id,
+        externalEventId,
+        externalEventLink,
+        syncStatus: Object.prototype.hasOwnProperty.call(patch, 'sync_status')
+          ? (patch.sync_status || 'synced')
+          : (current?.sync_status || 'synced'),
+        syncError: Object.prototype.hasOwnProperty.call(patch, 'sync_error')
+          ? (patch.sync_error || null)
+          : (current?.sync_error || null),
+        lastSyncedAt: Object.prototype.hasOwnProperty.call(patch, 'synced_at')
+          ? patch.synced_at
+          : (current?.synced_at || null)
+      })
+    }
+  }
+
+  return findCalendarEventDocInSql(existing.user_id, existing.id)
+}
+
+async function findCalendarConnection(db, userKey, provider) {
+  const key = normalizeUserKey(userKey)
+  const normalizedProvider = normalizeCalendarProvider(provider)
+  if (!normalizedProvider) return null
+  if (isCalendarSqlStorageEnabled()) {
+    const { rows } = await pgPool.query(
+      `
+        SELECT *
+        FROM calendar_connections
+        WHERE user_id = $1 AND provider = $2
+        LIMIT 1
+      `,
+      [key, normalizedProvider]
+    )
+    const row = rows?.[0] || null
+    if (row) return hydrateCalendarConnection(row)
+    if (normalizedProvider === CALENDAR_PROVIDER_GOOGLE) {
+      return migrateLegacyGoogleConnectionIfNeeded(db, key)
+    }
+    return null
+  }
+  const coll = db.collection(CALENDAR_CONNECTIONS_COLLECTION)
+  const stored = await coll.findOne({ user_id: key, provider: normalizedProvider })
+  if (stored) return hydrateCalendarConnection(stored)
+  if (normalizedProvider === CALENDAR_PROVIDER_GOOGLE) {
+    return migrateLegacyGoogleConnectionIfNeeded(db, key)
+  }
+  return null
+}
+
+async function listCalendarConnections(db, userKey) {
+  const key = normalizeUserKey(userKey)
+  if (isCalendarSqlStorageEnabled()) {
+    const { rows } = await pgPool.query(
+      `
+        SELECT *
+        FROM calendar_connections
+        WHERE user_id = $1
+        ORDER BY updated_at DESC, created_at DESC
+      `,
+      [key]
+    )
+    return (rows || [])
+      .filter((item) => normalizeCalendarProvider(item?.provider))
+      .map((item) => hydrateCalendarConnection(item))
+      .filter(Boolean)
+  }
+  const coll = db.collection(CALENDAR_CONNECTIONS_COLLECTION)
+  const all = await coll.find({ user_id: key }).toArray()
+  const filtered = Array.isArray(all)
+    ? all.filter((item) => normalizeCalendarProvider(item?.provider))
+    : []
+  return filtered.map((item) => hydrateCalendarConnection(item)).filter(Boolean)
+}
+
+async function upsertCalendarConnection(db, userKey, provider, updates = {}) {
+  const key = normalizeUserKey(userKey)
+  const normalizedProvider = normalizeCalendarProvider(provider)
+  if (!normalizedProvider) throw new Error('Unsupported calendar provider')
+  if (isCalendarSqlStorageEnabled()) {
+    const existing = await findCalendarConnection(db, key, normalizedProvider)
+    const now = new Date()
+    const next = {
+      ...(existing || {}),
+      ...updates,
+      id: existing?.id || updates?.id || uuidv4(),
+      user_id: key,
+      provider: normalizedProvider,
+      created_at: existing?.created_at || now,
+      updated_at: now
+    }
+    const stored = toStoredCalendarConnection(next)
+    await pgPool.query(
+      `
+        INSERT INTO calendar_connections (
+          id,
+          user_id,
+          provider,
+          connected_email,
+          access_token,
+          refresh_token,
+          token_type,
+          scope,
+          calendar_id,
+          expires_at,
+          created_at,
+          updated_at
+        )
+        VALUES (
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW()
+        )
+        ON CONFLICT (user_id, provider)
+        DO UPDATE SET
+          connected_email = EXCLUDED.connected_email,
+          access_token = EXCLUDED.access_token,
+          refresh_token = EXCLUDED.refresh_token,
+          token_type = EXCLUDED.token_type,
+          scope = EXCLUDED.scope,
+          calendar_id = EXCLUDED.calendar_id,
+          expires_at = EXCLUDED.expires_at,
+          updated_at = NOW()
+      `,
+      [
+        String(stored.id),
+        key,
+        normalizedProvider,
+        stored.connected_email || null,
+        stored.access_token || null,
+        stored.refresh_token || null,
+        stored.token_type || null,
+        stored.scope || null,
+        stored.calendar_id || null,
+        stored.expires_at ? new Date(stored.expires_at) : null,
+        stored.created_at ? new Date(stored.created_at) : now
+      ]
+    )
+    return findCalendarConnection(db, key, normalizedProvider)
+  }
+  const coll = db.collection(CALENDAR_CONNECTIONS_COLLECTION)
+  const existingStored = await coll.findOne({ user_id: key, provider: normalizedProvider })
+  const existing = existingStored ? hydrateCalendarConnection(existingStored) : null
+  const now = new Date()
+  const next = {
+    ...(existing || {}),
+    ...updates,
+    user_id: key,
+    provider: normalizedProvider,
+    updated_at: now
+  }
+  if (!existing) {
+    next.id = next.id || uuidv4()
+    next.created_at = next.created_at || now
+  }
+  const storedNext = toStoredCalendarConnection(next)
+  if (existingStored) {
+    await coll.updateOne({ id: existingStored.id }, { $set: storedNext })
+  } else {
+    await coll.insertOne(storedNext)
+  }
+  return next
+}
+
+async function deleteCalendarConnection(db, userKey, provider = null) {
+  const key = normalizeUserKey(userKey)
+  if (isCalendarSqlStorageEnabled()) {
+    const normalizedProvider = provider ? normalizeCalendarProvider(provider) : null
+    if (provider && !normalizedProvider) return { deletedCount: 0 }
+    if (normalizedProvider) {
+      const { rowCount } = await pgPool.query(
+        `DELETE FROM calendar_connections WHERE user_id = $1 AND provider = $2`,
+        [key, normalizedProvider]
+      )
+      return { deletedCount: rowCount || 0 }
+    }
+    const { rowCount } = await pgPool.query(
+      `DELETE FROM calendar_connections WHERE user_id = $1`,
+      [key]
+    )
+    return { deletedCount: rowCount || 0 }
+  }
+  const coll = db.collection(CALENDAR_CONNECTIONS_COLLECTION)
+  const normalizedProvider = provider ? normalizeCalendarProvider(provider) : null
+  if (provider && !normalizedProvider) return { deletedCount: 0 }
+  if (normalizedProvider) {
+    return coll.deleteOne({ user_id: key, provider: normalizedProvider })
+  }
+  return coll.deleteMany({ user_id: key })
+}
+
+function getCalendarConnectionPublicStatus(connection, provider, configured) {
+  const hasAccessToken = Boolean(String(connection?.access_token || '').trim())
+  const hasRefreshToken = Boolean(String(connection?.refresh_token || '').trim())
+  return {
+    provider,
+    provider_name: providerDisplayName(provider),
+    configured: Boolean(configured),
+    connected: Boolean(connection) && (hasAccessToken || hasRefreshToken),
+    connected_email: connection?.connected_email || null,
+    expires_at: connection?.expires_at || null,
+    has_access_token: hasAccessToken,
+    has_refresh_token: hasRefreshToken,
+    calendar_id: connection?.calendar_id || null
+  }
+}
+
+async function findCalendarEventRecord(db, { userKey, provider, transactionId }) {
+  const key = normalizeUserKey(userKey)
+  const normalizedProvider = normalizeCalendarProvider(provider)
+  if (!normalizedProvider || !transactionId) return null
+  if (isCalendarSqlStorageEnabled()) {
+    const { rows } = await pgPool.query(
+      `
+        SELECT
+          m.id,
+          e.user_id,
+          c.provider,
+          e.transaction_id,
+          m.external_event_id,
+          m.external_event_link,
+          e.id AS event_id,
+          m.created_at,
+          m.updated_at
+        FROM event_provider_mapping m
+        JOIN calendar_events e ON e.id = m.event_id
+        JOIN calendar_connections c ON c.id = m.connection_id
+        WHERE e.user_id = $1
+          AND c.provider = $2
+          AND e.transaction_id = $3
+          AND COALESCE(e.status, 'active') <> 'deleted'
+        ORDER BY m.updated_at DESC, m.created_at DESC
+        LIMIT 1
+      `,
+      [key, normalizedProvider, String(transactionId)]
+    )
+    return rows?.[0] || null
+  }
+  return db.collection(CALENDAR_EVENTS_COLLECTION).findOne({
+    user_id: key,
+    provider: normalizedProvider,
+    transaction_id: String(transactionId)
+  })
+}
+
+async function listCalendarEventRecordsByTransaction(db, { userKey, transactionId }) {
+  const key = normalizeUserKey(userKey)
+  if (isCalendarSqlStorageEnabled()) {
+    const { rows } = await pgPool.query(
+      `
+        SELECT
+          m.id,
+          e.user_id,
+          c.provider,
+          e.transaction_id,
+          m.external_event_id,
+          m.external_event_link,
+          e.id AS event_id,
+          m.created_at,
+          m.updated_at
+        FROM event_provider_mapping m
+        JOIN calendar_events e ON e.id = m.event_id
+        JOIN calendar_connections c ON c.id = m.connection_id
+        WHERE e.user_id = $1
+          AND e.transaction_id = $2
+          AND COALESCE(e.status, 'active') <> 'deleted'
+        ORDER BY m.updated_at DESC, m.created_at DESC
+      `,
+      [key, String(transactionId)]
+    )
+    return rows || []
+  }
+  return db.collection(CALENDAR_EVENTS_COLLECTION)
+    .find({ user_id: key, transaction_id: String(transactionId) })
+    .toArray()
+}
+
+async function upsertCalendarEventRecord(db, {
+  userKey,
+  provider,
+  transactionId,
+  externalEventId,
+  externalEventLink = null
+}) {
+  const key = normalizeUserKey(userKey)
+  const normalizedProvider = normalizeCalendarProvider(provider)
+  if (!normalizedProvider || !transactionId) return null
+  if (isCalendarSqlStorageEnabled()) {
+    const { rows: existingEventRows } = await pgPool.query(
+      `
+        SELECT id
+        FROM calendar_events
+        WHERE user_id = $1 AND transaction_id = $2
+          AND COALESCE(status, 'active') <> 'deleted'
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT 1
+      `,
+      [key, String(transactionId)]
+    )
+    const existingEventId = existingEventRows?.[0]?.id || null
+    let eventDoc = existingEventId ? await findCalendarEventDocInSql(key, existingEventId) : null
+
+    if (!eventDoc) {
+      const now = new Date()
+      eventDoc = await insertCalendarEventDocInSql({
+        id: uuidv4(),
+        user_id: key,
+        title: `Transaction ${transactionId}`,
+        start_time: now.toISOString(),
+        end_time: new Date(now.getTime() + 60 * 60 * 1000).toISOString(),
+        description: null,
+        location: null,
+        attendees: [],
+        source_type: 'transaction',
+        source_id: String(transactionId),
+        transaction_id: String(transactionId),
+        sync_status: 'pending',
+        sync_error: null,
+        status: 'active'
+      })
+    }
+
+    const mapping = await upsertEventProviderMappingForUserProvider({
+      userId: key,
+      provider: normalizedProvider,
+      eventId: eventDoc?.id,
+      externalEventId,
+      externalEventLink,
+      syncStatus: 'synced',
+      syncError: null,
+      lastSyncedAt: new Date()
+    })
+
+    await updateCalendarEventDocInSql(eventDoc?.id, {
+      sync_status: mapping ? 'synced' : (eventDoc?.sync_status || 'pending'),
+      sync_error: null,
+      synced_at: mapping ? new Date() : null
+    })
+
+    return mapping ? {
+      id: String(mapping.id),
+      user_id: key,
+      provider: normalizedProvider,
+      transaction_id: String(transactionId),
+      external_event_id: String(mapping.external_event_id || '').trim() || null,
+      external_event_link: mapping.external_event_link || null,
+      event_id: String(eventDoc?.id || ''),
+      created_at: mapping.created_at || new Date(),
+      updated_at: mapping.updated_at || new Date()
+    } : null
+  }
+  const coll = db.collection(CALENDAR_EVENTS_COLLECTION)
+  const existing = await coll.findOne({
+    user_id: key,
+    provider: normalizedProvider,
+    transaction_id: String(transactionId)
+  })
+  const now = new Date()
+  const payload = {
+    id: existing?.id || uuidv4(),
+    user_id: key,
+    provider: normalizedProvider,
+    transaction_id: String(transactionId),
+    external_event_id: String(externalEventId || '').trim() || null,
+    external_event_link: externalEventLink || null,
+    created_at: existing?.created_at || now,
+    updated_at: now
+  }
+  if (existing) {
+    await coll.updateOne({ id: existing.id }, { $set: payload })
+  } else {
+    await coll.insertOne(payload)
+  }
+  return payload
+}
+
+async function deleteCalendarEventRecord(db, id) {
+  if (!id) return { deletedCount: 0 }
+  if (isCalendarSqlStorageEnabled()) {
+    const { rowCount } = await pgPool.query(
+      `DELETE FROM event_provider_mapping WHERE id = $1`,
+      [String(id)]
+    )
+    return { deletedCount: rowCount || 0 }
+  }
+  return db.collection(CALENDAR_EVENTS_COLLECTION).deleteOne({ id: String(id) })
+}
+
+async function deleteCalendarEventRecordsByQuery(db, query = {}) {
+  if (isCalendarSqlStorageEnabled()) {
+    const userId = normalizeUserKey(query?.user_id || query?.userKey || '')
+    const transactionId = query?.transaction_id ? String(query.transaction_id) : null
+    const provider = normalizeCalendarProvider(query?.provider)
+
+    if (userId && transactionId && !provider) {
+      const { rowCount } = await pgPool.query(
+        `DELETE FROM calendar_events WHERE user_id = $1 AND transaction_id = $2`,
+        [userId, transactionId]
+      )
+      return { deletedCount: rowCount || 0 }
+    }
+
+    if (userId && transactionId && provider) {
+      const { rowCount } = await pgPool.query(
+        `
+          DELETE FROM event_provider_mapping m
+          USING calendar_events e, calendar_connections c
+          WHERE m.event_id = e.id
+            AND m.connection_id = c.id
+            AND e.user_id = $1
+            AND e.transaction_id = $2
+            AND c.provider = $3
+        `,
+        [userId, transactionId, provider]
+      )
+      return { deletedCount: rowCount || 0 }
+    }
+  }
+  return db.collection(CALENDAR_EVENTS_COLLECTION).deleteMany(query)
+}
+
+async function markCalendarEventsAsProviderDisconnected(db, { userKey, provider = null }) {
+  const key = normalizeUserKey(userKey)
+  const normalizedProvider = provider ? normalizeCalendarProvider(provider) : null
+  if (isCalendarSqlStorageEnabled()) {
+    if (provider && !normalizedProvider) return
+    if (normalizedProvider) {
+      await pgPool.query(
+        `
+          UPDATE event_provider_mapping m
+          SET sync_status = 'provider_disconnected',
+              sync_error = NULL,
+              updated_at = NOW()
+          FROM calendar_events e, calendar_connections c
+          WHERE m.event_id = e.id
+            AND m.connection_id = c.id
+            AND e.user_id = $1
+            AND c.provider = $2
+        `,
+        [key, normalizedProvider]
+      )
+      await pgPool.query(
+        `
+          UPDATE calendar_events
+          SET sync_status = 'provider_disconnected',
+              sync_error = NULL,
+              updated_at = NOW()
+          WHERE user_id = $1
+            AND id IN (
+              SELECT e.id
+              FROM calendar_events e
+              JOIN event_provider_mapping m ON m.event_id = e.id
+              JOIN calendar_connections c ON c.id = m.connection_id
+              WHERE e.user_id = $1 AND c.provider = $2
+            )
+        `,
+        [key, normalizedProvider]
+      )
+      return
+    }
+
+    await pgPool.query(
+      `
+        UPDATE event_provider_mapping m
+        SET sync_status = 'provider_disconnected',
+            sync_error = NULL,
+            updated_at = NOW()
+        FROM calendar_events e
+        WHERE m.event_id = e.id
+          AND e.user_id = $1
+      `,
+      [key]
+    )
+    await pgPool.query(
+      `
+        UPDATE calendar_events
+        SET sync_status = 'provider_disconnected',
+            sync_error = NULL,
+            updated_at = NOW()
+        WHERE user_id = $1
+      `,
+      [key]
+    )
+    return
+  }
+  const query = { user_id: key }
+  if (normalizedProvider) query.provider = normalizedProvider
+
+  const events = await db.collection(CALENDAR_EVENTS_COLLECTION).find(query).toArray()
+  for (const eventDoc of events) {
+    if (!eventDoc?.id) continue
+    await db.collection(CALENDAR_EVENTS_COLLECTION).updateOne(
+      { id: String(eventDoc.id) },
+      {
+        $set: {
+          sync_status: 'provider_disconnected',
+          sync_error: null,
+          updated_at: new Date()
+        }
+      }
+    )
+  }
+}
+
+function buildTransactionCalendarEventInput(transaction, closingDate) {
+  return {
+    summary: buildTransactionCalendarSummary(transaction),
+    description: buildTransactionCalendarDetails(transaction),
+    location: String(transaction?.property_address || '').trim() || null,
+    start_date: closingDate,
+    end_date: addDaysToDateOnly(closingDate, 1) || closingDate,
+    attendees: transaction?.client_email
+      ? [{ email: String(transaction.client_email).trim().toLowerCase(), name: transaction?.client_name || '' }]
+      : []
+  }
+}
+
+function buildProviderQuickAddUrl(provider, transaction, closingDate) {
+  if (provider === CALENDAR_PROVIDER_GOOGLE) {
+    return buildGoogleCalendarTemplateUrl(transaction, closingDate)
+  }
+  if (provider === CALENDAR_PROVIDER_OUTLOOK) {
+    return buildOutlookCalendarComposeUrl(transaction, closingDate)
+  }
+  return null
+}
+
+function isRetryableStatus(statusCode) {
+  return statusCode === 408 || statusCode === 409 || statusCode === 429 || statusCode >= 500
+}
+
+function parseRetryAfterMs(response, fallbackMs = 350) {
+  const header = response?.headers?.get?.('retry-after')
+  if (!header) return fallbackMs
+  const asNumber = Number(header)
+  if (Number.isFinite(asNumber) && asNumber >= 0) return Math.min(5000, asNumber * 1000)
+  const asDate = Date.parse(header)
+  if (Number.isFinite(asDate)) {
+    return Math.max(fallbackMs, Math.min(5000, asDate - Date.now()))
+  }
+  return fallbackMs
+}
+
+async function waitMs(ms) {
+  const delay = Math.max(0, Number(ms) || 0)
+  if (!delay) return
+  await new Promise((resolve) => setTimeout(resolve, delay))
+}
+
+async function fetchWithRetry(url, init = {}, options = {}) {
+  const retries = Math.max(0, Number(options.retries ?? 2))
+  const baseDelay = Math.max(0, Number(options.baseDelayMs ?? 350))
+  let attempt = 0
+  let lastError = null
+  while (attempt <= retries) {
+    try {
+      const response = await fetch(url, init)
+      if (attempt < retries && isRetryableStatus(response.status)) {
+        const delay = Math.min(4000, parseRetryAfterMs(response, baseDelay * (2 ** attempt)))
+        await waitMs(delay)
+        attempt += 1
+        continue
+      }
+      return response
+    } catch (error) {
+      lastError = error
+      if (attempt >= retries) break
+      const delay = Math.min(4000, baseDelay * (2 ** attempt))
+      await waitMs(delay)
+      attempt += 1
+    }
+  }
+  throw lastError || new Error('Network request failed')
+}
+
+function toIsoDateTime(value) {
+  const epoch = parseDateToEpochMillis(value)
+  if (epoch === null) return null
+  return new Date(epoch).toISOString()
+}
+
+function toGraphDateTime(value) {
+  const iso = toIsoDateTime(value)
+  return iso ? iso.replace(/Z$/, '') : null
+}
+
+function genericApiErrorMessage(payload, fallback = 'Calendar API request failed') {
+  if (!payload) return fallback
+  if (typeof payload === 'string') return payload || fallback
+  if (payload?.error?.message) return String(payload.error.message)
+  if (payload?.error_description) return String(payload.error_description)
+  if (payload?.error) {
+    if (typeof payload.error === 'string') return payload.error
+    if (payload.error?.message) return String(payload.error.message)
+  }
+  return fallback
+}
+
+function buildUtcDateStart(dateOnly) {
+  const safeDate = toDateOnlyString(dateOnly)
+  return safeDate ? `${safeDate}T00:00:00` : null
+}
+
+function buildUtcDateEnd(dateOnly) {
+  const safeDate = toDateOnlyString(dateOnly)
+  const end = safeDate ? addDaysToDateOnly(safeDate, 1) : null
+  return (end || safeDate) ? `${end || safeDate}T00:00:00` : null
+}
+
+async function updateGoogleCalendarEvent({ accessToken, calendarId = 'primary', eventId, event }) {
+  const response = await fetchWithRetry(
+    `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
+    {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(event)
+    }
+  )
+  const payload = await response.json().catch(() => null)
+  return {
+    ok: response.ok,
+    status: response.status,
+    payload
+  }
+}
+
+async function deleteGoogleCalendarEvent({ accessToken, calendarId = 'primary', eventId }) {
+  const response = await fetchWithRetry(
+    `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
+    {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${accessToken}` }
+    }
+  )
+  let payload = null
+  if (response.status !== 204) {
+    payload = await response.json().catch(() => null)
+  }
+  return {
+    ok: response.ok || response.status === 404,
+    status: response.status,
+    payload
+  }
+}
+
+async function exchangeOutlookCodeForTokens({ code, config }) {
+  const params = new URLSearchParams()
+  params.set('client_id', config.clientId)
+  params.set('client_secret', config.clientSecret)
+  params.set('code', String(code || ''))
+  params.set('redirect_uri', config.redirectUri)
+  params.set('grant_type', 'authorization_code')
+  params.set('scope', OUTLOOK_OAUTH_SCOPES.join(' '))
+
+  const response = await fetchWithRetry(config.tokenUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString()
+  })
+  const payload = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    throw new Error(genericApiErrorMessage(payload, `Outlook token exchange failed (${response.status})`))
+  }
+  return payload
+}
+
+async function refreshOutlookAccessToken({ refreshToken, config }) {
+  const params = new URLSearchParams()
+  params.set('client_id', config.clientId)
+  params.set('client_secret', config.clientSecret)
+  params.set('refresh_token', String(refreshToken || ''))
+  params.set('grant_type', 'refresh_token')
+  params.set('scope', OUTLOOK_OAUTH_SCOPES.join(' '))
+
+  const response = await fetchWithRetry(config.tokenUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString()
+  })
+  const payload = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    throw new Error(genericApiErrorMessage(payload, `Outlook token refresh failed (${response.status})`))
+  }
+  return payload
+}
+
+async function fetchOutlookUserProfile(accessToken) {
+  if (!accessToken) return null
+  const response = await fetchWithRetry(`${GRAPH_API_BASE_URL}/me`, {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  })
+  if (!response.ok) return null
+  return response.json().catch(() => null)
+}
+
+async function createOutlookCalendarEvent({ accessToken, event }) {
+  const response = await fetchWithRetry(`${GRAPH_API_BASE_URL}/me/events`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(event)
+  })
+  const payload = await response.json().catch(() => null)
+  return {
+    ok: response.ok,
+    status: response.status,
+    payload
+  }
+}
+
+async function updateOutlookCalendarEvent({ accessToken, eventId, event }) {
+  const response = await fetchWithRetry(`${GRAPH_API_BASE_URL}/me/events/${encodeURIComponent(eventId)}`, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(event)
+  })
+  const payload = await response.json().catch(() => null)
+  return {
+    ok: response.ok,
+    status: response.status,
+    payload
+  }
+}
+
+async function deleteOutlookCalendarEvent({ accessToken, eventId }) {
+  const response = await fetchWithRetry(`${GRAPH_API_BASE_URL}/me/events/${encodeURIComponent(eventId)}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${accessToken}` }
+  })
+  let payload = null
+  if (response.status !== 204) {
+    payload = await response.json().catch(() => null)
+  }
+  return {
+    ok: response.ok || response.status === 404,
+    status: response.status,
+    payload
+  }
+}
+
+class CalendarProvider {
+  constructor(providerId, displayName) {
+    this.providerId = providerId
+    this.displayName = displayName
+  }
+
+  getConfig() {
+    throw new Error('getConfig() must be implemented')
+  }
+
+  isConfigured() {
+    throw new Error('isConfigured() must be implemented')
+  }
+
+  getScopes() {
+    return []
+  }
+
+  connect() {
+    throw new Error('connect() must be implemented')
+  }
+
+  async callback() {
+    throw new Error('callback() must be implemented')
+  }
+
+  async refreshToken() {
+    throw new Error('refreshToken() must be implemented')
+  }
+
+  async createEvent() {
+    throw new Error('createEvent() must be implemented')
+  }
+
+  async updateEvent() {
+    throw new Error('updateEvent() must be implemented')
+  }
+
+  async deleteEvent() {
+    throw new Error('deleteEvent() must be implemented')
+  }
+}
+
+class GoogleCalendarProvider extends CalendarProvider {
+  constructor() {
+    super(CALENDAR_PROVIDER_GOOGLE, 'Google Calendar')
+  }
+
+  getConfig() {
+    return getGoogleOAuthConfig()
+  }
+
+  isConfigured(config = this.getConfig()) {
+    return isGoogleOAuthConfigured(config)
+  }
+
+  getScopes() {
+    return [...GOOGLE_OAUTH_SCOPES]
+  }
+
+  connect({ state }) {
+    const config = this.getConfig()
+    const params = new URLSearchParams()
+    params.set('client_id', config.clientId)
+    params.set('redirect_uri', config.redirectUri)
+    params.set('response_type', 'code')
+    params.set('access_type', 'offline')
+    params.set('prompt', 'consent')
+    params.set('include_granted_scopes', 'true')
+    params.set('scope', this.getScopes().join(' '))
+    params.set('state', state)
+    return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`
+  }
+
+  async callback({ db, userKey, code }) {
+    const config = this.getConfig()
+    const existing = await findCalendarConnection(db, userKey, this.providerId)
+    const tokens = await exchangeGoogleCodeForTokens({ code, config })
+    const profile = await fetchGoogleUserProfile(tokens.access_token)
+    return upsertCalendarConnection(db, userKey, this.providerId, {
+      connected_email: String(profile?.email || existing?.connected_email || '').trim().toLowerCase() || null,
+      access_token: tokens.access_token || existing?.access_token || null,
+      refresh_token: tokens.refresh_token || existing?.refresh_token || null,
+      token_type: tokens.token_type || existing?.token_type || 'Bearer',
+      scope: tokens.scope || existing?.scope || this.getScopes().join(' '),
+      expires_at: computeExpiryIso(tokens.expires_in, existing?.expires_at),
+      calendar_id: existing?.calendar_id || config.calendarId
+    })
+  }
+
+  async refreshToken({ refreshToken }) {
+    const config = this.getConfig()
+    return refreshGoogleAccessToken({ refreshToken, config })
+  }
+
+  buildEventPayload(eventInput) {
+    const startDateTime = toIsoDateTime(eventInput?.start_time)
+    const endDateTime = toIsoDateTime(eventInput?.end_time || eventInput?.start_time)
+    const payload = {
+      summary: eventInput?.summary || 'CRM event',
+      description: eventInput?.description || '',
+      location: eventInput?.location || undefined,
+      reminders: { useDefault: true },
+      attendees: Array.isArray(eventInput?.attendees)
+        ? eventInput.attendees
+            .filter((att) => String(att?.email || '').includes('@'))
+            .map((att) => ({
+              email: String(att.email).trim().toLowerCase(),
+              displayName: att?.name ? String(att.name).trim() : undefined
+            }))
+        : undefined
+    }
+    if (startDateTime && endDateTime) {
+      payload.start = { dateTime: startDateTime }
+      payload.end = { dateTime: endDateTime }
+    } else {
+      payload.start = { date: toDateOnlyString(eventInput?.start_date || eventInput?.start_time) }
+      payload.end = { date: toDateOnlyString(eventInput?.end_date || eventInput?.end_time || eventInput?.start_date || eventInput?.start_time) }
+    }
+    return payload
+  }
+
+  async createEvent({ accessToken, connection, eventInput }) {
+    const config = this.getConfig()
+    const event = this.buildEventPayload(eventInput)
+    const insertion = await createGoogleCalendarEvent({
+      accessToken,
+      calendarId: connection?.calendar_id || config.calendarId,
+      event
+    })
+    if (!insertion.ok) {
+      return {
+        ok: false,
+        status: insertion.status,
+        error: googleApiErrorMessage(insertion.payload, `Google Calendar create failed (${insertion.status})`)
+      }
+    }
+    const payload = insertion.payload || {}
+    return {
+      ok: true,
+      status: insertion.status,
+      event_id: payload.id || null,
+      event_link: payload.htmlLink || null
+    }
+  }
+
+  async updateEvent({ accessToken, connection, eventId, eventInput }) {
+    const config = this.getConfig()
+    const event = this.buildEventPayload(eventInput)
+    const response = await updateGoogleCalendarEvent({
+      accessToken,
+      calendarId: connection?.calendar_id || config.calendarId,
+      eventId,
+      event
+    })
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        error: googleApiErrorMessage(response.payload, `Google Calendar update failed (${response.status})`)
+      }
+    }
+    const payload = response.payload || {}
+    return {
+      ok: true,
+      status: response.status,
+      event_id: payload.id || eventId,
+      event_link: payload.htmlLink || null
+    }
+  }
+
+  async deleteEvent({ accessToken, connection, eventId }) {
+    const config = this.getConfig()
+    const response = await deleteGoogleCalendarEvent({
+      accessToken,
+      calendarId: connection?.calendar_id || config.calendarId,
+      eventId
+    })
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        error: googleApiErrorMessage(response.payload, `Google Calendar delete failed (${response.status})`)
+      }
+    }
+    return {
+      ok: true,
+      status: response.status
+    }
+  }
+}
+
+class OutlookCalendarProvider extends CalendarProvider {
+  constructor() {
+    super(CALENDAR_PROVIDER_OUTLOOK, 'Outlook Calendar')
+  }
+
+  getConfig() {
+    return getOutlookOAuthConfig()
+  }
+
+  isConfigured(config = this.getConfig()) {
+    return isOutlookOAuthConfigured(config)
+  }
+
+  getScopes() {
+    return [...OUTLOOK_OAUTH_SCOPES]
+  }
+
+  connect({ state }) {
+    const config = this.getConfig()
+    const params = new URLSearchParams()
+    params.set('client_id', config.clientId)
+    params.set('response_type', 'code')
+    params.set('redirect_uri', config.redirectUri)
+    params.set('response_mode', 'query')
+    params.set('scope', this.getScopes().join(' '))
+    params.set('prompt', 'select_account')
+    params.set('state', state)
+    return `${config.authorizationUrl}?${params.toString()}`
+  }
+
+  async callback({ db, userKey, code }) {
+    const config = this.getConfig()
+    const existing = await findCalendarConnection(db, userKey, this.providerId)
+    const tokens = await exchangeOutlookCodeForTokens({ code, config })
+    const profile = await fetchOutlookUserProfile(tokens.access_token)
+    const connectedEmail = String(
+      profile?.mail ||
+      profile?.userPrincipalName ||
+      existing?.connected_email ||
+      ''
+    ).trim().toLowerCase() || null
+
+    return upsertCalendarConnection(db, userKey, this.providerId, {
+      connected_email: connectedEmail,
+      access_token: tokens.access_token || existing?.access_token || null,
+      refresh_token: tokens.refresh_token || existing?.refresh_token || null,
+      token_type: tokens.token_type || existing?.token_type || 'Bearer',
+      scope: tokens.scope || existing?.scope || this.getScopes().join(' '),
+      expires_at: computeExpiryIso(tokens.expires_in, existing?.expires_at)
+    })
+  }
+
+  async refreshToken({ refreshToken }) {
+    const config = this.getConfig()
+    return refreshOutlookAccessToken({ refreshToken, config })
+  }
+
+  buildEventPayload(eventInput) {
+    const attendees = Array.isArray(eventInput?.attendees)
+      ? eventInput.attendees
+          .filter((att) => String(att?.email || '').includes('@'))
+          .map((att) => ({
+            emailAddress: {
+              address: String(att.email).trim().toLowerCase(),
+              name: String(att?.name || att?.email || '').trim()
+            },
+            type: 'required'
+          }))
+      : []
+
+    const startDateTime = toGraphDateTime(eventInput?.start_time)
+    const endDateTime = toGraphDateTime(eventInput?.end_time || eventInput?.start_time)
+    const payload = {
+      subject: eventInput?.summary || 'CRM event',
+      body: {
+        contentType: 'Text',
+        content: String(eventInput?.description || '')
+      },
+      start: startDateTime
+        ? { dateTime: startDateTime, timeZone: 'UTC' }
+        : { dateTime: buildUtcDateStart(eventInput?.start_date || eventInput?.start_time), timeZone: 'UTC' },
+      end: endDateTime
+        ? { dateTime: endDateTime, timeZone: 'UTC' }
+        : { dateTime: buildUtcDateEnd(eventInput?.end_date || eventInput?.end_time || eventInput?.start_date || eventInput?.start_time), timeZone: 'UTC' },
+      isAllDay: !(startDateTime && endDateTime)
+    }
+
+    const location = String(eventInput?.location || '').trim()
+    if (location) payload.location = { displayName: location }
+    if (attendees.length) payload.attendees = attendees
+
+    return payload
+  }
+
+  async createEvent({ accessToken, eventInput }) {
+    const event = this.buildEventPayload(eventInput)
+    const insertion = await createOutlookCalendarEvent({ accessToken, event })
+    if (!insertion.ok) {
+      return {
+        ok: false,
+        status: insertion.status,
+        error: genericApiErrorMessage(insertion.payload, `Outlook Calendar create failed (${insertion.status})`)
+      }
+    }
+    const payload = insertion.payload || {}
+    return {
+      ok: true,
+      status: insertion.status,
+      event_id: payload.id || null,
+      event_link: payload.webLink || null
+    }
+  }
+
+  async updateEvent({ accessToken, eventId, eventInput }) {
+    const event = this.buildEventPayload(eventInput)
+    const response = await updateOutlookCalendarEvent({ accessToken, eventId, event })
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        error: genericApiErrorMessage(response.payload, `Outlook Calendar update failed (${response.status})`)
+      }
+    }
+    const payload = response.payload || {}
+    return {
+      ok: true,
+      status: response.status,
+      event_id: payload.id || eventId,
+      event_link: payload.webLink || null
+    }
+  }
+
+  async deleteEvent({ accessToken, eventId }) {
+    const response = await deleteOutlookCalendarEvent({ accessToken, eventId })
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        error: genericApiErrorMessage(response.payload, `Outlook Calendar delete failed (${response.status})`)
+      }
+    }
+    return {
+      ok: true,
+      status: response.status
+    }
+  }
+}
+
+const calendarProviders = {
+  [CALENDAR_PROVIDER_GOOGLE]: new GoogleCalendarProvider(),
+  [CALENDAR_PROVIDER_OUTLOOK]: new OutlookCalendarProvider()
+}
+
+function getCalendarProvider(provider) {
+  const normalizedProvider = normalizeCalendarProvider(provider)
+  if (!normalizedProvider) return null
+  return calendarProviders[normalizedProvider] || null
+}
+
+function listCalendarProviderMetas() {
+  return CALENDAR_PROVIDER_IDS.map((providerId) => {
+    const provider = getCalendarProvider(providerId)
+    return {
+      id: providerId,
+      name: provider?.displayName || providerDisplayName(providerId),
+      configured: provider ? provider.isConfigured() : false
+    }
+  })
+}
+
+async function ensureCalendarProviderAccessToken({ db, provider, connection }) {
+  if (!connection) return { success: false, error: `${provider.displayName} is not connected` }
+  let current = connection
+  let accessToken = String(connection.access_token || '').trim()
+  const expiresAt = parseDateToEpochMillis(connection.expires_at)
+  const expiresSoon = expiresAt !== null && expiresAt <= Date.now() + 60 * 1000
+
+  if ((!accessToken || expiresSoon) && current.refresh_token) {
+    const refreshed = await provider.refreshToken({ refreshToken: current.refresh_token })
+    current = await upsertCalendarConnection(db, current.user_id, provider.providerId, {
+      access_token: refreshed.access_token || accessToken,
+      refresh_token: refreshed.refresh_token || current.refresh_token,
+      token_type: refreshed.token_type || current.token_type || 'Bearer',
+      scope: refreshed.scope || current.scope || provider.getScopes().join(' '),
+      expires_at: computeExpiryIso(refreshed.expires_in, current.expires_at),
+      connected_email: current.connected_email || null,
+      calendar_id: current.calendar_id || null
+    })
+    accessToken = String(current.access_token || '').trim()
+  }
+
+  if (!accessToken) {
+    return { success: false, error: `Missing ${provider.displayName} access token` }
+  }
+
+  return { success: true, accessToken, connection: current }
+}
+
+class CalendarService {
+  constructor({ db, logger = console } = {}) {
+    this.db = db
+    this.logger = logger
+  }
+
+  log(message, payload = null) {
+    if (payload) {
+      this.logger.log(`[CalendarService] ${message}`, payload)
+      return
+    }
+    this.logger.log(`[CalendarService] ${message}`)
+  }
+
+  async resolveSingleProviderConnection(userKey) {
+    const key = normalizeUserKey(userKey)
+    const connections = await listCalendarConnections(this.db, key)
+    if (!Array.isArray(connections) || connections.length === 0) {
+      return { providerId: null, connection: null }
+    }
+    const orderedProviders = [CALENDAR_PROVIDER_OUTLOOK, CALENDAR_PROVIDER_GOOGLE]
+    const selected = orderedProviders
+      .map((providerId) => connections.find((item) => item?.provider === providerId))
+      .find(Boolean) || connections[0]
+    if (selected?.provider) {
+      return { providerId: selected.provider, connection: selected }
+    }
+    return { providerId: null, connection: null }
+  }
+
+  async updateCalendarEventDoc(eventId, patch = {}) {
+    if (isCalendarSqlStorageEnabled()) {
+      return updateCalendarEventDocInSql(eventId, patch)
+    }
+    await this.db.collection(CALENDAR_EVENTS_COLLECTION).updateOne(
+      { id: String(eventId) },
+      { $set: { ...patch, updated_at: new Date() } }
+    )
+    return this.db.collection(CALENDAR_EVENTS_COLLECTION).findOne({ id: String(eventId) })
+  }
+
+  async findCalendarEventDoc(userKey, eventId) {
+    if (isCalendarSqlStorageEnabled()) {
+      return findCalendarEventDocInSql(userKey, eventId)
+    }
+    return this.db.collection(CALENDAR_EVENTS_COLLECTION).findOne({
+      id: String(eventId),
+      user_id: normalizeUserKey(userKey)
+    })
+  }
+
+  toProviderEventInput(eventDoc) {
+    return {
+      summary: eventDoc?.title || 'CRM Event',
+      description: eventDoc?.description || '',
+      location: eventDoc?.location || null,
+      attendees: Array.isArray(eventDoc?.attendees) ? eventDoc.attendees : [],
+      start_time: eventDoc?.start_time || null,
+      end_time: eventDoc?.end_time || null,
+      start_date: toDateOnlyString(eventDoc?.start_time),
+      end_date: toDateOnlyString(eventDoc?.end_time || eventDoc?.start_time)
+    }
+  }
+
+  async createEvent({ userKey, event = {}, source = {} } = {}) {
+    const normalizedUser = normalizeUserKey(userKey)
+    const title = String(event?.title || event?.summary || '').trim()
+    const startTime = toIsoDateTime(event?.start_time || event?.start || event?.start_date)
+    const endTimeRaw = toIsoDateTime(event?.end_time || event?.end || event?.end_date)
+    const endTime = endTimeRaw || startTime
+    if (!title) throw new Error('title is required')
+    if (!startTime || !endTime) throw new Error('start_time and end_time are required')
+    const startEpoch = parseDateToEpochMillis(startTime)
+    const endEpoch = parseDateToEpochMillis(endTime)
+    if (startEpoch === null || endEpoch === null || endEpoch <= startEpoch) {
+      throw new Error('Invalid time range')
+    }
+
+    const eventDoc = {
+      id: uuidv4(),
+      title,
+      start_time: startTime,
+      end_time: endTime,
+      user_id: normalizedUser,
+      provider: null,
+      external_event_id: null,
+      external_event_link: null,
+      description: String(event?.description || '').trim() || null,
+      location: String(event?.location || '').trim() || null,
+      attendees: Array.isArray(event?.attendees) ? event.attendees : [],
+      source_type: source?.type || null,
+      source_id: source?.id || null,
+      transaction_id: source?.transaction_id ? String(source.transaction_id) : null,
+      sync_status: 'pending',
+      sync_error: null,
+      created_at: new Date(),
+      updated_at: new Date()
+    }
+
+    const persistedEvent = isCalendarSqlStorageEnabled()
+      ? await insertCalendarEventDocInSql(eventDoc)
+      : await (async () => {
+        await this.db.collection(CALENDAR_EVENTS_COLLECTION).insertOne(eventDoc)
+        return eventDoc
+      })()
+    const localEvent = persistedEvent || eventDoc
+    this.log('CRM event created (source of truth)', {
+      event_id: localEvent.id,
+      user_id: normalizedUser
+    })
+
+    const resolved = await this.resolveSingleProviderConnection(normalizedUser)
+    if (!resolved.connection || !resolved.providerId) {
+      const updated = await this.updateCalendarEventDoc(localEvent.id, {
+        provider: null,
+        sync_status: 'provider_not_connected',
+        sync_error: null
+      })
+      this.log('No connected provider. Keeping CRM event unsynced.', {
+        event_id: localEvent.id,
+        user_id: normalizedUser
+      })
+      return {
+        success: true,
+        event: updated,
+        sync: {
+          attempted: false,
+          connected: false,
+          success: false,
+          provider: null,
+          reason: 'provider_not_connected',
+          error: null
+        }
+      }
+    }
+
+    const providerAdapter = getCalendarProvider(resolved.providerId)
+    if (!providerAdapter || !providerAdapter.isConfigured()) {
+      const updated = await this.updateCalendarEventDoc(localEvent.id, {
+        provider: resolved.providerId,
+        sync_status: 'provider_not_configured',
+        sync_error: null
+      })
+      return {
+        success: true,
+        event: updated,
+        sync: {
+          attempted: false,
+          connected: true,
+          success: false,
+          provider: resolved.providerId,
+          reason: 'provider_not_configured',
+          error: null
+        }
+      }
+    }
+
+    // Outlook manual flow: keep CRM event as source of truth and require user confirmation
+    // through Outlook compose page instead of API auto-creation.
+    if (resolved.providerId === CALENDAR_PROVIDER_OUTLOOK) {
+      const updated = await this.updateCalendarEventDoc(localEvent.id, {
+        provider: resolved.providerId,
+        sync_status: 'manual_confirmation_required',
+        sync_error: null
+      })
+      this.log('Outlook manual confirmation required', {
+        event_id: localEvent.id,
+        provider: resolved.providerId
+      })
+      return {
+        success: true,
+        event: updated,
+        sync: {
+          attempted: false,
+          connected: true,
+          success: false,
+          provider: resolved.providerId,
+          reason: 'manual_confirmation_required',
+          error: null
+        }
+      }
+    }
+
+    let ensured
+    try {
+      ensured = await ensureCalendarProviderAccessToken({
+        db: this.db,
+        provider: providerAdapter,
+        connection: resolved.connection
+      })
+    } catch (error) {
+      const updated = await this.updateCalendarEventDoc(localEvent.id, {
+        provider: resolved.providerId,
+        sync_status: 'token_refresh_failed',
+        sync_error: String(error?.message || error)
+      })
+      return {
+        success: true,
+        event: updated,
+        sync: {
+          attempted: true,
+          connected: true,
+          success: false,
+          provider: resolved.providerId,
+          reason: 'token_refresh_failed',
+          error: String(error?.message || error)
+        }
+      }
+    }
+
+    if (!ensured.success) {
+      const updated = await this.updateCalendarEventDoc(localEvent.id, {
+        provider: resolved.providerId,
+        sync_status: 'token_unavailable',
+        sync_error: ensured.error || null
+      })
+      return {
+        success: true,
+        event: updated,
+        sync: {
+          attempted: true,
+          connected: true,
+          success: false,
+          provider: resolved.providerId,
+          reason: 'token_unavailable',
+          error: ensured.error || null
+        }
+      }
+    }
+
+    this.log('Syncing event to provider', {
+      event_id: localEvent.id,
+      provider: resolved.providerId
+    })
+    const syncResult = await providerAdapter.createEvent({
+      accessToken: ensured.accessToken,
+      connection: ensured.connection,
+      eventInput: this.toProviderEventInput(localEvent)
+    })
+
+    if (!syncResult.ok) {
+      const updated = await this.updateCalendarEventDoc(localEvent.id, {
+        provider: resolved.providerId,
+        sync_status: 'sync_failed',
+        sync_error: syncResult.error || null
+      })
+      this.log('Provider sync failed (CRM event retained)', {
+        event_id: localEvent.id,
+        provider: resolved.providerId,
+        error: syncResult.error || null
+      })
+      return {
+        success: true,
+        event: updated,
+        sync: {
+          attempted: true,
+          connected: true,
+          success: false,
+          provider: resolved.providerId,
+          reason: 'sync_failed',
+          error: syncResult.error || null
+        }
+      }
+    }
+
+    const updated = await this.updateCalendarEventDoc(localEvent.id, {
+      provider: resolved.providerId,
+      external_event_id: syncResult.event_id || null,
+      external_event_link: syncResult.event_link || null,
+      sync_status: 'synced',
+      sync_error: null,
+      synced_at: new Date()
+    })
+    this.log('Provider sync successful', {
+      event_id: localEvent.id,
+      provider: resolved.providerId,
+      external_event_id: syncResult.event_id || null
+    })
+    return {
+      success: true,
+      event: updated,
+      sync: {
+        attempted: true,
+        connected: true,
+        success: true,
+        provider: resolved.providerId,
+        reason: 'synced',
+        error: null
+      }
+    }
+  }
+
+  async updateEvent({ userKey, eventId, updates = {} } = {}) {
+    const existing = await this.findCalendarEventDoc(userKey, eventId)
+    if (!existing) throw new Error('Calendar event not found')
+
+    const title = Object.prototype.hasOwnProperty.call(updates, 'title')
+      ? String(updates.title || '').trim()
+      : existing.title
+    if (!title) throw new Error('title is required')
+    const startTime = Object.prototype.hasOwnProperty.call(updates, 'start_time')
+      ? toIsoDateTime(updates.start_time)
+      : existing.start_time
+    const endTime = Object.prototype.hasOwnProperty.call(updates, 'end_time')
+      ? toIsoDateTime(updates.end_time)
+      : existing.end_time
+    if (!startTime || !endTime) throw new Error('start_time and end_time are required')
+
+    const localUpdated = await this.updateCalendarEventDoc(existing.id, {
+      title,
+      start_time: startTime,
+      end_time: endTime,
+      description: Object.prototype.hasOwnProperty.call(updates, 'description') ? (updates.description || null) : existing.description,
+      location: Object.prototype.hasOwnProperty.call(updates, 'location') ? (updates.location || null) : existing.location,
+      attendees: Array.isArray(updates?.attendees) ? updates.attendees : existing.attendees
+    })
+    this.log('CRM event updated', { event_id: existing.id, user_id: normalizeUserKey(userKey) })
+
+    if (!localUpdated?.provider || !localUpdated?.external_event_id) {
+      return {
+        success: true,
+        event: localUpdated,
+        sync: {
+          attempted: false,
+          connected: false,
+          success: false,
+          provider: localUpdated?.provider || null,
+          reason: 'not_linked',
+          error: null
+        }
+      }
+    }
+
+    const providerAdapter = getCalendarProvider(localUpdated.provider)
+    const connection = await findCalendarConnection(this.db, userKey, localUpdated.provider)
+    if (!providerAdapter || !connection) {
+      const updated = await this.updateCalendarEventDoc(existing.id, {
+        sync_status: 'provider_not_connected'
+      })
+      return {
+        success: true,
+        event: updated,
+        sync: {
+          attempted: false,
+          connected: false,
+          success: false,
+          provider: localUpdated.provider,
+          reason: 'provider_not_connected',
+          error: null
+        }
+      }
+    }
+
+    const ensured = await ensureCalendarProviderAccessToken({ db: this.db, provider: providerAdapter, connection })
+    if (!ensured.success) {
+      const updated = await this.updateCalendarEventDoc(existing.id, {
+        sync_status: 'token_unavailable',
+        sync_error: ensured.error || null
+      })
+      return {
+        success: true,
+        event: updated,
+        sync: {
+          attempted: true,
+          connected: true,
+          success: false,
+          provider: localUpdated.provider,
+          reason: 'token_unavailable',
+          error: ensured.error || null
+        }
+      }
+    }
+
+    const syncResult = await providerAdapter.updateEvent({
+      accessToken: ensured.accessToken,
+      connection: ensured.connection,
+      eventId: localUpdated.external_event_id,
+      eventInput: this.toProviderEventInput(localUpdated)
+    })
+
+    if (!syncResult.ok) {
+      const updated = await this.updateCalendarEventDoc(existing.id, {
+        sync_status: 'sync_failed',
+        sync_error: syncResult.error || null
+      })
+      return {
+        success: true,
+        event: updated,
+        sync: {
+          attempted: true,
+          connected: true,
+          success: false,
+          provider: localUpdated.provider,
+          reason: 'sync_failed',
+          error: syncResult.error || null
+        }
+      }
+    }
+
+    const updated = await this.updateCalendarEventDoc(existing.id, {
+      external_event_link: syncResult.event_link || localUpdated.external_event_link || null,
+      sync_status: 'synced',
+      sync_error: null
+    })
+    return {
+      success: true,
+      event: updated,
+      sync: {
+        attempted: true,
+        connected: true,
+        success: true,
+        provider: localUpdated.provider,
+        reason: 'synced',
+        error: null
+      }
+    }
+  }
+
+  async deleteEvent({ userKey, eventId } = {}) {
+    const existing = await this.findCalendarEventDoc(userKey, eventId)
+    if (!existing) throw new Error('Calendar event not found')
+
+    const marked = await this.updateCalendarEventDoc(existing.id, {
+      status: 'deleted',
+      deleted_at: new Date()
+    })
+    this.log('CRM event marked deleted', { event_id: existing.id, user_id: normalizeUserKey(userKey) })
+
+    if (!marked?.provider || !marked?.external_event_id) {
+      return {
+        success: true,
+        event: marked,
+        sync: {
+          attempted: false,
+          connected: false,
+          success: false,
+          provider: marked?.provider || null,
+          reason: 'not_linked',
+          error: null
+        }
+      }
+    }
+
+    const providerAdapter = getCalendarProvider(marked.provider)
+    const connection = await findCalendarConnection(this.db, userKey, marked.provider)
+    if (!providerAdapter || !connection) {
+      const updated = await this.updateCalendarEventDoc(existing.id, {
+        sync_status: 'provider_not_connected'
+      })
+      return {
+        success: true,
+        event: updated,
+        sync: {
+          attempted: false,
+          connected: false,
+          success: false,
+          provider: marked.provider,
+          reason: 'provider_not_connected',
+          error: null
+        }
+      }
+    }
+
+    const ensured = await ensureCalendarProviderAccessToken({ db: this.db, provider: providerAdapter, connection })
+    if (!ensured.success) {
+      const updated = await this.updateCalendarEventDoc(existing.id, {
+        sync_status: 'token_unavailable',
+        sync_error: ensured.error || null
+      })
+      return {
+        success: true,
+        event: updated,
+        sync: {
+          attempted: true,
+          connected: true,
+          success: false,
+          provider: marked.provider,
+          reason: 'token_unavailable',
+          error: ensured.error || null
+        }
+      }
+    }
+
+    const syncResult = await providerAdapter.deleteEvent({
+      accessToken: ensured.accessToken,
+      connection: ensured.connection,
+      eventId: marked.external_event_id
+    })
+    if (!syncResult.ok) {
+      const updated = await this.updateCalendarEventDoc(existing.id, {
+        sync_status: 'delete_failed',
+        sync_error: syncResult.error || null
+      })
+      return {
+        success: true,
+        event: updated,
+        sync: {
+          attempted: true,
+          connected: true,
+          success: false,
+          provider: marked.provider,
+          reason: 'delete_failed',
+          error: syncResult.error || null
+        }
+      }
+    }
+
+    const updated = await this.updateCalendarEventDoc(existing.id, {
+      sync_status: 'deleted_synced',
+      sync_error: null
+    })
+    return {
+      success: true,
+      event: updated,
+      sync: {
+        attempted: true,
+        connected: true,
+        success: true,
+        provider: marked.provider,
+        reason: 'deleted_synced',
+        error: null
+      }
+    }
+  }
+}
+
+function getAppOriginFromRequest(request) {
+  const configuredOrigin = String(
+    process.env.APP_BASE_URL ||
+    process.env.BASE_URL ||
+    process.env.NEXT_PUBLIC_APP_URL ||
+    ''
+  ).trim()
+
+  if (configuredOrigin) {
+    try {
+      const parsedConfiguredOrigin = new URL(
+        configuredOrigin.includes('://') ? configuredOrigin : `http://${configuredOrigin}`
+      )
+      if (parsedConfiguredOrigin.hostname === '0.0.0.0') {
+        parsedConfiguredOrigin.hostname = 'localhost'
+      }
+      return parsedConfiguredOrigin.origin
+    } catch (_) {
+      // Fallback to request URL origin below.
+    }
+  }
+
+  const url = new URL(request.url)
+  if (url.hostname === '0.0.0.0') {
+    url.hostname = 'localhost'
+  }
+  return `${url.protocol}//${url.host}`
+}
+
+function buildCalendarRedirectResponse(request, returnTo = '/', params = {}) {
+  const destination = buildReturnPathWithParams(returnTo, params)
+  return NextResponse.redirect(`${getAppOriginFromRequest(request)}${destination}`)
+}
+
+async function getCalendarStatusPayload(db, request) {
+  const auth = getRequestAuthContext(request)
+  const userKey = auth.userKey
+  const statuses = []
+  for (const providerId of CALENDAR_PROVIDER_IDS) {
+    const provider = getCalendarProvider(providerId)
+    const connection = await findCalendarConnection(db, userKey, providerId)
+    statuses.push(getCalendarConnectionPublicStatus(connection, providerId, provider?.isConfigured()))
+  }
+  const connectedProviders = statuses.filter((entry) => entry.connected).map((entry) => entry.provider)
+  const configuredProviders = statuses.filter((entry) => entry.configured).map((entry) => entry.provider)
+
+  return {
+    success: true,
+    connected: connectedProviders.length > 0,
+    configured: configuredProviders.length > 0,
+    connected_providers: connectedProviders,
+    configured_providers: configuredProviders,
+    providers: statuses
+  }
+}
+
+async function startCalendarConnectFlow(request, providerId) {
+  const provider = getCalendarProvider(providerId)
+  const url = new URL(request.url)
+  const auth = getRequestAuthContext(request)
+  const returnTo = sanitizeReturnPath(url.searchParams.get('returnTo') || '/?tab=transactions')
+  const userKey = normalizeUserKey(url.searchParams.get('user_key') || auth.userKey)
+
+  if (!provider) {
+    return buildCalendarRedirectResponse(request, returnTo, {
+      calendar: 'unknown_provider',
+      calendar_provider: String(providerId || '')
+    })
+  }
+  if (!provider.isConfigured()) {
+    return buildCalendarRedirectResponse(request, returnTo, {
+      calendar: 'missing_config',
+      calendar_provider: provider.providerId
+    })
+  }
+
+  const state = createCalendarOAuthState({ userKey, provider: provider.providerId, returnTo })
+  if (!state) {
+    return buildCalendarRedirectResponse(request, returnTo, {
+      calendar: 'state_unavailable',
+      calendar_provider: provider.providerId
+    })
+  }
+
+  const authUrl = provider.connect({ state })
+  return NextResponse.redirect(authUrl)
+}
+
+async function finishCalendarConnectFlow({ db, request, providerId }) {
+  const provider = getCalendarProvider(providerId)
+  const url = new URL(request.url)
+  const state = String(url.searchParams.get('state') || '')
+  const verified = verifyCalendarOAuthState(state, providerId)
+  const returnTo = verified?.returnTo || '/?tab=transactions'
+  const callbackReturnTo = returnTo
+
+  if (!provider) {
+    return buildCalendarRedirectResponse(request, callbackReturnTo, {
+      calendar: 'unknown_provider',
+      calendar_provider: String(providerId || '')
+    })
+  }
+  if (!provider.isConfigured()) {
+    return buildCalendarRedirectResponse(request, callbackReturnTo, {
+      calendar: 'missing_config',
+      calendar_provider: provider.providerId
+    })
+  }
+  if (!verified?.userKey || verified.provider !== provider.providerId) {
+    return buildCalendarRedirectResponse(request, callbackReturnTo, {
+      calendar: 'invalid_state',
+      calendar_provider: provider.providerId
+    })
+  }
+
+  const oauthError = url.searchParams.get('error')
+  if (oauthError) {
+    return buildCalendarRedirectResponse(request, callbackReturnTo, {
+      calendar: 'oauth_denied',
+      calendar_provider: provider.providerId,
+      calendar_error: oauthError
+    })
+  }
+
+  const code = String(url.searchParams.get('code') || '').trim()
+  if (!code) {
+    return buildCalendarRedirectResponse(request, callbackReturnTo, {
+      calendar: 'missing_code',
+      calendar_provider: provider.providerId
+    })
+  }
+
+  try {
+    await provider.callback({ db, userKey: verified.userKey, code })
+    const normalizedUser = normalizeUserKey(verified.userKey)
+    if (isCalendarSqlStorageEnabled()) {
+      await pgPool.query(
+        `DELETE FROM calendar_connections WHERE user_id = $1 AND provider <> $2`,
+        [normalizedUser, provider.providerId]
+      )
+    } else {
+      await db.collection(CALENDAR_CONNECTIONS_COLLECTION).deleteMany({
+        user_id: normalizedUser,
+        provider: { $ne: provider.providerId }
+      })
+    }
+    console.log('[CalendarService] Enforced single provider connection for user', {
+      user_id: normalizedUser,
+      provider: provider.providerId
+    })
+    return buildCalendarRedirectResponse(request, callbackReturnTo, {
+      calendar: 'connected',
+      calendar_provider: provider.providerId
+    })
+  } catch (error) {
+    console.error(`Calendar callback error (${provider.providerId}):`, error)
+    return buildCalendarRedirectResponse(request, callbackReturnTo, {
+      calendar: 'connect_failed',
+      calendar_provider: provider.providerId,
+      calendar_error: String(error?.message || 'unknown_error')
+    })
+  }
+}
+
+function baseCalendarSyncResult(overrides = {}) {
+  return {
+    attempted: false,
+    connected: false,
+    success: false,
+    partial_success: false,
+    reason: 'not_attempted',
+    providers: [],
+    event_link: null,
+    quick_add_url: null,
+    ...overrides
+  }
+}
+
+function summarizeProviderResults(results = []) {
+  const attempted = results.filter((entry) => entry.attempted)
+  const successful = results.filter((entry) => entry.success)
+  const failed = results.filter((entry) => entry.attempted && !entry.success)
+  const firstEvent = successful.find((entry) => entry.event_link)
+  const firstQuickAdd = results.find((entry) => entry.quick_add_url)
+  const errors = failed.map((entry) => entry.error).filter(Boolean)
+
+  return {
+    success: attempted.length > 0 && failed.length === 0 && successful.length === attempted.length,
+    partial_success: successful.length > 0 && failed.length > 0,
+    event_link: firstEvent?.event_link || null,
+    quick_add_url: firstQuickAdd?.quick_add_url || null,
+    error: errors.length ? errors.join('; ') : null
+  }
+}
+
+async function syncTransactionCalendarUpsert({ db, request, transaction }) {
+  const auth = getRequestAuthContext(request)
+  const userKey = auth.userKey
+  const closingDate = toDateOnlyString(transaction?.closing_date)
+  const connections = await listCalendarConnections(db, userKey)
+
+  if (!connections.length) {
+    return baseCalendarSyncResult({
+      reason: 'calendar_not_connected',
+      quick_add_url: buildGoogleCalendarTemplateUrl(transaction, closingDate)
+    })
+  }
+
+  const eventInput = closingDate ? buildTransactionCalendarEventInput(transaction, closingDate) : null
+  const providerResults = []
+
+  for (const connection of connections) {
+    const providerId = normalizeCalendarProvider(connection?.provider)
+    const provider = getCalendarProvider(providerId)
+    if (!provider) continue
+    const quickAddUrl = buildProviderQuickAddUrl(providerId, transaction, closingDate)
+
+    if (!provider.isConfigured()) {
+      providerResults.push({
+        provider: providerId,
+        attempted: false,
+        success: false,
+        reason: 'provider_not_configured',
+        quick_add_url: quickAddUrl
+      })
+      continue
+    }
+
+    const record = await findCalendarEventRecord(db, {
+      userKey,
+      provider: providerId,
+      transactionId: transaction?.id
+    })
+
+    if (!closingDate) {
+      if (record?.external_event_id) {
+        try {
+          const ensured = await ensureCalendarProviderAccessToken({ db, provider, connection })
+          if (ensured.success) {
+            await provider.deleteEvent({
+              accessToken: ensured.accessToken,
+              connection: ensured.connection,
+              eventId: record.external_event_id
+            })
+          }
+        } catch (_) {
+          // Best effort cleanup when closing date was removed.
+        }
+      }
+      if (record?.id) await deleteCalendarEventRecord(db, record.id)
+      providerResults.push({
+        provider: providerId,
+        attempted: Boolean(record),
+        success: true,
+        reason: 'closing_date_missing',
+        quick_add_url: null
+      })
+      continue
+    }
+
+    let ensured
+    try {
+      ensured = await ensureCalendarProviderAccessToken({ db, provider, connection })
+    } catch (error) {
+      providerResults.push({
+        provider: providerId,
+        attempted: true,
+        success: false,
+        reason: 'token_refresh_failed',
+        error: String(error?.message || error),
+        quick_add_url: quickAddUrl
+      })
+      continue
+    }
+
+    if (!ensured.success) {
+      providerResults.push({
+        provider: providerId,
+        attempted: true,
+        success: false,
+        reason: 'token_unavailable',
+        error: ensured.error,
+        quick_add_url: quickAddUrl
+      })
+      continue
+    }
+
+    try {
+      if (record?.external_event_id) {
+        let updateResult = await provider.updateEvent({
+          accessToken: ensured.accessToken,
+          connection: ensured.connection,
+          eventId: record.external_event_id,
+          eventInput
+        })
+
+        if (!updateResult.ok && updateResult.status === 404) {
+          updateResult = await provider.createEvent({
+            accessToken: ensured.accessToken,
+            connection: ensured.connection,
+            eventInput
+          })
+        }
+
+        if (!updateResult.ok) {
+          providerResults.push({
+            provider: providerId,
+            attempted: true,
+            success: false,
+            reason: 'event_update_failed',
+            error: updateResult.error,
+            quick_add_url: quickAddUrl
+          })
+          continue
+        }
+
+        await upsertCalendarEventRecord(db, {
+          userKey,
+          provider: providerId,
+          transactionId: transaction?.id,
+          externalEventId: updateResult.event_id || record.external_event_id,
+          externalEventLink: updateResult.event_link || record.external_event_link || null
+        })
+
+        providerResults.push({
+          provider: providerId,
+          attempted: true,
+          success: true,
+          reason: 'event_updated',
+          event_id: updateResult.event_id || record.external_event_id,
+          event_link: updateResult.event_link || record.external_event_link || null,
+          quick_add_url: null
+        })
+        continue
+      }
+
+      const createResult = await provider.createEvent({
+        accessToken: ensured.accessToken,
+        connection: ensured.connection,
+        eventInput
+      })
+
+      if (!createResult.ok) {
+        providerResults.push({
+          provider: providerId,
+          attempted: true,
+          success: false,
+          reason: 'event_create_failed',
+          error: createResult.error,
+          quick_add_url: quickAddUrl
+        })
+        continue
+      }
+
+      await upsertCalendarEventRecord(db, {
+        userKey,
+        provider: providerId,
+        transactionId: transaction?.id,
+        externalEventId: createResult.event_id,
+        externalEventLink: createResult.event_link
+      })
+
+      providerResults.push({
+        provider: providerId,
+        attempted: true,
+        success: true,
+        reason: 'event_created',
+        event_id: createResult.event_id || null,
+        event_link: createResult.event_link || null,
+        quick_add_url: null
+      })
+    } catch (error) {
+      providerResults.push({
+        provider: providerId,
+        attempted: true,
+        success: false,
+        reason: 'unexpected_error',
+        error: String(error?.message || error),
+        quick_add_url: quickAddUrl
+      })
+    }
+  }
+
+  const summary = summarizeProviderResults(providerResults)
+  return baseCalendarSyncResult({
+    attempted: providerResults.length > 0,
+    connected: providerResults.length > 0,
+    success: summary.success,
+    partial_success: summary.partial_success,
+    reason: summary.success ? 'synced' : (summary.partial_success ? 'partially_synced' : 'failed'),
+    providers: providerResults,
+    event_link: summary.event_link,
+    quick_add_url: summary.quick_add_url,
+    error: summary.error
+  })
+}
+
+async function syncTransactionCalendarDelete({ db, request, transactionId }) {
+  const auth = getRequestAuthContext(request)
+  const userKey = auth.userKey
+  const records = await listCalendarEventRecordsByTransaction(db, { userKey, transactionId })
+  if (!records.length) {
+    return baseCalendarSyncResult({
+      reason: 'no_calendar_events',
+      success: true
+    })
+  }
+
+  const providerResults = []
+  for (const record of records) {
+    const providerId = normalizeCalendarProvider(record?.provider)
+    const provider = getCalendarProvider(providerId)
+    if (!provider) {
+      await deleteCalendarEventRecord(db, record.id)
+      providerResults.push({
+        provider: providerId || 'unknown',
+        attempted: false,
+        success: true,
+        reason: 'provider_missing'
+      })
+      continue
+    }
+
+    const connection = await findCalendarConnection(db, userKey, providerId)
+    if (!connection) {
+      await deleteCalendarEventRecord(db, record.id)
+      providerResults.push({
+        provider: providerId,
+        attempted: false,
+        success: true,
+        reason: 'connection_missing'
+      })
+      continue
+    }
+
+    try {
+      const ensured = await ensureCalendarProviderAccessToken({ db, provider, connection })
+      if (!ensured.success) {
+        await deleteCalendarEventRecord(db, record.id)
+        providerResults.push({
+          provider: providerId,
+          attempted: true,
+          success: false,
+          reason: 'token_unavailable',
+          error: ensured.error
+        })
+        continue
+      }
+
+      const result = await provider.deleteEvent({
+        accessToken: ensured.accessToken,
+        connection: ensured.connection,
+        eventId: record.external_event_id
+      })
+
+      await deleteCalendarEventRecord(db, record.id)
+      providerResults.push({
+        provider: providerId,
+        attempted: true,
+        success: Boolean(result.ok),
+        reason: result.ok ? 'event_deleted' : 'event_delete_failed',
+        error: result.ok ? null : result.error
+      })
+    } catch (error) {
+      await deleteCalendarEventRecord(db, record.id)
+      providerResults.push({
+        provider: providerId,
+        attempted: true,
+        success: false,
+        reason: 'unexpected_error',
+        error: String(error?.message || error)
+      })
+    }
+  }
+
+  const summary = summarizeProviderResults(providerResults)
+  return baseCalendarSyncResult({
+    attempted: true,
+    connected: true,
+    success: summary.success,
+    partial_success: summary.partial_success,
+    reason: summary.success ? 'deleted' : (summary.partial_success ? 'partially_deleted' : 'delete_failed'),
+    providers: providerResults,
+    error: summary.error
+  })
+}
+
 // Lead deduplication check
 async function checkDuplicateLead(db, email, phone) {
   const existingLead = await db.collection('leads').findOne({
@@ -3111,11 +6436,258 @@ async function handleRoute(request, { params }) {
   const method = request.method
 
   try {
+    if (route === '/health/db' && method === 'GET') {
+      try {
+        await connectToMongo()
+        return handleCORS(NextResponse.json({
+          success: true,
+          db: getDbRuntimeStatus()
+        }))
+      } catch (error) {
+        const code = String(error?.code || 'DB_UNAVAILABLE')
+        const status = code === 'DB_CONFIG_MISSING' ? 500 : 503
+        return handleCORS(NextResponse.json({
+          success: false,
+          error: String(error?.message || 'Database unavailable'),
+          code,
+          db: getDbRuntimeStatus()
+        }, { status }))
+      }
+    }
+
     const db = await connectToMongo()
 
     // Root endpoint
     if (route === '/' && method === 'GET') {
       return handleCORS(NextResponse.json({ message: "Real Estate CRM API" }))
+    }
+
+    // CALENDAR PROVIDERS (provider-agnostic API)
+    if (route === '/calendar/providers' && method === 'GET') {
+      const providers = listCalendarProviderMetas()
+      return handleCORS(NextResponse.json({
+        success: true,
+        providers
+      }))
+    }
+
+    if (route === '/calendar/status' && method === 'GET') {
+      try {
+        const payload = await getCalendarStatusPayload(db, request)
+        return handleCORS(NextResponse.json(payload))
+      } catch (error) {
+        console.error('Calendar status error:', error)
+        return handleCORS(NextResponse.json({
+          success: false,
+          error: 'Failed to fetch calendar status'
+        }, { status: 500 }))
+      }
+    }
+
+    if (route === '/calendar/connect' && method === 'GET') {
+      const url = new URL(request.url)
+      const rawProvider = String(url.searchParams.get('provider') || '').trim()
+      if (!rawProvider) {
+        return handleCORS(NextResponse.json({
+          success: false,
+          error: 'provider query parameter is required'
+        }, { status: 400 }))
+      }
+      const provider = normalizeCalendarProvider(rawProvider)
+      if (!provider) {
+        return handleCORS(NextResponse.json({
+          success: false,
+          error: 'Unsupported calendar provider'
+        }, { status: 400 }))
+      }
+      return startCalendarConnectFlow(request, provider)
+    }
+
+    if (route.match(/^\/calendar\/[^\/]+\/callback$/) && method === 'GET') {
+      const provider = normalizeCalendarProvider(path[1])
+      return finishCalendarConnectFlow({ db, request, providerId: provider })
+    }
+
+    if (route.match(/^\/calendar\/callback\/[^\/]+$/) && method === 'GET') {
+      const provider = normalizeCalendarProvider(path[2])
+      return finishCalendarConnectFlow({ db, request, providerId: provider })
+    }
+
+    if (route === '/calendar/disconnect' && method === 'POST') {
+      try {
+        const auth = getRequestAuthContext(request)
+        await deleteCalendarConnection(db, auth.userKey, null)
+        await markCalendarEventsAsProviderDisconnected(db, {
+          userKey: auth.userKey,
+          provider: null
+        })
+        const payload = await getCalendarStatusPayload(db, request)
+        return handleCORS(NextResponse.json(payload))
+      } catch (error) {
+        console.error('Calendar disconnect error:', error)
+        return handleCORS(NextResponse.json({
+          success: false,
+          error: 'Failed to disconnect calendar'
+        }, { status: 500 }))
+      }
+    }
+
+    if (route === '/calendar/create' && method === 'POST') {
+      try {
+        const auth = getRequestAuthContext(request)
+        const body = await request.json().catch(() => ({}))
+        const calendarService = new CalendarService({ db, logger: console })
+        const result = await calendarService.createEvent({
+          userKey: auth.userKey,
+          event: {
+            title: body?.title || body?.summary || '',
+            description: body?.description || '',
+            location: body?.location || '',
+            attendees: Array.isArray(body?.attendees) ? body.attendees : [],
+            start_time: body?.start_time || body?.start || body?.start_date,
+            end_time: body?.end_time || body?.end || body?.end_date
+          },
+          source: {
+            type: body?.source_type || 'manual',
+            id: body?.source_id || null,
+            transaction_id: body?.transaction_id || null
+          }
+        })
+        return handleCORS(NextResponse.json({
+          success: true,
+          event: result.event,
+          sync: result.sync
+        }))
+      } catch (error) {
+        console.error('Calendar create error:', error)
+        return handleCORS(NextResponse.json({
+          success: false,
+          error: String(error?.message || 'Failed to create calendar event')
+        }, { status: 400 }))
+      }
+    }
+
+    if (route === '/calendar/update' && method === 'POST') {
+      try {
+        const auth = getRequestAuthContext(request)
+        const body = await request.json().catch(() => ({}))
+        const eventId = String(body?.event_id || '').trim()
+        if (!eventId) {
+          return handleCORS(NextResponse.json({
+            success: false,
+            error: 'event_id is required'
+          }, { status: 400 }))
+        }
+        const calendarService = new CalendarService({ db, logger: console })
+        const result = await calendarService.updateEvent({
+          userKey: auth.userKey,
+          eventId,
+          updates: {
+            title: body?.title,
+            description: body?.description,
+            location: body?.location,
+            attendees: body?.attendees,
+            start_time: body?.start_time,
+            end_time: body?.end_time
+          }
+        })
+        return handleCORS(NextResponse.json({
+          success: true,
+          event: result.event,
+          sync: result.sync
+        }))
+      } catch (error) {
+        console.error('Calendar update error:', error)
+        const status = /not found/i.test(String(error?.message || '')) ? 404 : 400
+        return handleCORS(NextResponse.json({
+          success: false,
+          error: String(error?.message || 'Failed to update calendar event')
+        }, { status }))
+      }
+    }
+
+    if (route === '/calendar/delete' && method === 'POST') {
+      try {
+        const auth = getRequestAuthContext(request)
+        const body = await request.json().catch(() => ({}))
+        const eventId = String(body?.event_id || '').trim()
+        if (!eventId) {
+          return handleCORS(NextResponse.json({
+            success: false,
+            error: 'event_id is required'
+          }, { status: 400 }))
+        }
+        const calendarService = new CalendarService({ db, logger: console })
+        const result = await calendarService.deleteEvent({
+          userKey: auth.userKey,
+          eventId
+        })
+        return handleCORS(NextResponse.json({
+          success: true,
+          event: result.event,
+          sync: result.sync
+        }))
+      } catch (error) {
+        console.error('Calendar delete error:', error)
+        const status = /not found/i.test(String(error?.message || '')) ? 404 : 400
+        return handleCORS(NextResponse.json({
+          success: false,
+          error: String(error?.message || 'Failed to delete calendar event')
+        }, { status }))
+      }
+    }
+
+    // GOOGLE CALENDAR OAUTH
+    if (route === '/google/status' && method === 'GET') {
+      try {
+        const payload = await getCalendarStatusPayload(db, request)
+        const googleStatus = Array.isArray(payload?.providers)
+          ? payload.providers.find((entry) => entry.provider === CALENDAR_PROVIDER_GOOGLE)
+          : null
+        return handleCORS(NextResponse.json({
+          success: true,
+          configured: Boolean(googleStatus?.configured),
+          connected: Boolean(googleStatus?.connected),
+          connected_email: googleStatus?.connected_email || null,
+          expires_at: googleStatus?.expires_at || null,
+          has_refresh_token: Boolean(googleStatus?.has_refresh_token),
+          provider: CALENDAR_PROVIDER_GOOGLE
+        }))
+      } catch (error) {
+        console.error('Google status error:', error)
+        return handleCORS(NextResponse.json({
+          success: false,
+          error: 'Failed to fetch Google Calendar status'
+        }, { status: 500 }))
+      }
+    }
+
+    if (route === '/google/connect' && method === 'GET') {
+      return startCalendarConnectFlow(request, CALENDAR_PROVIDER_GOOGLE)
+    }
+
+    if (route === '/google/callback' && method === 'GET') {
+      return finishCalendarConnectFlow({ db, request, providerId: CALENDAR_PROVIDER_GOOGLE })
+    }
+
+    if (route === '/google/disconnect' && method === 'POST') {
+      try {
+        const auth = getRequestAuthContext(request)
+        await markCalendarEventsAsProviderDisconnected(db, {
+          userKey: auth.userKey,
+          provider: CALENDAR_PROVIDER_GOOGLE
+        })
+        await deleteCalendarConnection(db, auth.userKey, CALENDAR_PROVIDER_GOOGLE)
+        return handleCORS(NextResponse.json({
+          success: true
+        }))
+      } catch (error) {
+        console.error('Google disconnect error:', error)
+        return handleCORS(NextResponse.json({
+          success: false,
+          error: 'Failed to disconnect Google Calendar'
+        }, { status: 500 }))
+      }
     }
 
     // LEADS ENDPOINTS
@@ -4330,6 +7902,7 @@ function heuristicAssistantParse(message = '') {
     if (route === '/transactions' && method === 'POST') {
       try {
         const body = await request.json()
+        const closingDate = toDateOnlyString(body?.closing_date)
         
         if (!body.property_address || !body.client_name) {
           return handleCORS(NextResponse.json({
@@ -4351,7 +7924,7 @@ function heuristicAssistantParse(message = '') {
           assigned_agent: body.assigned_agent,
           listing_price: body.listing_price,
           contract_price: body.contract_price,
-          closing_date: body.closing_date,
+          closing_date: closingDate,
           created_at: new Date(),
           updated_at: new Date(),
           stage_history: [{
@@ -4366,10 +7939,101 @@ function heuristicAssistantParse(message = '') {
         // Create default checklist items for the initial stage
         await createDefaultChecklistItems(db, transaction.id, initialStage, txType)
 
+        let calendarSync = baseCalendarSyncResult({
+          reason: 'not_attempted',
+          quick_add_url: null
+        })
+        if (closingDate) {
+          try {
+            const auth = getRequestAuthContext(request)
+            const calendarService = new CalendarService({ db, logger: console })
+            const endDate = addDaysToDateOnly(closingDate, 1) || closingDate
+            const createResult = await calendarService.createEvent({
+              userKey: auth.userKey,
+              event: {
+                title: buildTransactionCalendarSummary(transaction),
+                description: buildTransactionCalendarDetails(transaction),
+                location: transaction?.property_address || '',
+                attendees: transaction?.client_email
+                  ? [{ email: String(transaction.client_email).trim().toLowerCase(), name: transaction?.client_name || '' }]
+                  : [],
+                start_time: `${closingDate}T00:00:00.000Z`,
+                end_time: `${endDate}T00:00:00.000Z`
+              },
+              source: {
+                type: 'transaction',
+                id: transaction.id,
+                transaction_id: transaction.id
+              }
+            })
+
+            const providerResult = createResult?.sync?.provider
+              ? [{
+                  provider: createResult.sync.provider,
+                  attempted: Boolean(createResult.sync.attempted),
+                  success: Boolean(createResult.sync.success),
+                  reason: createResult.sync.reason || null,
+                  error: createResult.sync.error || null,
+                  event_id: createResult?.event?.external_event_id || null,
+                  event_link: createResult?.event?.external_event_link || null
+                }]
+              : []
+            const fallbackQuickAddUrl = buildProviderQuickAddUrl(
+              createResult?.sync?.provider || null,
+              transaction,
+              closingDate
+            )
+
+            calendarSync = baseCalendarSyncResult({
+              attempted: Boolean(createResult?.sync?.attempted),
+              connected: Boolean(createResult?.sync?.connected),
+              success: Boolean(createResult?.sync?.success),
+              reason: createResult?.sync?.reason || 'sync_not_attempted',
+              providers: providerResult,
+              event_link: createResult?.event?.external_event_link || null,
+              error: createResult?.sync?.error || null,
+              quick_add_url: createResult?.sync?.success ? null : fallbackQuickAddUrl
+            })
+          } catch (calendarError) {
+            console.error('Transaction calendar sync error:', calendarError)
+            calendarSync = baseCalendarSyncResult({
+              attempted: true,
+              connected: true,
+              reason: 'unexpected_error',
+              error: String(calendarError?.message || 'Unexpected calendar sync error'),
+              quick_add_url: null
+            })
+          }
+        }
+
         const { _id, ...cleanedTransaction } = transaction
+        const googleProviderResult = Array.isArray(calendarSync?.providers)
+          ? calendarSync.providers.find((entry) => entry.provider === CALENDAR_PROVIDER_GOOGLE)
+          : null
+        const legacyGoogleResult = googleProviderResult
+          ? {
+              attempted: Boolean(googleProviderResult.attempted),
+              connected: true,
+              success: Boolean(googleProviderResult.success),
+              reason: googleProviderResult.reason || null,
+              error: googleProviderResult.error || null,
+              event_id: googleProviderResult.event_id || null,
+              event_link: googleProviderResult.event_link || null,
+              quick_add_url: googleProviderResult.quick_add_url || null
+            }
+          : {
+              attempted: false,
+              connected: false,
+              success: false,
+              reason: 'provider_not_connected',
+              quick_add_url: calendarSync?.quick_add_url || null
+            }
         return handleCORS(NextResponse.json({
           success: true,
-          transaction: cleanedTransaction
+          transaction: cleanedTransaction,
+          calendar: calendarSync,
+          google_calendar: legacyGoogleResult,
+          quick_add_url: calendarSync?.quick_add_url || null
         }, { status: 201 }))
       } catch (error) {
         console.error('Error creating transaction:', error)
@@ -4419,6 +8083,9 @@ function heuristicAssistantParse(message = '') {
         }
         delete updateData.id
         delete updateData.created_at
+        if (Object.prototype.hasOwnProperty.call(updateData, 'closing_date')) {
+          updateData.closing_date = toDateOnlyString(updateData.closing_date)
+        }
 
         const result = await db.collection('transactions').updateOne(
           { id: transactionId },
@@ -4434,10 +8101,25 @@ function heuristicAssistantParse(message = '') {
 
         const updatedTransaction = await db.collection('transactions').findOne({ id: transactionId })
         const { _id, ...cleanedTransaction } = updatedTransaction
+        let calendarSync = baseCalendarSyncResult({
+          reason: 'not_attempted'
+        })
+        try {
+          calendarSync = await syncTransactionCalendarUpsert({ db, request, transaction: updatedTransaction })
+        } catch (calendarError) {
+          console.error('Transaction calendar update sync error:', calendarError)
+          calendarSync = baseCalendarSyncResult({
+            attempted: true,
+            connected: true,
+            reason: 'unexpected_error',
+            error: String(calendarError?.message || 'Unexpected calendar sync error')
+          })
+        }
         
         return handleCORS(NextResponse.json({
           success: true,
-          transaction: cleanedTransaction
+          transaction: cleanedTransaction,
+          calendar: calendarSync
         }))
       } catch (error) {
         console.error('Error updating transaction:', error)
@@ -4452,6 +8134,28 @@ function heuristicAssistantParse(message = '') {
     if (route.match(/^\/transactions\/[^\/]+$/) && method === 'DELETE') {
       try {
         const transactionId = path[1]
+        const existing = await db.collection('transactions').findOne({ id: transactionId })
+        if (!existing) {
+          return handleCORS(NextResponse.json({
+            success: false,
+            error: "Transaction not found"
+          }, { status: 404 }))
+        }
+
+        let calendarSync = baseCalendarSyncResult({
+          reason: 'not_attempted'
+        })
+        try {
+          calendarSync = await syncTransactionCalendarDelete({ db, request, transactionId })
+        } catch (calendarError) {
+          console.error('Transaction calendar delete sync error:', calendarError)
+          calendarSync = baseCalendarSyncResult({
+            attempted: true,
+            connected: true,
+            reason: 'unexpected_error',
+            error: String(calendarError?.message || 'Unexpected calendar delete sync error')
+          })
+        }
 
         const result = await db.collection('transactions').deleteOne({ id: transactionId })
 
@@ -4464,11 +8168,17 @@ function heuristicAssistantParse(message = '') {
 
         // Also delete related checklist items
         const checklistResult = await db.collection('checklist_items').deleteMany({ transaction_id: transactionId })
+        const auth = getRequestAuthContext(request)
+        await deleteCalendarEventRecordsByQuery(db, {
+          user_id: normalizeUserKey(auth.userKey),
+          transaction_id: String(transactionId)
+        })
 
         return handleCORS(NextResponse.json({
           success: true,
           message: "Transaction deleted successfully",
-          deleted_checklist_items: checklistResult?.deletedCount || 0
+          deleted_checklist_items: checklistResult?.deletedCount || 0,
+          calendar: calendarSync
         }))
       } catch (error) {
         console.error('Error deleting transaction:', error)
@@ -6457,6 +10167,17 @@ function heuristicAssistantParse(message = '') {
     ))
 
   } catch (error) {
+    const code = String(error?.code || '')
+    if (code === 'DB_CONFIG_MISSING' || code === 'DB_CONNECT_FAILED') {
+      return handleCORS(NextResponse.json(
+        {
+          error: String(error?.message || 'Database unavailable'),
+          code,
+          db: getDbRuntimeStatus()
+        },
+        { status: 503 }
+      ))
+    }
     console.error('API Error:', error)
     return handleCORS(NextResponse.json(
       { error: "Internal server error" }, 

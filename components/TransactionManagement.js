@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -18,6 +18,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { ToastAction } from '@/components/ui/toast'
 import { toast } from '@/hooks/use-toast'
 import { 
   Plus, 
@@ -35,6 +36,7 @@ import {
 } from 'lucide-react'
 import { TransactionTimeline } from '@/components/TransactionTimeline'
 import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/components/ui/tooltip'
+import { useAuth } from '@/components/auth/CognitoAuthProvider'
 
 // Stage configurations for seller (sale) and buyer (purchase)
 const STAGE_CONFIGS = {
@@ -58,7 +60,42 @@ const formatStageLabel = (stage = '') =>
     .replace(/_/g, ' ')
     .replace(/\b\w/g, (c) => c.toUpperCase())
 
+const CALENDAR_PROVIDER_OPTIONS = [
+  { id: 'google', label: 'Google Calendar' },
+  { id: 'outlook', label: 'Outlook Calendar' }
+]
+
+const CALENDAR_PROVIDER_LABELS = {
+  google: 'Google Calendar',
+  outlook: 'Outlook Calendar'
+}
+
+const getCalendarProviderLabel = (providerId = '') => CALENDAR_PROVIDER_LABELS[String(providerId || '').toLowerCase()] || 'Calendar'
+const PENDING_CALENDAR_TRANSACTION_KEY = 'crm.pending_calendar_transaction_create'
+
+const GOOGLE_EMAIL_DOMAINS = new Set(['gmail.com', 'googlemail.com'])
+const OUTLOOK_EMAIL_DOMAINS = new Set([
+  'outlook.com',
+  'hotmail.com',
+  'live.com',
+  'msn.com',
+  'office365.com',
+  'microsoft.com'
+])
+
+const getRecommendedProviderFromEmail = (email = '') => {
+  const normalizedEmail = String(email || '').trim().toLowerCase()
+  const domain = normalizedEmail.includes('@') ? normalizedEmail.split('@')[1] : ''
+  if (!domain) return null
+  if (GOOGLE_EMAIL_DOMAINS.has(domain)) return 'google'
+  if (OUTLOOK_EMAIL_DOMAINS.has(domain)) return 'outlook'
+  return null
+}
+
+const OUTLOOK_CALENDAR_FALLBACK_URL = 'https://outlook.live.com/calendar/view/workweek'
+
 export function TransactionManagement() {
+  const { userEmail, isSignedIn, loading: authLoading } = useAuth()
   const [transactions, setTransactions] = useState([])
   const [filteredTransactions, setFilteredTransactions] = useState([])
   const [selectedTransaction, setSelectedTransaction] = useState(null)
@@ -69,6 +106,19 @@ export function TransactionManagement() {
   const [stageFilter, setStageFilter] = useState('all')
   const [deleteDialog, setDeleteDialog] = useState({ open: false, tx: null })
   const [deleting, setDeleting] = useState(false)
+  const [calendarStatus, setCalendarStatus] = useState({
+    loading: true,
+    providers: [],
+    configured: false,
+    connected: false,
+    connected_providers: [],
+    configured_providers: [],
+    byProvider: {}
+  })
+  const [isCalendarConnectDialogOpen, setIsCalendarConnectDialogOpen] = useState(false)
+  const [calendarActionLoading, setCalendarActionLoading] = useState(false)
+  const [calendarConnectReason, setCalendarConnectReason] = useState('manual')
+  const connectRedirectingRef = useRef(false)
 
   const [newTransaction, setNewTransaction] = useState({
     property_address: '',
@@ -84,6 +134,11 @@ export function TransactionManagement() {
   useEffect(() => {
     fetchTransactions()
   }, [])
+
+  useEffect(() => {
+    if (authLoading) return
+    fetchCalendarStatus()
+  }, [authLoading, isSignedIn, userEmail])
 
   useEffect(() => {
     filterTransactions()
@@ -122,6 +177,86 @@ export function TransactionManagement() {
     window.addEventListener('crm:focus-task', handleFocusTask)
     return () => window.removeEventListener('crm:focus-task', handleFocusTask)
   }, [transactions])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+
+    const parsePendingCalendarTransaction = () => {
+      try {
+        const raw = window.sessionStorage.getItem(PENDING_CALENDAR_TRANSACTION_KEY)
+        if (!raw) return null
+        const parsed = JSON.parse(raw)
+        if (!parsed || typeof parsed !== 'object') return null
+        if (!parsed.transaction || typeof parsed.transaction !== 'object') return null
+        return parsed
+      } catch {
+        return null
+      }
+    }
+
+    const clearPendingCalendarTransaction = () => {
+      window.sessionStorage.removeItem(PENDING_CALENDAR_TRANSACTION_KEY)
+    }
+
+    const run = async () => {
+      const url = new URL(window.location.href)
+      const flag = url.searchParams.get('calendar') || url.searchParams.get('google_calendar')
+      const provider = String(url.searchParams.get('calendar_provider') || '').toLowerCase()
+      const providerLabel = provider ? getCalendarProviderLabel(provider) : 'Calendar'
+      const shouldContinuePending = url.searchParams.get('calendar_continue') === 'transaction_create'
+      if (!flag) return
+
+      if (flag === 'connected') {
+        toast({
+          title: `${providerLabel} connected`,
+          description: 'New transactions with a closing date will be synced automatically.'
+        })
+        setIsCalendarConnectDialogOpen(false)
+        await fetchCalendarStatus()
+        let resumedPendingCreate = false
+        if (shouldContinuePending) {
+          const pending = parsePendingCalendarTransaction()
+          if (pending?.transaction) {
+            resumedPendingCreate = true
+            await createTransaction(pending.transaction, { skipConnectionGate: true, isRetry: true })
+          }
+        }
+        if (!resumedPendingCreate) {
+          clearPendingCalendarTransaction()
+        }
+      } else if (flag === 'missing_config') {
+        toast({
+          title: `${providerLabel} is not configured`,
+          description: 'Configure calendar OAuth environment variables in `.env.local`.'
+        })
+      } else if (flag === 'oauth_denied') {
+        toast({
+          title: `${providerLabel} access was denied`,
+          description: 'Authorize access to enable calendar sync.'
+        })
+      } else if (flag === 'connect_failed') {
+        const errorMsg = url.searchParams.get('calendar_error') || url.searchParams.get('google_error') || 'Calendar OAuth callback failed.'
+        toast({
+          title: `${providerLabel} connection failed`,
+          description: errorMsg
+        })
+      }
+
+      if (flag !== 'connected') {
+        clearPendingCalendarTransaction()
+      }
+
+      url.searchParams.delete('calendar')
+      url.searchParams.delete('calendar_provider')
+      url.searchParams.delete('calendar_error')
+      url.searchParams.delete('google_calendar')
+      url.searchParams.delete('google_error')
+      url.searchParams.delete('calendar_continue')
+      window.history.replaceState({}, document.title, `${url.pathname}${url.search}${url.hash}`)
+    }
+
+    run()
+  }, [])
 
   const fetchTransactions = async () => {
     setLoading(true)
@@ -194,6 +329,186 @@ export function TransactionManagement() {
     setLoading(false)
   }
 
+  const applyCalendarStatusPayload = (data = {}) => {
+    const providers = Array.isArray(data?.providers) ? data.providers : []
+    const byProvider = providers.reduce((acc, item) => {
+      if (item?.provider) acc[item.provider] = item
+      return acc
+    }, {})
+
+    const nextState = {
+      loading: false,
+      providers,
+      configured: Boolean(data?.configured || providers.some((item) => item?.configured)),
+      connected: Boolean(data?.connected || providers.some((item) => item?.connected)),
+      connected_providers: Array.isArray(data?.connected_providers)
+        ? data.connected_providers
+        : providers.filter((item) => item?.connected).map((item) => item.provider),
+      configured_providers: Array.isArray(data?.configured_providers)
+        ? data.configured_providers
+        : providers.filter((item) => item?.configured).map((item) => item.provider),
+      byProvider
+    }
+    setCalendarStatus(nextState)
+    return nextState
+  }
+
+  const savePendingCalendarTransaction = (transactionPayload = {}) => {
+    if (typeof window === 'undefined') return
+    const payload = {
+      transaction: transactionPayload,
+      created_at: Date.now()
+    }
+    window.sessionStorage.setItem(PENDING_CALENDAR_TRANSACTION_KEY, JSON.stringify(payload))
+  }
+
+  const loadPendingCalendarTransaction = () => {
+    if (typeof window === 'undefined') return null
+    try {
+      const raw = window.sessionStorage.getItem(PENDING_CALENDAR_TRANSACTION_KEY)
+      if (!raw) return null
+      const parsed = JSON.parse(raw)
+      if (!parsed || typeof parsed !== 'object') return null
+      if (!parsed.transaction || typeof parsed.transaction !== 'object') return null
+      return parsed
+    } catch {
+      return null
+    }
+  }
+
+  const clearPendingCalendarTransaction = () => {
+    if (typeof window === 'undefined') return
+    window.sessionStorage.removeItem(PENDING_CALENDAR_TRANSACTION_KEY)
+  }
+
+  const fetchCalendarStatus = async () => {
+    try {
+      const response = await fetch('/api/calendar/status')
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok || !data?.success) {
+        throw new Error(data?.error || 'Failed to load calendar status')
+      }
+      return applyCalendarStatusPayload(data)
+    } catch (error) {
+      console.error('Error fetching calendar status:', error)
+      const fallback = {
+        loading: false,
+        providers: [],
+        configured: false,
+        connected: false,
+        connected_providers: [],
+        configured_providers: [],
+        byProvider: {}
+      }
+      setCalendarStatus(fallback)
+      return fallback
+    }
+  }
+
+  const handleCalendarConnectDialogChange = (open) => {
+    setIsCalendarConnectDialogOpen(open)
+    if (open) return
+
+    if (!connectRedirectingRef.current && calendarConnectReason === 'event_create') {
+      clearPendingCalendarTransaction()
+    }
+
+    connectRedirectingRef.current = false
+    setCalendarActionLoading(false)
+    setCalendarConnectReason('manual')
+  }
+
+  const connectCalendarWithProvider = (provider = 'outlook') => {
+    const normalizedProvider = String(provider || '').trim().toLowerCase()
+    if (!['google', 'outlook'].includes(normalizedProvider)) return
+    const providerLabel = getCalendarProviderLabel(normalizedProvider)
+    if (!userEmail) {
+      toast({
+        title: 'Sign in required',
+        description: `Please sign in before connecting ${providerLabel}.`
+      })
+      return
+    }
+
+    const pending = loadPendingCalendarTransaction()
+    const returnTo = pending?.transaction
+      ? '/?tab=transactions&calendar_continue=transaction_create'
+      : '/?tab=transactions'
+
+    connectRedirectingRef.current = true
+    setCalendarActionLoading(true)
+    setIsCalendarConnectDialogOpen(false)
+    const params = new URLSearchParams({
+      provider: normalizedProvider,
+      returnTo,
+      user_key: String(userEmail || '').trim().toLowerCase() || 'anonymous'
+    })
+    window.location.href = `/api/calendar/connect?${params.toString()}`
+  }
+
+  const openCalendarConnectDialog = () => {
+    if (!userEmail) {
+      toast({
+        title: 'Sign in required',
+        description: 'Please sign in before connecting a calendar.'
+      })
+      return
+    }
+    clearPendingCalendarTransaction()
+    setCalendarConnectReason('manual')
+    setIsCalendarConnectDialogOpen(true)
+  }
+
+  const requireCalendarConnectionForTransaction = (transactionPayload = {}) => {
+    if (!userEmail) {
+      toast({
+        title: 'Sign in required',
+        description: 'Please sign in before connecting a calendar.'
+      })
+      return false
+    }
+
+    savePendingCalendarTransaction(transactionPayload)
+    setIsAddDialogOpen(false)
+    setCalendarConnectReason('event_create')
+    setIsCalendarConnectDialogOpen(true)
+    toast({
+      title: 'Connect your calendar',
+      description: 'To sync this event, please connect your calendar.'
+    })
+    return true
+  }
+
+  const disconnectCalendar = async () => {
+    const connectedProvider = Array.isArray(calendarStatus.connected_providers) && calendarStatus.connected_providers.length > 0
+      ? calendarStatus.connected_providers[0]
+      : null
+    const providerLabel = getCalendarProviderLabel(connectedProvider || '')
+    setCalendarActionLoading(true)
+    try {
+      const response = await fetch('/api/calendar/disconnect', {
+        method: 'POST'
+      })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok || !data?.success) {
+        throw new Error(data?.error || 'Failed to disconnect calendar')
+      }
+
+      toast({
+        title: `${providerLabel} disconnected`,
+        description: 'Future transactions will not be synced until you reconnect.'
+      })
+      applyCalendarStatusPayload(data)
+    } catch (error) {
+      toast({
+        title: 'Disconnect failed',
+        description: error.message || 'Please try again.'
+      })
+    } finally {
+      setCalendarActionLoading(false)
+    }
+  }
+
   const filterTransactions = () => {
     let filtered = transactions
 
@@ -216,9 +531,26 @@ export function TransactionManagement() {
     setFilteredTransactions(filtered)
   }
 
-  const createTransaction = async () => {
-    if (!newTransaction.property_address || !newTransaction.client_name) {
+  const createTransaction = async (transactionPayload = newTransaction, options = {}) => {
+    const isClickEventPayload = Boolean(
+      transactionPayload &&
+      typeof transactionPayload === 'object' &&
+      (typeof transactionPayload.preventDefault === 'function' || transactionPayload?.nativeEvent)
+    )
+    const sourcePayload = isClickEventPayload ? newTransaction : transactionPayload
+    const payload = {
+      ...sourcePayload,
+      closing_date: sourcePayload?.closing_date || ''
+    }
+
+    if (!payload.property_address || !payload.client_name) {
       alert('Property address and client name are required')
+      return
+    }
+
+    const selectedClosingDate = payload.closing_date
+    if (selectedClosingDate && !calendarStatus.connected && !options?.skipConnectionGate) {
+      requireCalendarConnectionForTransaction(payload)
       return
     }
 
@@ -227,13 +559,14 @@ export function TransactionManagement() {
       const response = await fetch('/api/transactions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newTransaction)
+        body: JSON.stringify(payload)
       })
 
-      const data = await response.json()
-      if (data.success) {
-        const createdTx = data.transaction || {}
-        setTransactions([{ ...createdTx, open_stages: createdTx.current_stage ? [createdTx.current_stage] : [] }, ...transactions])
+        const data = await response.json()
+        if (data.success) {
+          const createdTx = data.transaction || {}
+          clearPendingCalendarTransaction()
+        setTransactions((prev) => [{ ...createdTx, open_stages: createdTx.current_stage ? [createdTx.current_stage] : [] }, ...prev])
         setNewTransaction({
           property_address: '',
           client_name: '',
@@ -245,14 +578,90 @@ export function TransactionManagement() {
           closing_date: ''
         })
         setIsAddDialogOpen(false)
+
+        const calendarResult = data.calendar || data.google_calendar || null
+        const responseQuickAddUrl = String(data?.quick_add_url || calendarResult?.quick_add_url || '').trim() || null
+        const providerResults = Array.isArray(calendarResult?.providers) ? calendarResult.providers : []
+        const successfulProviders = providerResults.filter((entry) => entry?.success)
+        const attemptedOutlook =
+          providerResults.some((entry) => String(entry?.provider || '').toLowerCase() === 'outlook') ||
+          (Array.isArray(calendarStatus.connected_providers) &&
+            calendarStatus.connected_providers.some((entry) => String(entry || '').toLowerCase() === 'outlook'))
+        const successfulProviderNames = successfulProviders
+          .map((entry) => getCalendarProviderLabel(entry.provider))
+          .filter(Boolean)
+        const firstEventLink = successfulProviders.find((entry) => entry?.event_link)?.event_link || calendarResult?.event_link || null
+        const manualQuickAddUrl = selectedClosingDate ? responseQuickAddUrl : null
+
+        if (calendarResult?.success && successfulProviders.length > 0) {
+          toast({
+            title: 'Transaction created and synced',
+            description: successfulProviderNames.length > 0
+              ? `Closing date was added to ${successfulProviderNames.join(', ')}.`
+              : 'Closing date was synced to connected calendars.',
+            action: firstEventLink ? (
+              <ToastAction
+                altText="Open calendar event"
+                onClick={() => window.open(firstEventLink, '_blank', 'noopener,noreferrer')}
+              >
+                View Event
+              </ToastAction>
+            ) : undefined
+          })
+        } else if (calendarResult?.partial_success && successfulProviders.length > 0) {
+          toast({
+            title: 'Transaction created, calendar partially synced',
+            description: successfulProviderNames.length > 0
+              ? `Synced to ${successfulProviderNames.join(', ')}. ${calendarResult?.error || ''}`.trim()
+              : (calendarResult?.error || 'Some calendar providers could not be synced.')
+          })
+        } else if (selectedClosingDate && manualQuickAddUrl) {
+          if (manualQuickAddUrl) {
+            console.log('OUTLOOK URL:', manualQuickAddUrl)
+            window.open(manualQuickAddUrl, '_blank', 'noopener,noreferrer')
+          }
+          toast({
+            title: calendarResult?.attempted ? 'Transaction created, calendar sync failed' : 'Transaction created',
+            description: calendarResult?.attempted
+              ? (calendarResult?.error || 'Calendar page opened. Save the event to confirm.')
+              : 'Calendar page opened. Save the event to confirm.',
+            action: (
+              <ToastAction
+                altText="Add closing date to calendar"
+                onClick={() => window.open(manualQuickAddUrl, '_blank', 'noopener,noreferrer')}
+              >
+                Add to Calendar
+              </ToastAction>
+            )
+          })
+        } else if (selectedClosingDate && calendarResult?.attempted && !calendarResult?.success) {
+          if (attemptedOutlook) {
+            window.open(OUTLOOK_CALENDAR_FALLBACK_URL, '_blank', 'noopener,noreferrer')
+          }
+          toast({
+            title: 'Transaction created, calendar sync failed',
+            description: calendarResult?.error || 'Please reconnect your calendar and try again.'
+          })
+        } else if (selectedClosingDate && !calendarResult?.success) {
+          if (attemptedOutlook) {
+            window.open(OUTLOOK_CALENDAR_FALLBACK_URL, '_blank', 'noopener,noreferrer')
+          }
+          toast({
+            title: 'Transaction created',
+            description: 'Calendar sync is pending. Reconnect your calendar to sync this closing date.'
+          })
+        }
       } else {
+        if (options?.isRetry) clearPendingCalendarTransaction()
         alert(data.error || 'Failed to create transaction')
       }
     } catch (error) {
+      if (options?.isRetry) clearPendingCalendarTransaction()
       console.error('Error creating transaction:', error)
       alert('Failed to create transaction')
+    } finally {
+      setLoading(false)
     }
-    setLoading(false)
   }
 
   const formatCurrency = (amount) => {
@@ -320,6 +729,30 @@ export function TransactionManagement() {
     return Array.from(scoped).sort((a, b) => getStageOrder(a, txType) - getStageOrder(b, txType))
   }
 
+  const providerOptions = Array.isArray(calendarStatus.providers) && calendarStatus.providers.length > 0
+    ? calendarStatus.providers.map((entry) => ({
+      id: entry.provider,
+      label: getCalendarProviderLabel(entry.provider),
+      configured: Boolean(entry.configured),
+      connected: Boolean(entry.connected),
+      connected_email: entry.connected_email || null
+    }))
+    : CALENDAR_PROVIDER_OPTIONS.map((entry) => ({
+      ...entry,
+      configured: false,
+      connected: false,
+      connected_email: null
+    }))
+
+  const connectedProviderEntry = providerOptions.find((entry) => entry.connected) || null
+  const connectedProviderLabel = connectedProviderEntry?.label || 'Calendar'
+  const anyProviderConfigured = providerOptions.some((entry) => entry.configured)
+  const googleOption = providerOptions.find((entry) => entry.id === 'google') || { configured: false }
+  const outlookOption = providerOptions.find((entry) => entry.id === 'outlook') || { configured: false }
+  const recommendedProvider = getRecommendedProviderFromEmail(userEmail)
+  const googleRecommended = recommendedProvider === 'google'
+  const outlookRecommended = recommendedProvider === 'outlook'
+
   if (selectedTransaction) {
     return (
       <div className="space-y-6">
@@ -332,7 +765,7 @@ export function TransactionManagement() {
               await fetchTransactions()
             }}
           >
-            ← Back to Transactions
+            &lt;- Back to Transactions
           </Button>
           <h2 className="text-2xl font-bold">Transaction Timeline</h2>
         </div>
@@ -354,11 +787,91 @@ export function TransactionManagement() {
           <h2 className="text-2xl font-bold">Transaction Management</h2>
           <p className="text-muted-foreground">Manage your real estate transactions with timeline checklists</p>
         </div>
-        <Button onClick={() => setIsAddDialogOpen(true)}>
-          <Plus className="mr-2 h-4 w-4" />
-          New Transaction
-        </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant={calendarStatus.connected ? 'outline' : 'default'}
+            onClick={openCalendarConnectDialog}
+            disabled={
+              calendarStatus.loading ||
+              calendarActionLoading ||
+              !anyProviderConfigured ||
+              authLoading ||
+              !isSignedIn ||
+              !userEmail ||
+              calendarStatus.connected
+            }
+          >
+            <Calendar className="mr-2 h-4 w-4" />
+            {calendarStatus.connected ? `${connectedProviderLabel} Connected` : 'Connect Calendar'}
+          </Button>
+          {calendarStatus.connected && (
+            <Button
+              variant="ghost"
+              onClick={disconnectCalendar}
+              disabled={calendarActionLoading}
+            >
+              Disconnect
+            </Button>
+          )}
+          <Button onClick={() => setIsAddDialogOpen(true)}>
+            <Plus className="mr-2 h-4 w-4" />
+            New Transaction
+          </Button>
+        </div>
       </div>
+      {!calendarStatus.loading && !calendarStatus.configured && (
+        <p className="text-sm text-muted-foreground">
+          Calendar sync is disabled. Set Google (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`) and/or Microsoft (`MICROSOFT_CLIENT_ID`, `MICROSOFT_CLIENT_SECRET`, `MICROSOFT_TENANT`, `MICROSOFT_REDIRECT_URI`) variables in `.env.local`.
+        </p>
+      )}
+      {!calendarStatus.loading && calendarStatus.connected && (
+        <p className="text-sm text-muted-foreground">
+          Synced accounts: {providerOptions
+            .filter((entry) => entry.connected)
+            .map((entry) => `${entry.label}${entry.connected_email ? ` (${entry.connected_email})` : ''}`)
+            .join(' | ')}
+        </p>
+      )}
+      <Dialog open={isCalendarConnectDialogOpen} onOpenChange={handleCalendarConnectDialogChange}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Connect your calendar</DialogTitle>
+            <DialogDescription>
+              To sync this event, please connect your calendar
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <Button
+              className="w-full justify-start"
+              variant={googleRecommended ? 'default' : 'outline'}
+              onClick={() => connectCalendarWithProvider('google')}
+              disabled={calendarActionLoading || !googleOption.configured}
+            >
+              <span className="flex items-center justify-between w-full">
+                <span>Continue with Google</span>
+                {googleRecommended && <span className="text-xs opacity-80">Recommended</span>}
+              </span>
+            </Button>
+            {!googleOption.configured && (
+              <p className="text-xs text-muted-foreground">Google provider is not configured in environment variables.</p>
+            )}
+            <Button
+              className="w-full justify-start"
+              variant={outlookRecommended ? 'default' : 'outline'}
+              onClick={() => connectCalendarWithProvider('outlook')}
+              disabled={calendarActionLoading || !outlookOption.configured}
+            >
+              <span className="flex items-center justify-between w-full">
+                <span>Continue with Outlook</span>
+                {outlookRecommended && <span className="text-xs opacity-80">Recommended</span>}
+              </span>
+            </Button>
+            {!outlookOption.configured && (
+              <p className="text-xs text-muted-foreground">Microsoft provider is not configured in environment variables.</p>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* Search and Filters */}
       <div className="flex flex-col sm:flex-row gap-4">
@@ -627,7 +1140,7 @@ export function TransactionManagement() {
               Cancel
             </Button>
             <Button 
-              onClick={createTransaction} 
+              onClick={() => createTransaction()} 
               disabled={!newTransaction.property_address || !newTransaction.client_name || loading}
             >
               {loading ? 'Creating...' : 'Create Transaction'}

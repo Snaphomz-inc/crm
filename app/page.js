@@ -99,6 +99,15 @@ export default function RealEstateCRM() {
   })
 
   useEffect(() => {
+    if (typeof window === 'undefined') return
+    const params = new URLSearchParams(window.location.search)
+    const tab = String(params.get('tab') || '').trim()
+    if (['assistant', 'dashboard', 'transactions', 'properties'].includes(tab)) {
+      setActiveTab(tab)
+    }
+  }, [])
+
+  useEffect(() => {
     if (activeTab === 'dashboard') {
       fetchLeads()
       fetchDashboardStats()

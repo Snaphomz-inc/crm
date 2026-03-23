@@ -16,6 +16,8 @@ Create or edit `.env.local` in the project root:
 # Database (required)
 POSTGRES_URL=postgres://USER:PASSWORD@HOST:5432/DBNAME
 # You can use DATABASE_URL instead of POSTGRES_URL if preferred
+# Optional dev-only fallback (disabled by default)
+# DEV_IN_MEMORY_DB=true
 
 # Optional external URL (production)
 NEXT_PUBLIC_BASE_URL=https://your-domain.com
@@ -76,8 +78,9 @@ npm run start
 
 ## Troubleshooting
 
-1. `POSTGRES_URL or DATABASE_URL not configured`:
-   - Add `POSTGRES_URL` in `.env.local` and restart dev server.
+1. `Missing DATABASE_URL (or POSTGRES_URL)`:
+   - Add `POSTGRES_URL` (or `DATABASE_URL`) in `.env.local` and restart dev server.
+   - Use `DEV_IN_MEMORY_DB=true` only for temporary local development.
 2. `connect ECONNREFUSED ... 5432`:
    - Postgres is not running or host/port is wrong.
 3. RealEstateAPI `401 Unauthorized`:

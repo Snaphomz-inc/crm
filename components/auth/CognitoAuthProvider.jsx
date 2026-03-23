@@ -119,7 +119,9 @@ function patchFetchForApiAuth() {
       if (!isLocalApi) return originalFetch(input, init)
 
       const tokens = readStoredAuthTokens()
-      const bearer = tokens?.accessToken || tokens?.idToken
+      // Prefer ID token for local API calls because it reliably carries user email claims.
+      // Calendar/user records are keyed by normalized email in backend handlers.
+      const bearer = tokens?.idToken || tokens?.accessToken
       if (!bearer) return originalFetch(input, init)
 
       const mergedHeaders = new Headers(input instanceof Request ? input.headers : undefined)

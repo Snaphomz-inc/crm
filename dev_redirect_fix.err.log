@@ -1,0 +1,3 @@
+POSTGRES_URL or DATABASE_URL not set - using in-memory stub DB (development only).
+POSTGRES_URL or DATABASE_URL not set - using in-memory stub DB (development only).
+^C^C

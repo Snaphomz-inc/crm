@@ -736,7 +736,7 @@ export function TransactionTimeline({ transactionId, focusTaskId = null, focusSt
               </CardDescription>
             </div>
             <Badge variant="outline" className="text-lg px-3 py-1">
-              {stageConfig[activeStage]?.name}
+              {stageConfig[activeStage]?.name || activeStage}
             </Badge>
           </div>
         </CardHeader>
