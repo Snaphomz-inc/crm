@@ -3737,12 +3737,104 @@ async function sendNotificationRecordEmail(db, request, notification = {}, optio
   })
 }
 
+function getDaysUntilDateOnly(targetDateOnly, now = new Date()) {
+  const safeTarget = toDateOnlyString(targetDateOnly)
+  const safeToday = toDateOnlyString(now)
+  if (!safeTarget || !safeToday) return null
+  const targetMs = Date.parse(`${safeTarget}T00:00:00.000Z`)
+  const todayMs = Date.parse(`${safeToday}T00:00:00.000Z`)
+  if (!Number.isFinite(targetMs) || !Number.isFinite(todayMs)) return null
+  return Math.round((targetMs - todayMs) / (24 * 60 * 60 * 1000))
+}
+
+function resolveClosingReminderStage(daysToClosing) {
+  if (!Number.isFinite(daysToClosing)) return null
+  if (daysToClosing <= 0) return { key: 'd0', label: 'closing day', nextDays: null }
+  if (daysToClosing <= 1) return { key: 'd1', label: '1 day before', nextDays: 0 }
+  if (daysToClosing <= 3) return { key: 'd3', label: '3 days before', nextDays: 1 }
+  if (daysToClosing <= 7) return { key: 'd7', label: '1 week before', nextDays: 3 }
+  return { key: 'created', label: 'initial notice', nextDays: 7 }
+}
+
+function buildClosingReminderContent(alert = {}, closingDate, daysToClosing, stage) {
+  const address = String(alert?.property_address || 'this transaction').trim()
+  const safeDate = closingDate || 'the closing date'
+  const dayWord = (n) => `${n} day${n === 1 ? '' : 's'}`
+  let subject = '[Snaphomz] Closing reminder'
+  let message = `${address} has a closing milestone update.`
+
+  if (stage.key === 'created') {
+    subject = '[Snaphomz] Closing timeline started'
+    message = `${address} is scheduled to close on ${safeDate} (${dayWord(Math.max(0, daysToClosing))} left).`
+  } else if (stage.key === 'd7') {
+    subject = '[Snaphomz] Closing reminder: 1 week left'
+    message = `${address} is closing in ${dayWord(Math.max(0, daysToClosing))}.`
+  } else if (stage.key === 'd3') {
+    subject = '[Snaphomz] Closing reminder: 3 days left'
+    message = `${address} is closing in ${dayWord(Math.max(0, daysToClosing))}.`
+  } else if (stage.key === 'd1') {
+    subject = '[Snaphomz] Closing reminder: 1 day left'
+    message = `${address} is closing tomorrow (${safeDate}).`
+  } else if (stage.key === 'd0') {
+    subject = '[Snaphomz] Closing reminder: today'
+    message = `${address} is closing today (${safeDate}).`
+  }
+
+  if (stage.nextDays === null) {
+    message += ' This is the final reminder for this closing date.'
+  } else if (stage.nextDays === 0) {
+    message += ' Next reminder: on the day of closing.'
+  } else {
+    const nextDate = addDaysToDateOnly(closingDate, -stage.nextDays)
+    message += nextDate
+      ? ` Next reminder: ${dayWord(stage.nextDays)} before closing (${nextDate}).`
+      : ` Next reminder: ${dayWord(stage.nextDays)} before closing.`
+  }
+
+  return { subject, message }
+}
+
 async function sendSmartAlertEmail(db, request, alert = {}, options = {}) {
   const type = String(alert?.alert_type || 'general')
-  const title = String(alert?.title || 'Smart Alert').trim()
-  const message = String(alert?.message || '').trim() || 'You have a smart alert in CRM.'
-  const dedupeWindow = new Date().toISOString().slice(0, 10)
-  const dedupeKey = `smart_alert:${String(alert?.id || '')}:${dedupeWindow}`
+  let title = String(alert?.title || 'Smart Alert').trim()
+  let message = String(alert?.message || '').trim() || 'You have a smart alert in CRM.'
+  let dedupeKey = ''
+  let metadata = {
+    alert_id: alert?.id || null,
+    transaction_id: alert?.transaction_id || null,
+    alert_type: type
+  }
+
+  if (type === 'closing_approaching') {
+    const closingDate = toDateOnlyString(alert?.details?.closing_date || alert?.closing_date || '')
+    if (!closingDate) return { success: false, reason: 'missing_closing_date' }
+
+    let daysToClosing = Number(alert?.details?.days_to_closing)
+    if (!Number.isFinite(daysToClosing)) {
+      daysToClosing = getDaysUntilDateOnly(closingDate)
+    } else {
+      daysToClosing = Math.floor(daysToClosing)
+    }
+    if (!Number.isFinite(daysToClosing)) return { success: false, reason: 'missing_days_to_closing' }
+
+    const stage = resolveClosingReminderStage(daysToClosing)
+    if (!stage) return { success: false, reason: 'closing_stage_unresolved' }
+
+    const content = buildClosingReminderContent(alert, closingDate, daysToClosing, stage)
+    title = content.subject.replace(/^\[Snaphomz\]\s*/i, '')
+    message = content.message
+    dedupeKey = `smart_alert:closing:${String(alert?.transaction_id || alert?.id || 'unknown')}:${closingDate}:${stage.key}`
+    metadata = {
+      ...metadata,
+      closing_date: closingDate,
+      days_to_closing: daysToClosing,
+      reminder_stage: stage.key
+    }
+  } else {
+    const dedupeWindow = new Date().toISOString().slice(0, 10)
+    dedupeKey = `smart_alert:${String(alert?.id || '')}:${dedupeWindow}`
+  }
+
   return sendNotificationEmail({
     db,
     request,
@@ -3750,13 +3842,9 @@ async function sendSmartAlertEmail(db, request, alert = {}, options = {}) {
     notificationType: type,
     priority: String(alert?.priority || 'medium'),
     dedupeKey,
-    subject: `[Snaphomz] ${title}`,
+    subject: title.startsWith('[Snaphomz]') ? title : `[Snaphomz] ${title}`,
     message,
-    metadata: {
-      alert_id: alert?.id || null,
-      transaction_id: alert?.transaction_id || null,
-      alert_type: type
-    }
+    metadata
   })
 }
 
@@ -8480,6 +8568,44 @@ function heuristicAssistantParse(message = '') {
         // Create default checklist items for the initial stage
         await createDefaultChecklistItems(db, transaction.id, initialStage, txType)
 
+        // Create a user-scoped notification and attempt email delivery for transaction creation.
+        try {
+          const notif = {
+            id: uuidv4(),
+            type: 'transaction',
+            title: 'Transaction created',
+            message: `Created transaction for ${transaction.client_name || 'client'} at ${transaction.property_address || 'property'}.`,
+            meta: {
+              transaction_id: transaction.id,
+              transaction_type: transaction.transaction_type,
+              stage: transaction.current_stage,
+              priority: 'medium'
+            },
+            status: 'unread',
+            created_at: new Date(),
+            updated_at: new Date(),
+            snooze_until: null
+          }
+          await db.collection('notifications').insertOne(notif)
+          try {
+            const emailResult = await sendNotificationRecordEmail(db, request, notif)
+            if (!emailResult?.success) {
+              console.warn('Transaction notification email skipped:', emailResult?.reason || 'unknown_reason')
+            }
+          } catch (mailError) {
+            console.warn('Transaction notification email error:', mailError?.message || mailError)
+          }
+          try {
+            const g = globalThis
+            if (g.__crmSSE?.clients) {
+              const msg = (ev, data) => `event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`
+              for (const c of g.__crmSSE.clients) { try { c.enqueue(msg('notifications:changed', { action: 'created', id: notif.id })) } catch {} }
+            }
+          } catch (_) {}
+        } catch (notificationError) {
+          console.warn('Transaction notification create error:', notificationError?.message || notificationError)
+        }
+
         let calendarSync = baseCalendarSyncResult({
           reason: 'not_attempted',
           quick_add_url: null
@@ -9580,6 +9706,18 @@ function heuristicAssistantParse(message = '') {
         }
         
         const alertsResult = await getSmartAlerts(db, filters)
+        if (alertsResult?.success && Array.isArray(alertsResult.alerts) && alertsResult.alerts.length) {
+          try {
+            const closingAlerts = alertsResult.alerts.filter(
+              (alert) => String(alert?.alert_type || '').toLowerCase() === 'closing_approaching'
+            )
+            if (closingAlerts.length) {
+              await Promise.allSettled(
+                closingAlerts.map((alert) => sendSmartAlertEmail(db, request, alert))
+              )
+            }
+          } catch (_) {}
+        }
         return handleCORS(NextResponse.json(alertsResult))
       } catch (error) {
         console.error('Smart alerts error:', error)
