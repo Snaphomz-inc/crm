@@ -53,6 +53,8 @@ export default function RealEstateCRM() {
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false)
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
   const [selectedLead, setSelectedLead] = useState(null)
+  const [leadMatchesDialogLead, setLeadMatchesDialogLead] = useState(null)
+  const [removingPropertyKey, setRemovingPropertyKey] = useState(null)
   const [dashboardStats, setDashboardStats] = useState({})
   const [loading, setLoading] = useState(false)
   const [propertyMatches, setPropertyMatches] = useState(null)
@@ -300,6 +302,79 @@ export default function RealEstateCRM() {
     setLoading(false)
   }
 
+  const openLeadEditor = async (lead) => {
+    if (!lead?.id) {
+      setSelectedLead(lead || null)
+      setIsEditDialogOpen(true)
+      return
+    }
+
+    try {
+      const response = await fetch(`/api/leads/${lead.id}`)
+      if (response.ok) {
+        const latestLead = await response.json()
+        setSelectedLead(latestLead)
+      } else {
+        setSelectedLead(lead)
+      }
+    } catch (error) {
+      console.error('Error loading lead details:', error)
+      setSelectedLead(lead)
+    }
+    setIsEditDialogOpen(true)
+  }
+
+  const openLeadMatchesDialog = async (lead) => {
+    if (!lead?.id) return
+    try {
+      const response = await fetch(`/api/leads/${lead.id}`)
+      if (response.ok) {
+        const latestLead = await response.json()
+        setLeadMatchesDialogLead(latestLead)
+      } else {
+        setLeadMatchesDialogLead(lead)
+      }
+    } catch (error) {
+      console.error('Error loading potential matches:', error)
+      setLeadMatchesDialogLead(lead)
+    }
+  }
+
+  const removePropertyFromLead = async (lead, propertyIndex) => {
+    if (!lead?.id) return
+    const current = Array.isArray(lead.interested_properties) ? lead.interested_properties : []
+    if (propertyIndex < 0 || propertyIndex >= current.length) return
+
+    const property = current[propertyIndex] || {}
+    const propertyName = property?.address || 'this property'
+    const confirmed = window.confirm(`Remove "${propertyName}" from ${lead.name}'s saved properties?`)
+    if (!confirmed) return
+
+    const nextProperties = current.filter((_, idx) => idx !== propertyIndex)
+    const key = `${lead.id}:${propertyIndex}`
+    setRemovingPropertyKey(key)
+    try {
+      const response = await fetch(`/api/leads/${lead.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ interested_properties: nextProperties })
+      })
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}))
+        throw new Error(err?.error || `Failed to remove property (${response.status})`)
+      }
+      const updatedLead = await response.json()
+      setLeadMatchesDialogLead(updatedLead)
+      setLeads(prev => prev.map(l => l.id === updatedLead.id ? updatedLead : l))
+      setSelectedLead(prev => (prev?.id === updatedLead.id ? updatedLead : prev))
+    } catch (error) {
+      console.error('Error removing saved property:', error)
+      alert(error?.message || 'Failed to remove property')
+    } finally {
+      setRemovingPropertyKey(null)
+    }
+  }
+
   const handleFindMatches = async (leadId) => {
     setLoading(true)
     try {
@@ -346,11 +421,14 @@ export default function RealEstateCRM() {
   }
 
   const formatCurrency = (amount) => {
+    if (amount === undefined || amount === null || amount === '') return 'N/A'
+    const parsed = typeof amount === 'number' ? amount : Number(String(amount).replace(/[^0-9.-]/g, ''))
+    if (!Number.isFinite(parsed)) return 'N/A'
     return new Intl.NumberFormat('en-US', {
       style: 'currency',
       currency: 'USD',
       minimumFractionDigits: 0,
-    }).format(amount)
+    }).format(parsed)
   }
 
   return (
@@ -488,11 +566,22 @@ export default function RealEstateCRM() {
                             </AvatarFallback>
                           </Avatar>
                           <div className="space-y-1">
-                            <h3 className="text-lg font-semibold">{lead.name}</h3>
+                            <button
+                              type="button"
+                              className="text-left text-lg font-semibold hover:underline"
+                              onClick={() => openLeadEditor(lead)}
+                            >
+                              {lead.name}
+                            </button>
                             <div className="flex flex-col sm:flex-row sm:items-center gap-2">
                               <Badge variant={lead.lead_type === 'buyer' ? 'default' : 'secondary'}>
                                 {lead.lead_type}
                               </Badge>
+                              <button type="button" onClick={() => openLeadMatchesDialog(lead)} className="cursor-pointer">
+                                <Badge variant="outline">
+                                  Properties: {Array.isArray(lead.interested_properties) ? lead.interested_properties.length : 0}
+                                </Badge>
+                              </button>
                               {lead.source === 'assistant' && (
                                 <Badge variant="outline" className="text-purple-600 border-purple-600">
                                   <Bot className="mr-1 h-3 w-3" />
@@ -528,10 +617,7 @@ export default function RealEstateCRM() {
                             <Button
                               variant="outline"
                               size="sm"
-                              onClick={() => {
-                                setSelectedLead(lead)
-                                setIsEditDialogOpen(true)
-                              }}
+                              onClick={() => openLeadEditor(lead)}
                             >
                               Edit
                             </Button>
@@ -1381,6 +1467,89 @@ export default function RealEstateCRM() {
                 {loading ? 'Updating...' : 'Update Lead'}
               </Button>
             </div>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {leadMatchesDialogLead && (
+        <Dialog open={!!leadMatchesDialogLead} onOpenChange={(open) => { if (!open) setLeadMatchesDialogLead(null) }}>
+          <DialogContent className="max-w-4xl max-h-[80vh] overflow-y-auto">
+            <DialogHeader>
+              <DialogTitle>Properties - {leadMatchesDialogLead.name}</DialogTitle>
+              <DialogDescription>
+                Saved properties for this lead.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="flex justify-end">
+              <Button
+                onClick={() => {
+                  setLeadMatchesDialogLead(null)
+                  setActiveTab('properties')
+                }}
+              >
+                Add Properties
+              </Button>
+            </div>
+
+            {Array.isArray(leadMatchesDialogLead.interested_properties) && leadMatchesDialogLead.interested_properties.length > 0 ? (
+              <div className="grid gap-3 md:grid-cols-2">
+                {leadMatchesDialogLead.interested_properties.map((property, index) => {
+                  const locationLine = [property?.city, property?.state, property?.zipcode].filter(Boolean).join(', ')
+                  const removeKey = `${leadMatchesDialogLead.id}:${index}`
+                  const isRemoving = removingPropertyKey === removeKey
+                  return (
+                    <Card key={property?.property_id || property?.mls_number || property?.address || index} className="overflow-hidden">
+                      <CardContent className="p-3">
+                        <div className="flex gap-3">
+                          {property?.primary_image ? (
+                            <img
+                              src={property.primary_image}
+                              alt={property?.address || 'Property'}
+                              className="h-20 w-24 rounded object-cover border"
+                            />
+                          ) : (
+                            <div className="h-20 w-24 rounded border bg-muted flex items-center justify-center text-muted-foreground">
+                              <Home className="h-5 w-5" />
+                            </div>
+                          )}
+                          <div className="min-w-0 flex-1 space-y-1">
+                            <p className="font-medium text-sm truncate">{property?.address || 'Saved property'}</p>
+                            <p className="text-xs text-muted-foreground truncate">{locationLine || 'Location unavailable'}</p>
+                            <p className="text-sm font-semibold text-primary">{formatCurrency(property?.price)}</p>
+                            <div className="flex flex-wrap gap-1 text-xs text-muted-foreground">
+                              {property?.property_type && (
+                                <Badge variant="secondary">{property.property_type}</Badge>
+                              )}
+                              {(property?.bedrooms ?? '') !== '' && <span>{property.bedrooms} bd</span>}
+                              {(property?.bathrooms ?? '') !== '' && <span>{property.bathrooms} ba</span>}
+                              {(property?.square_feet ?? '') !== '' && <span>{property.square_feet} sqft</span>}
+                            </div>
+                            <div className="pt-2">
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="text-red-600 border-red-600 hover:bg-red-50"
+                                onClick={() => removePropertyFromLead(leadMatchesDialogLead, index)}
+                                disabled={isRemoving}
+                              >
+                                <Trash2 className="mr-2 h-4 w-4" />
+                                {isRemoving ? 'Removing...' : 'Delete'}
+                              </Button>
+                            </div>
+                          </div>
+                        </div>
+                      </CardContent>
+                    </Card>
+                  )
+                })}
+              </div>
+            ) : (
+              <div className="rounded-md border border-dashed p-4">
+                <p className="text-sm text-muted-foreground">
+                  No properties saved for this lead yet.
+                </p>
+              </div>
+            )}
           </DialogContent>
         </Dialog>
       )}
