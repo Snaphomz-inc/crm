@@ -17,6 +17,16 @@ let dbConnectedLogEmitted = false
 let dbMissingConfigLogEmitted = false
 let dbConnectErrorLogEmitted = false
 let dbInMemoryLogEmitted = false
+let dbLastConnectError = null
+let dbReconnectNotBefore = 0
+let dbPoolErrorLastLogAt = 0
+
+const PG_CONNECTION_TIMEOUT_MS = Math.max(1000, Number(process.env.PG_CONNECTION_TIMEOUT_MS || 10000))
+const PG_QUERY_TIMEOUT_MS = Math.max(1000, Number(process.env.PG_QUERY_TIMEOUT_MS || 10000))
+const PG_IDLE_TIMEOUT_MS = Math.max(1000, Number(process.env.PG_IDLE_TIMEOUT_MS || 30000))
+const DB_RECONNECT_COOLDOWN_MS = Math.max(1000, Number(process.env.DB_RECONNECT_COOLDOWN_MS || 30000))
+const DB_SCAN_ERROR_LOG_COOLDOWN_MS = Math.max(1000, Number(process.env.DB_SCAN_ERROR_LOG_COOLDOWN_MS || 300000))
+const DB_POOL_ERROR_LOG_COOLDOWN_MS = Math.max(1000, Number(process.env.DB_POOL_ERROR_LOG_COOLDOWN_MS || 60000))
 
 const PG_DOC_TABLE = 'crm_documents'
 const GOOGLE_CALENDAR_CONNECTIONS_COLLECTION = 'google_calendar_connections'
@@ -567,18 +577,77 @@ function buildDbConfigError() {
   return error
 }
 
-function buildDbConnectError(cause) {
-  const error = new Error(`Failed to connect to PostgreSQL: ${String(cause?.message || cause || 'unknown error')}`)
+function buildDbConnectError(cause, options = {}) {
+  const retryMs = Math.max(0, Number(options.retryMs || 0))
+  const retrySuffix = retryMs > 0 ? ` (retrying in ${Math.ceil(retryMs / 1000)}s)` : ''
+  const error = new Error(`Failed to connect to PostgreSQL: ${String(cause?.message || cause || 'unknown error')}${retrySuffix}`)
   error.code = 'DB_CONNECT_FAILED'
   return error
 }
 
+function isDbUnavailableError(error) {
+  const code = String(error?.code || '').toUpperCase()
+  return (
+    code === 'DB_CONNECT_FAILED' ||
+    code === 'DB_CONFIG_MISSING' ||
+    code === 'ENOTFOUND' ||
+    code === 'ECONNRESET' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ECONNREFUSED' ||
+    code === 'EHOSTUNREACH' ||
+    code === 'ENETUNREACH'
+  )
+}
+
+function logThrottledScanError(scanName, error) {
+  if (!isDbUnavailableError(error)) {
+    console.warn(`${scanName} error`, error)
+    return
+  }
+
+  const g = globalThis
+  if (!g.__crmScanErrorThrottle) g.__crmScanErrorThrottle = {}
+
+  const key = String(scanName || 'scan')
+  const now = Date.now()
+  const existing = g.__crmScanErrorThrottle[key] || { lastLogAt: 0, suppressed: 0 }
+  const elapsed = now - Number(existing.lastLogAt || 0)
+
+  if (elapsed >= DB_SCAN_ERROR_LOG_COOLDOWN_MS) {
+    const suppressed = Number(existing.suppressed || 0)
+    g.__crmScanErrorThrottle[key] = { lastLogAt: now, suppressed: 0 }
+    const suffix = suppressed > 0 ? ` (suppressed ${suppressed} similar errors)` : ''
+    console.warn(`${scanName} error${suffix}: ${String(error?.message || error || 'unknown error')}`)
+    return
+  }
+
+  g.__crmScanErrorThrottle[key] = {
+    lastLogAt: existing.lastLogAt,
+    suppressed: Number(existing.suppressed || 0) + 1
+  }
+}
+
+function handlePgPoolError(error) {
+  dbLastConnectError = error || new Error('PostgreSQL pool error')
+  dbReconnectNotBefore = Date.now() + DB_RECONNECT_COOLDOWN_MS
+  db = null
+  dbMode = 'uninitialized'
+
+  const now = Date.now()
+  if ((now - dbPoolErrorLastLogAt) >= DB_POOL_ERROR_LOG_COOLDOWN_MS) {
+    dbPoolErrorLastLogAt = now
+    console.error('[DB] PostgreSQL pool error:', error?.message || error)
+  }
+}
+
 function getDbRuntimeStatus() {
+  const reconnectInMs = Math.max(0, dbReconnectNotBefore - Date.now())
   return {
     mode: dbMode,
     configured: Boolean(getDatabaseConnectionString()),
     in_memory_enabled: isDevInMemoryDbEnabled(),
-    connected: dbMode === 'postgres'
+    connected: dbMode === 'postgres',
+    reconnect_in_ms: reconnectInMs
   }
 }
 
@@ -619,6 +688,10 @@ async function connectToMongo() {
   // Kept for compatibility with existing route handlers.
   if (db) return db
   if (dbInitPromise) return dbInitPromise
+  const reconnectInMs = dbReconnectNotBefore - Date.now()
+  if (reconnectInMs > 0 && dbLastConnectError) {
+    throw buildDbConnectError(dbLastConnectError, { retryMs: reconnectInMs })
+  }
 
   dbInitPromise = (async () => {
     const connectionString = getDatabaseConnectionString()
@@ -644,13 +717,24 @@ async function connectToMongo() {
       if (!pgPool) {
         pgPool = new Pool({
           connectionString,
-          ssl: shouldUseSsl(connectionString) ? { rejectUnauthorized: false } : undefined
+          ssl: shouldUseSsl(connectionString) ? { rejectUnauthorized: false } : undefined,
+          connectionTimeoutMillis: PG_CONNECTION_TIMEOUT_MS,
+          idleTimeoutMillis: PG_IDLE_TIMEOUT_MS,
+          query_timeout: PG_QUERY_TIMEOUT_MS,
+          statement_timeout: PG_QUERY_TIMEOUT_MS,
+          keepAlive: true,
+          keepAliveInitialDelayMillis: 10000
+        })
+        pgPool.on('error', (error) => {
+          handlePgPoolError(error)
         })
       }
       await pgPool.query('SELECT 1')
       await ensurePgSchema(pgPool)
       db = createPostgresDb(pgPool)
       dbMode = 'postgres'
+      dbLastConnectError = null
+      dbReconnectNotBefore = 0
       if (!dbConnectedLogEmitted) {
         console.info('[DB] Connected to PostgreSQL')
         dbConnectedLogEmitted = true
@@ -661,6 +745,8 @@ async function connectToMongo() {
       pgPool = null
       db = null
       dbMode = 'uninitialized'
+      dbLastConnectError = error
+      dbReconnectNotBefore = Date.now() + DB_RECONNECT_COOLDOWN_MS
 
       if (allowInMemory) {
         if (!dbInMemoryLogEmitted) {
@@ -676,7 +762,7 @@ async function connectToMongo() {
         console.error('[DB] Failed to connect to PostgreSQL:', error?.message || error)
         dbConnectErrorLogEmitted = true
       }
-      throw buildDbConnectError(error)
+      throw buildDbConnectError(error, { retryMs: DB_RECONNECT_COOLDOWN_MS })
     } finally {
       dbInitPromise = null
     }
@@ -1210,7 +1296,7 @@ class OpenAIUtility {
   estimateTokenCount(text, model = this.defaultModel) {
     if (!text) return 0
     
-    // Rough approximation: 1 token ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â°ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â  4 characters for English text
+    // Rough approximation: 1 token ~= 4 characters for English text
     // More accurate for code and structured content
     const baseCount = Math.ceil(text.length / 4)
     
@@ -1548,9 +1634,9 @@ class OpenAIUtility {
 
     // Console logging for monitoring
     if (requestInfo.success) {
-      console.log(`ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ ${this.provider.toUpperCase()} ${requestInfo.model}: ${requestInfo.inputTokens}+${requestInfo.outputTokens} tokens, $${requestInfo.cost.toFixed(4)}, ${requestInfo.responseTime}ms`)
+      console.log(`[AI Usage] ${this.provider.toUpperCase()} ${requestInfo.model}: ${requestInfo.inputTokens}+${requestInfo.outputTokens} tokens, $${requestInfo.cost.toFixed(4)}, ${requestInfo.responseTime}ms`)
     } else {
-      console.error(`ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ ${this.provider.toUpperCase()} ${requestInfo.model} failed: ${requestInfo.error.message}`)
+      console.error(`[AI Usage] ${this.provider.toUpperCase()} ${requestInfo.model} failed: ${requestInfo.error.message}`)
     }
   }
 
@@ -1611,7 +1697,7 @@ class OpenAIUtility {
   resetDailyUsage() {
     this.totalCost = 0
     this.requestLog = []
-    console.log('ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ Daily usage reset')
+    console.log('[AI Usage] Daily usage reset')
   }
 }
 
@@ -2374,6 +2460,66 @@ function getStageOrder(stage, transactionType = 'sale') {
   return mapping[stage] || 999
 }
 
+const TASK_PRIORITY_RANK = {
+  urgent: 0,
+  high: 1,
+  medium: 2,
+  low: 3
+}
+
+const STAGE_LABELS = {
+  pre_approval: 'Pre-Approval',
+  home_search: 'Home Search',
+  offer: 'Offer',
+  under_contract: 'Under Contract',
+  escrow_closing: 'Escrow Closing',
+  pre_listing: 'Pre-Listing',
+  listing: 'Listing',
+  closed: 'Closed'
+}
+
+function formatStageLabel(stage = '') {
+  const key = String(stage || '').trim().toLowerCase()
+  if (STAGE_LABELS[key]) return STAGE_LABELS[key]
+  return key
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (char) => char.toUpperCase())
+}
+
+function getPriorityRank(priority = 'medium') {
+  const normalized = String(priority || 'medium').toLowerCase()
+  return Number.isFinite(TASK_PRIORITY_RANK[normalized]) ? TASK_PRIORITY_RANK[normalized] : TASK_PRIORITY_RANK.medium
+}
+
+function getDateSortValue(value) {
+  if (!value) return Number.POSITIVE_INFINITY
+  const parsed = new Date(value).getTime()
+  return Number.isFinite(parsed) ? parsed : Number.POSITIVE_INFINITY
+}
+
+function pickNextActionTask(tasks = []) {
+  if (!Array.isArray(tasks) || tasks.length === 0) return null
+  const ranked = [...tasks]
+    .filter((task) => task && String(task.status || '').toLowerCase() !== 'completed')
+    .sort((a, b) => {
+      const priorityDiff = getPriorityRank(a?.priority) - getPriorityRank(b?.priority)
+      if (priorityDiff !== 0) return priorityDiff
+      const dueDiff = getDateSortValue(a?.due_date) - getDateSortValue(b?.due_date)
+      if (dueDiff !== 0) return dueDiff
+      return String(a?.title || '').localeCompare(String(b?.title || ''))
+    })
+
+  if (ranked.length === 0) return null
+  const selected = ranked[0]
+  return {
+    id: selected.id || null,
+    title: String(selected.title || '').trim() || 'Untitled task',
+    stage: selected.stage || null,
+    due_date: selected.due_date || null,
+    priority: String(selected.priority || 'medium').toLowerCase()
+  }
+}
+
 // Helper function to extract names from messages (fallback parsing)
 function extractNameFromMessage(message) {
   // Simple regex to find potential names
@@ -2545,6 +2691,8 @@ async function generateDealSummaryById(db, transactionId) {
 }
 
 // Smart Alerts System
+const SMART_ALERT_BACKGROUND_REFRESH_MS = 2 * 60 * 1000
+
 async function getSmartAlerts(db, filters = {}) {
   try {
     // Get existing alerts from database
@@ -2560,27 +2708,41 @@ async function getSmartAlerts(db, filters = {}) {
       .limit(50)
       .toArray()
 
-    // Generate new alerts if needed
-    const newAlerts = await generateSmartAlerts(db)
-    // Apply same filters to freshly generated alerts
-    const filteredNewAlerts = newAlerts.filter(a => (
-      (!filters.agent || a.assigned_agent === filters.agent) &&
-      (!filters.priority || a.priority === filters.priority) &&
-      (!filters.type || a.alert_type === filters.type)
-    ))
+    // Trigger background refresh with cooldown (non-blocking for UI requests).
+    try {
+      const g = globalThis
+      if (!g.__crmSmartAlertRefresh) {
+        g.__crmSmartAlertRefresh = { inFlight: null, lastStartedAt: 0 }
+      }
+      const state = g.__crmSmartAlertRefresh
+      const nowMs = Date.now()
+      const elapsed = nowMs - Number(state.lastStartedAt || 0)
+      const shouldStart = !state.inFlight && elapsed >= SMART_ALERT_BACKGROUND_REFRESH_MS
 
-    // Combine and return all alerts
-    const allAlerts = [...filteredNewAlerts, ...existingAlerts.filter(alert => 
-      !filteredNewAlerts.find(newAlert => 
-        newAlert.transaction_id === alert.transaction_id && 
-        newAlert.alert_type === alert.alert_type
-      )
-    )]
+      if (shouldStart) {
+        state.lastStartedAt = nowMs
+        state.inFlight = (async () => {
+          try {
+            const upserted = await generateSmartAlerts(db)
+            if (Array.isArray(upserted) && upserted.length > 0 && g.__crmSSE?.clients) {
+              const msg = (ev, data) => `event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`
+              for (const c of g.__crmSSE.clients) {
+                try { c.enqueue(msg('alerts:changed', { reason: 'auto_refresh', count: upserted.length })) } catch (_) {}
+              }
+            }
+          } catch (error) {
+            console.warn('Background smart-alert refresh failed:', error)
+          } finally {
+            state.inFlight = null
+          }
+        })()
+      }
+    } catch (_) {}
 
     return {
       success: true,
-      alerts: allAlerts.map(({ _id, ...rest }) => rest),
-      total: allAlerts.length,
+      alerts: existingAlerts.map(({ _id, ...rest }) => rest),
+      total: existingAlerts.length,
       filters_applied: filters
     }
   } catch (error) {
@@ -2721,6 +2883,7 @@ async function generateSmartAlerts(db) {
                 due_date: task.due_date || null,
                 priority: task.priority || 'medium'
               }))
+            const nextActionTask = pickNextActionTask(remainingTasks)
 
             const closingPriority = daysToClosing <= 3
               ? 'urgent'
@@ -2747,9 +2910,17 @@ async function generateSmartAlerts(db) {
                 days_to_closing: daysToClosing,
                 closing_date: transaction.closing_date,
                 incomplete_tasks: incompleteItems.length,
+                tasks_remaining: incompleteItems.length,
                 current_stage: transaction.current_stage,
+                current_stage_label: formatStageLabel(transaction.current_stage),
                 open_stages: openStages,
-                remaining_tasks: remainingTasks
+                remaining_tasks: remainingTasks,
+                next_action_task: nextActionTask
+                  ? {
+                    ...nextActionTask,
+                    stage_label: formatStageLabel(nextActionTask.stage)
+                  }
+                  : null
               }
             })
           }
@@ -3725,7 +3896,8 @@ async function sendNotificationEmail({
   const safeMessage = String(message || '').trim() || 'You have a new update in CRM.'
   const appUrl = config.appUrl || ''
   const textBody = appUrl ? `${safeMessage}\n\nOpen CRM: ${appUrl}` : safeMessage
-  const htmlBody = html || `<p>${safeMessage}</p>${appUrl ? `<p><a href="${appUrl}">Open CRM</a></p>` : ''}`
+  const appLinkHtml = appUrl ? `<p><a href="${appUrl}">Open CRM</a></p>` : ''
+  const htmlBody = html ? `${html}${appLinkHtml}` : `<p>${safeMessage}</p>${appLinkHtml}`
 
   const sendResult = config.provider === 'resend'
     ? await sendEmailViaResend(config, { to: recipient, subject: safeSubject, text: textBody, html: htmlBody })
@@ -3787,48 +3959,109 @@ function resolveClosingReminderStage(daysToClosing) {
   return { key: 'created', label: 'initial notice', nextDays: 7 }
 }
 
-function buildClosingReminderContent(alert = {}, closingDate, daysToClosing, stage) {
+function formatDateOnlyLong(dateOnly) {
+  const safeDate = toDateOnlyString(dateOnly)
+  if (!safeDate) return ''
+  const parts = safeDate.split('-').map((part) => Number(part))
+  if (parts.length !== 3 || parts.some((part) => !Number.isFinite(part))) return safeDate
+  const [year, month, day] = parts
+  const utcDate = new Date(Date.UTC(year, month - 1, day))
+  if (Number.isNaN(utcDate.getTime())) return safeDate
+  return utcDate.toLocaleDateString('en-US', {
+    month: 'long',
+    day: 'numeric',
+    year: 'numeric',
+    timeZone: 'UTC'
+  })
+}
+
+function escapeHtml(value = '') {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function buildClosingReminderContent(alert = {}, closingDate, stage) {
+  const details = isPlainObject(alert?.details) ? alert.details : {}
   const address = String(alert?.property_address || 'this transaction').trim()
-  const safeDate = closingDate || 'the closing date'
+  const safeDate = toDateOnlyString(closingDate)
+  const readableClosingDate = formatDateOnlyLong(safeDate) || 'the closing date'
   const dayWord = (n) => `${n} day${n === 1 ? '' : 's'}`
   let subject = '[Snaphomz] Closing reminder'
-  let message = `${address} has a closing milestone update.`
+  const leadLine = `${address} is closing on ${readableClosingDate}.`
+  let reminderLine = '- Closing timeline updated.'
 
   if (stage.key === 'created') {
     subject = '[Snaphomz] Closing timeline started'
-    message = `${address} is scheduled to close on ${safeDate} (${dayWord(Math.max(0, daysToClosing))} left).`
   } else if (stage.key === 'd7') {
     subject = '[Snaphomz] Closing reminder: 1 week left'
-    message = `${address} is closing in ${dayWord(Math.max(0, daysToClosing))}.`
   } else if (stage.key === 'd3') {
     subject = '[Snaphomz] Closing reminder: 3 days left'
-    message = `${address} is closing in ${dayWord(Math.max(0, daysToClosing))}.`
   } else if (stage.key === 'd1') {
     subject = '[Snaphomz] Closing reminder: 1 day left'
-    message = `${address} is closing tomorrow (${safeDate}).`
   } else if (stage.key === 'd0') {
     subject = '[Snaphomz] Closing reminder: today'
-    message = `${address} is closing today (${safeDate}).`
   }
 
   if (stage.nextDays === null) {
-    message += ' This is the final reminder for this closing date.'
+    reminderLine = '- Final alert: closing is today.'
   } else if (stage.nextDays === 0) {
-    message += ' Next reminder: on the day of closing.'
+    reminderLine = `- Next alert on ${readableClosingDate} (on closing day).`
   } else {
-    const nextDate = addDaysToDateOnly(closingDate, -stage.nextDays)
-    message += nextDate
-      ? ` Next reminder: ${dayWord(stage.nextDays)} before closing (${nextDate}).`
-      : ` Next reminder: ${dayWord(stage.nextDays)} before closing.`
+    const nextDate = safeDate ? addDaysToDateOnly(safeDate, -stage.nextDays) : ''
+    const readableNextDate = formatDateOnlyLong(nextDate)
+    reminderLine = readableNextDate
+      ? `- Next alert on ${readableNextDate} (${dayWord(stage.nextDays)} before closing).`
+      : `- Next alert ${dayWord(stage.nextDays)} before closing.`
   }
 
-  return { subject, message }
+  const currentStageRaw = String(details?.current_stage || alert?.current_stage || '').trim()
+  const currentStageLabel = String(details?.current_stage_label || formatStageLabel(currentStageRaw) || 'Not specified').trim() || 'Not specified'
+  const remainingTaskCountRaw = Number(
+    details?.tasks_remaining ??
+    details?.incomplete_tasks ??
+    (Array.isArray(details?.remaining_tasks) ? details.remaining_tasks.length : NaN)
+  )
+  const remainingTaskCount = Number.isFinite(remainingTaskCountRaw) ? Math.max(0, Math.floor(remainingTaskCountRaw)) : null
+
+  const fallbackTask = Array.isArray(details?.remaining_tasks) ? pickNextActionTask(details.remaining_tasks) : null
+  const selectedTask = isPlainObject(details?.next_action_task) ? details.next_action_task : fallbackTask
+  const selectedTaskTitle = String(selectedTask?.title || '').trim()
+  const selectedTaskDue = formatDateOnlyLong(selectedTask?.due_date)
+  const selectedTaskPriority = String(selectedTask?.priority || '').trim()
+  const selectedTaskPriorityLabel = selectedTaskPriority
+    ? `${selectedTaskPriority.charAt(0).toUpperCase()}${selectedTaskPriority.slice(1).toLowerCase()} priority`
+    : ''
+  const selectedTaskStage = String(selectedTask?.stage_label || formatStageLabel(selectedTask?.stage || '')).trim()
+  const selectedTaskMeta = [
+    selectedTaskDue ? `Due ${selectedTaskDue}` : '',
+    selectedTaskPriorityLabel,
+    selectedTaskStage ? `Stage: ${selectedTaskStage}` : ''
+  ].filter(Boolean)
+  const taskSummary = selectedTaskTitle
+    ? (selectedTaskMeta.length ? `${selectedTaskTitle} (${selectedTaskMeta.join(', ')})` : selectedTaskTitle)
+    : 'No pending task identified.'
+
+  const detailsLines = [
+    `Current stage: ${currentStageLabel}`,
+    `Task to focus: ${taskSummary}`,
+    remainingTaskCount === null ? '' : `Tasks remaining: ${remainingTaskCount}`
+  ].filter(Boolean)
+
+  const message = `${leadLine}\n${detailsLines.join('\n')}\n\nReminder:\n${reminderLine}`
+  const html = `<p>${escapeHtml(leadLine)}</p><p><strong>Current stage:</strong> ${escapeHtml(currentStageLabel)}<br/><strong>Task to focus:</strong> ${escapeHtml(taskSummary)}${remainingTaskCount === null ? '' : `<br/><strong>Tasks remaining:</strong> ${remainingTaskCount}`}</p><p><strong>Reminder:</strong></p><ul><li>${escapeHtml(reminderLine.replace(/^-\s*/, ''))}</li></ul>`
+
+  return { subject, message, html }
 }
 
 async function sendSmartAlertEmail(db, request, alert = {}, options = {}) {
   const type = String(alert?.alert_type || 'general')
   let title = String(alert?.title || 'Smart Alert').trim()
   let message = String(alert?.message || '').trim() || 'You have a smart alert in CRM.'
+  let html = null
   let dedupeKey = ''
   let metadata = {
     alert_id: alert?.id || null,
@@ -3851,9 +4084,10 @@ async function sendSmartAlertEmail(db, request, alert = {}, options = {}) {
     const stage = resolveClosingReminderStage(daysToClosing)
     if (!stage) return { success: false, reason: 'closing_stage_unresolved' }
 
-    const content = buildClosingReminderContent(alert, closingDate, daysToClosing, stage)
+    const content = buildClosingReminderContent(alert, closingDate, stage)
     title = content.subject.replace(/^\[Snaphomz\]\s*/i, '')
     message = content.message
+    html = content.html || null
     dedupeKey = `smart_alert:closing:${String(alert?.transaction_id || alert?.id || 'unknown')}:${closingDate}:${stage.key}`
     metadata = {
       ...metadata,
@@ -3875,6 +4109,7 @@ async function sendSmartAlertEmail(db, request, alert = {}, options = {}) {
     dedupeKey,
     subject: title.startsWith('[Snaphomz]') ? title : `[Snaphomz] ${title}`,
     message,
+    html,
     metadata
   })
 }
@@ -3943,12 +4178,47 @@ function parseDateToEpochMillis(value) {
 function toDateOnlyString(value) {
   const raw = String(value || '').trim()
   if (!raw) return null
-  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw
+  const isoDateMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:$|T)/)
+  if (isoDateMatch) {
+    return `${isoDateMatch[1]}-${isoDateMatch[2]}-${isoDateMatch[3]}`
+  }
+  const usDateMatch = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/)
+  if (usDateMatch) {
+    const month = Number(usDateMatch[1])
+    const day = Number(usDateMatch[2])
+    const year = Number(usDateMatch[3])
+    const local = new Date(year, month - 1, day)
+    if (
+      !Number.isNaN(local.getTime()) &&
+      local.getFullYear() === year &&
+      local.getMonth() + 1 === month &&
+      local.getDate() === day
+    ) {
+      return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+    }
+    return null
+  }
+  const yearFirstSlashMatch = raw.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/)
+  if (yearFirstSlashMatch) {
+    const year = Number(yearFirstSlashMatch[1])
+    const month = Number(yearFirstSlashMatch[2])
+    const day = Number(yearFirstSlashMatch[3])
+    const local = new Date(year, month - 1, day)
+    if (
+      !Number.isNaN(local.getTime()) &&
+      local.getFullYear() === year &&
+      local.getMonth() + 1 === month &&
+      local.getDate() === day
+    ) {
+      return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+    }
+    return null
+  }
   const parsed = new Date(raw)
   if (Number.isNaN(parsed.getTime())) return null
-  const y = parsed.getUTCFullYear()
-  const m = String(parsed.getUTCMonth() + 1).padStart(2, '0')
-  const d = String(parsed.getUTCDate()).padStart(2, '0')
+  const y = parsed.getFullYear()
+  const m = String(parsed.getMonth() + 1).padStart(2, '0')
+  const d = String(parsed.getDate()).padStart(2, '0')
   return `${y}-${m}-${d}`
 }
 
@@ -7614,7 +7884,7 @@ async function handleRoute(request, { params }) {
       }
 
       if (matchingPool.length === 0 && (minPrice !== null || maxPrice !== null)) {
-        // Expand price by ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â±10%
+        // Expand price by +/-10%
         const adjMin = minPrice !== null ? Math.floor(minPrice * 0.9) : null
         const adjMax = maxPrice !== null ? Math.ceil(maxPrice * 1.1) : null
         matchingPool = properties.filter(p => {
@@ -8113,8 +8383,8 @@ async function handleRoute(request, { params }) {
 
             // timeline
             if (/\basap\b|\bimmediately\b|\bright away\b/.test(l)) out.seller_timeline = 'asap'
-            else if (/(30|thirty)\s*[ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ-]?\s*(60|sixty)\s*days/.test(l)) out.seller_timeline = '30_60'
-            else if (/(60|sixty)\s*[ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ-]?\s*(90|ninety)\s*days/.test(l)) out.seller_timeline = '60_90'
+            else if (/(30|thirty)\s*(?:-|to)?\s*(60|sixty)\s*days/.test(l)) out.seller_timeline = '30_60'
+            else if (/(60|sixty)\s*(?:-|to)?\s*(90|ninety)\s*days/.test(l)) out.seller_timeline = '60_90'
             else if (/(90|ninety)\+?\s*days/.test(l)) out.seller_timeline = '90_plus'
 
             // HOA
@@ -9737,24 +10007,87 @@ function heuristicAssistantParse(message = '') {
         }
         
         const alertsResult = await getSmartAlerts(db, filters)
-        if (alertsResult?.success && Array.isArray(alertsResult.alerts) && alertsResult.alerts.length) {
-          try {
-            const closingAlerts = alertsResult.alerts.filter(
-              (alert) => String(alert?.alert_type || '').toLowerCase() === 'closing_approaching'
-            )
-            if (closingAlerts.length) {
-              await Promise.allSettled(
-                closingAlerts.map((alert) => sendSmartAlertEmail(db, request, alert))
-              )
-            }
-          } catch (_) {}
-        }
         return handleCORS(NextResponse.json(alertsResult))
       } catch (error) {
         console.error('Smart alerts error:', error)
         return handleCORS(NextResponse.json({
           success: false,
           error: "Failed to get alerts"
+        }, { status: 500 }))
+      }
+    }
+
+    // GET /api/alerts/task-priority-counts - Aggregate incomplete task counts for Smart Alerts panel
+    if (route === '/alerts/task-priority-counts' && method === 'GET') {
+      try {
+        const priorities = ['urgent', 'high', 'medium', 'low']
+        const counts = { urgent: 0, high: 0, medium: 0, low: 0 }
+        const groups = { urgent: [], high: [], medium: [], low: [] }
+
+        const tasks = await db.collection('checklist_items')
+          .find({ status: { $ne: 'completed' } })
+          .toArray()
+
+        const transactionIds = Array.from(
+          new Set(
+            (Array.isArray(tasks) ? tasks : [])
+              .map((task) => String(task?.transaction_id || '').trim())
+              .filter(Boolean)
+          )
+        )
+
+        let transactionMap = new Map()
+        if (transactionIds.length > 0) {
+          try {
+            const transactions = await db.collection('transactions')
+              .find({ id: { $in: transactionIds } })
+              .toArray()
+            transactionMap = new Map((transactions || []).map((tx) => [String(tx?.id || ''), tx]))
+          } catch (_) {
+            const transactions = await db.collection('transactions').find({}).toArray()
+            transactionMap = new Map((transactions || []).map((tx) => [String(tx?.id || ''), tx]))
+          }
+        }
+
+        ;(Array.isArray(tasks) ? tasks : []).forEach((task) => {
+          const priority = String(task?.priority || 'medium').toLowerCase()
+          if (!priorities.includes(priority)) return
+          const transactionId = String(task?.transaction_id || '').trim()
+          const transaction = transactionMap.get(transactionId) || {}
+
+          counts[priority] += 1
+          groups[priority].push({
+            id: task?.id || null,
+            title: task?.title || 'Untitled task',
+            due_date: task?.due_date || null,
+            stage: task?.stage || '',
+            transaction_id: transactionId,
+            property_address: transaction?.property_address || 'Unknown address'
+          })
+        })
+
+        priorities.forEach((priority) => {
+          groups[priority] = groups[priority]
+            .slice()
+            .sort((a, b) => {
+              const ad = a?.due_date ? new Date(a.due_date).getTime() : Number.POSITIVE_INFINITY
+              const bd = b?.due_date ? new Date(b.due_date).getTime() : Number.POSITIVE_INFINITY
+              if (ad !== bd) return ad - bd
+              return String(a?.title || '').localeCompare(String(b?.title || ''))
+            })
+        })
+
+        return handleCORS(NextResponse.json({
+          success: true,
+          counts,
+          groups,
+          total: Array.isArray(tasks) ? tasks.length : 0
+        }))
+      } catch (error) {
+        console.error('Task priority counts error:', error)
+        return handleCORS(NextResponse.json({
+          success: false,
+          error: 'Failed to fetch task priority counts'
         }, { status: 500 }))
       }
     }
@@ -10056,17 +10389,17 @@ function heuristicAssistantParse(message = '') {
           const sellerPrice = prefs.seller_price ?? prefs.asking_price
           const bullets = [
             `Name: ${lead.name}${lead.lead_type ? ` (${lead.lead_type})` : ''}`,
-            `Contact: ${lead.email || 'ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â'} | ${lead.phone || 'ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â'}`,
+            `Contact: ${lead.email || 'Not provided'} | ${lead.phone || 'Not provided'}`,
             sellerAddress ? `Address: ${sellerAddress}` : null,
             sellerPrice != null ? `Asking price: $${Number(sellerPrice).toLocaleString()}` : null,
-            prefs.seller_property_type ? `Property: ${prefs.seller_property_type}${prefs.seller_bedrooms ? ` ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ ${prefs.seller_bedrooms} bd` : ''}${prefs.seller_bathrooms ? ` ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ ${prefs.seller_bathrooms} ba` : ''}` : null,
+            prefs.seller_property_type ? `Property: ${prefs.seller_property_type}${prefs.seller_bedrooms ? ` - ${prefs.seller_bedrooms} bd` : ''}${prefs.seller_bathrooms ? ` - ${prefs.seller_bathrooms} ba` : ''}` : null,
             prefs.seller_year_built ? `Year built: ${prefs.seller_year_built}` : null,
             prefs.seller_square_feet ? `Size: ${prefs.seller_square_feet} sqft` : null,
             prefs.seller_lot_size ? `Lot: ${prefs.seller_lot_size}` : null,
             prefs.seller_condition ? `Condition: ${prefs.seller_condition}` : null,
             prefs.seller_occupancy ? `Occupancy: ${prefs.seller_occupancy}` : null,
             prefs.seller_timeline ? `Timeline to list: ${prefs.seller_timeline}` : null,
-            prefs.seller_hoa_fee != null ? `HOA: ${prefs.seller_hoa_fee ? `$${Number(prefs.seller_hoa_fee).toLocaleString()}/mo` : 'ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â'}` : null,
+            prefs.seller_hoa_fee != null ? `HOA: ${prefs.seller_hoa_fee ? `$${Number(prefs.seller_hoa_fee).toLocaleString()}/mo` : 'None'}` : null,
             prefs.seller_description ? `Notes: ${prefs.seller_description}` : null,
             lead.updated_at ? `Last updated: ${new Date(lead.updated_at).toLocaleString()}` : null
           ]
@@ -10076,13 +10409,13 @@ function heuristicAssistantParse(message = '') {
           const actions = []
           const soonish = (prefs.seller_timeline || '').toString().toLowerCase().includes('week') || (prefs.seller_timeline || '').toString().toLowerCase().includes('soon')
           actions.push('Schedule a listing consultation and walkthrough')
-          actions.push('Prepare CMA with 3ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ5 comps and pricing strategy')
+          actions.push('Prepare CMA with 3-5 comps and pricing strategy')
           if (prefs.seller_condition && /needs|repair|fix|update/i.test(prefs.seller_condition)) actions.push('Outline repair/refresh plan (paint, fixtures, minor repairs)')
           else actions.push('Create a light staging/declutter checklist')
           actions.push('Book professional photography and floor plan')
           actions.push('Gather docs: HOA, disclosures, utility averages, survey')
           actions.push('Draft listing timeline and MLS remarks')
-          if (soonish) actions.push('Expedite prep: compress timeline to 1ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ2 weeks with daily checkpoints')
+          if (soonish) actions.push('Expedite prep: compress timeline to 1-2 weeks with daily checkpoints')
           const nextSteps = makeAnswer('Suggested next steps:', actions)
 
           // Optional AI insights reuse
@@ -11015,6 +11348,9 @@ if (!globalThis.__crmNudgeScheduler) {
   }
 
   const runNudgeScan = async () => {
+    const g = globalThis
+    if (g.__crmNudgeScanInFlight) return
+    g.__crmNudgeScanInFlight = true
     try {
       const db = await connectToMongo()
       const now = new Date()
@@ -11152,7 +11488,9 @@ if (!globalThis.__crmNudgeScheduler) {
       // Notify panels to refresh suggestions summary
       pushSSE('suggestions:update', { ts: Date.now() })
     } catch (e) {
-      console.warn('Nudge scan error', e)
+      logThrottledScanError('Nudge scan', e)
+    } finally {
+      g.__crmNudgeScanInFlight = false
     }
   }
 
@@ -11174,6 +11512,9 @@ if (!globalThis.__crmSnoozeScheduler) {
   }
 
   const runSnoozeScan = async () => {
+    const g = globalThis
+    if (g.__crmSnoozeScanInFlight) return
+    g.__crmSnoozeScanInFlight = true
     try {
       const db = await connectToMongo()
       const coll = db.collection('notifications')
@@ -11200,7 +11541,9 @@ if (!globalThis.__crmSnoozeScheduler) {
         } catch (_) {}
       }
     } catch (e) {
-      console.warn('Snooze scan error', e)
+      logThrottledScanError('Snooze scan', e)
+    } finally {
+      g.__crmSnoozeScanInFlight = false
     }
   }
 

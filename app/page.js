@@ -10,7 +10,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Di
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
-import { Search, Plus, Users, TrendingUp, Home, Phone, Mail, MapPin, DollarSign, Building, Sparkles, Bot, FileText, Trash2 } from 'lucide-react'
+import { Search, Plus, Users, TrendingUp, Home, Phone, Mail, MapPin, DollarSign, Building, Sparkles, Bot, FileText, Trash2, CalendarDays, ListChecks } from 'lucide-react'
 import { Textarea } from '@/components/ui/textarea'
 import { AssistantChat } from '@/components/AssistantChat'
 import { PropertySearch } from '@/components/PropertySearch'
@@ -461,6 +461,22 @@ export default function RealEstateCRM() {
                 <SidebarMenuButton isActive={activeTab === 'properties'} onClick={() => setActiveTab('properties')}>
                   <Home className="h-4 w-4" />
                   <span>Properties</span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton asChild>
+                  <a href="/calendar">
+                    <CalendarDays className="h-4 w-4" />
+                    <span>Calendar</span>
+                  </a>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton asChild>
+                  <a href="/calendar/events">
+                    <ListChecks className="h-4 w-4" />
+                    <span>Events</span>
+                  </a>
                 </SidebarMenuButton>
               </SidebarMenuItem>
             </SidebarMenu>

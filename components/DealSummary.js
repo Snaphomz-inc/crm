@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -400,33 +400,109 @@ export function SmartAlerts() {
   const [taskPriorityCounts, setTaskPriorityCounts] = useState(EMPTY_TASK_PRIORITY_COUNTS)
   const [taskPriorityGroups, setTaskPriorityGroups] = useState(() => createEmptyTaskPriorityGroups())
   const [loading, setLoading] = useState(false)
+  const [hasLoadedOnce, setHasLoadedOnce] = useState(false)
   const [taskDialog, setTaskDialog] = useState({ open: false, alert: null })
   const [priorityDialog, setPriorityDialog] = useState({ open: false, priority: null })
   const [filters, setFilters] = useState({
     priority: 'all',
     type: 'all'
   })
+  const inFlightRefreshRef = useRef(false)
+
+  const getPriorityBadgeClasses = (priority) => {
+    const normalized = String(priority || 'medium').toLowerCase()
+    const base = ALERT_PRIORITY_CONFIG[normalized]?.color || ALERT_PRIORITY_CONFIG.medium.color
+    return `${base} border-0 capitalize`
+  }
+
+  const fetchTaskPriorityCounts = async () => {
+    const response = await fetch('/api/alerts/task-priority-counts')
+    const payload = await response.json().catch(() => ({}))
+    if (!response.ok || payload?.success === false) {
+      throw new Error(payload?.error || 'Failed to fetch task priority counts')
+    }
+
+    const counts = { ...EMPTY_TASK_PRIORITY_COUNTS, ...(payload?.counts || {}) }
+    const groups = createEmptyTaskPriorityGroups()
+    PRIORITY_LEVELS.forEach((priority) => {
+      groups[priority] = Array.isArray(payload?.groups?.[priority]) ? payload.groups[priority] : []
+    })
+    return { counts, groups }
+  }
+
+  const fetchAlerts = useCallback(async ({ includeCounts = false } = {}) => {
+    if (inFlightRefreshRef.current) {
+      return
+    }
+
+    inFlightRefreshRef.current = true
+    setLoading(true)
+    try {
+      const params = new URLSearchParams()
+      if (filters.priority !== 'all') params.append('priority', filters.priority)
+      if (filters.type !== 'all') params.append('type', filters.type)
+      const query = params.toString()
+      const alertsPath = `/api/alerts/smart${query ? `?${query}` : ''}`
+      const countsPromise = includeCounts ? fetchTaskPriorityCounts() : null
+      const response = await fetch(alertsPath)
+      const data = await response.json().catch(() => ({}))
+
+      if (response.ok && data?.success) {
+        setAlerts(data.alerts || [])
+      }
+
+      if (countsPromise) {
+        countsPromise
+          .then((result) => {
+            setTaskPriorityCounts(result.counts)
+            setTaskPriorityGroups(result.groups)
+          })
+          .catch((error) => {
+            console.error('Error fetching task priority counts:', error)
+            setTaskPriorityCounts({ ...EMPTY_TASK_PRIORITY_COUNTS })
+            setTaskPriorityGroups(createEmptyTaskPriorityGroups())
+          })
+      }
+    } catch (error) {
+      console.error('Error fetching alerts:', error)
+      if (includeCounts) {
+        setTaskPriorityCounts({ ...EMPTY_TASK_PRIORITY_COUNTS })
+        setTaskPriorityGroups(createEmptyTaskPriorityGroups())
+      }
+    } finally {
+      inFlightRefreshRef.current = false
+      setLoading(false)
+      setHasLoadedOnce(true)
+    }
+  }, [filters])
 
   useEffect(() => {
-    fetchAlerts()
-  }, [filters])
+    void fetchAlerts({ includeCounts: true })
+  }, [fetchAlerts])
 
   useEffect(() => {
     let es
     let timer = null
-    const scheduleRefresh = () => {
+    let needsCountRefresh = false
+    let lastAutoRefreshAt = 0
+    const MIN_AUTO_REFRESH_MS = 10000
+    const scheduleRefresh = (includeCounts = false) => {
+      const now = Date.now()
+      if (!includeCounts && now - lastAutoRefreshAt < MIN_AUTO_REFRESH_MS) return
+      if (includeCounts) needsCountRefresh = true
       if (timer) clearTimeout(timer)
       timer = setTimeout(() => {
-        fetchAlerts()
-      }, 250)
+        const runWithCounts = needsCountRefresh
+        needsCountRefresh = false
+        lastAutoRefreshAt = Date.now()
+        void fetchAlerts({ includeCounts: runWithCounts })
+      }, 300)
     }
 
     try {
       es = new EventSource('/api/assistant/stream')
-      es.addEventListener('ready', scheduleRefresh)
-      es.addEventListener('tasks:changed', scheduleRefresh)
-      es.addEventListener('alerts:changed', scheduleRefresh)
-      es.addEventListener('suggestions:update', scheduleRefresh)
+      es.addEventListener('tasks:changed', () => scheduleRefresh(true))
+      es.addEventListener('alerts:changed', () => scheduleRefresh(false))
       es.onerror = () => { try { es.close() } catch {} }
     } catch (_) {
       // Ignore SSE setup issues; manual refresh remains available.
@@ -436,120 +512,7 @@ export function SmartAlerts() {
       if (timer) clearTimeout(timer)
       try { es && es.close() } catch {}
     }
-  }, [])
-
-  const getPriorityBadgeClasses = (priority) => {
-    const normalized = String(priority || 'medium').toLowerCase()
-    const base = ALERT_PRIORITY_CONFIG[normalized]?.color || ALERT_PRIORITY_CONFIG.medium.color
-    return `${base} border-0 capitalize`
-  }
-
-  const fetchTaskPriorityCounts = async () => {
-    const txRes = await fetch('/api/transactions')
-    const txData = await txRes.json()
-    if (!txRes.ok || txData?.success === false) {
-      throw new Error(txData?.error || 'Failed to fetch transactions')
-    }
-
-    const txList = Array.isArray(txData?.transactions)
-      ? txData.transactions
-      : (Array.isArray(txData) ? txData : [])
-
-    if (!txList.length) {
-      return {
-        counts: { ...EMPTY_TASK_PRIORITY_COUNTS },
-        groups: createEmptyTaskPriorityGroups()
-      }
-    }
-
-    const checklistResults = await Promise.all(
-      txList.map(async (tx) => {
-        const res = await fetch(`/api/transactions/${tx.id}/checklist`)
-        const data = await res.json()
-        return { ok: res.ok, data }
-      })
-    )
-
-    const counts = { ...EMPTY_TASK_PRIORITY_COUNTS }
-    const groups = createEmptyTaskPriorityGroups()
-    let validChecklistResponses = 0
-
-    checklistResults.forEach(({ ok, data }, txIndex) => {
-      if (!ok || !data?.success || !Array.isArray(data.checklist_items)) return
-      validChecklistResponses += 1
-      const tx = txList[txIndex] || {}
-
-      data.checklist_items.forEach((task) => {
-        if (task?.status === 'completed') return
-        const priority = String(task?.priority || 'medium').toLowerCase()
-        if (Object.prototype.hasOwnProperty.call(counts, priority)) {
-          counts[priority] += 1
-          groups[priority].push({
-            id: task.id,
-            title: task.title || 'Untitled task',
-            due_date: task.due_date || null,
-            stage: task.stage || '',
-            transaction_id: tx.id || '',
-            property_address: tx.property_address || 'Unknown address'
-          })
-        }
-      })
-    })
-
-    if (validChecklistResponses === 0) {
-      throw new Error('Failed to fetch checklist data')
-    }
-
-    PRIORITY_LEVELS.forEach((priority) => {
-      groups[priority] = groups[priority]
-        .slice()
-        .sort((a, b) => {
-          const ad = a?.due_date ? new Date(a.due_date).getTime() : Number.POSITIVE_INFINITY
-          const bd = b?.due_date ? new Date(b.due_date).getTime() : Number.POSITIVE_INFINITY
-          if (ad !== bd) return ad - bd
-          return String(a?.title || '').localeCompare(String(b?.title || ''))
-        })
-    })
-
-    return { counts, groups }
-  }
-
-  const fetchAlerts = async () => {
-    setLoading(true)
-    try {
-      const params = new URLSearchParams()
-      if (filters.priority !== 'all') params.append('priority', filters.priority)
-      if (filters.type !== 'all') params.append('type', filters.type)
-
-      const [alertsResult, countsResult] = await Promise.allSettled([
-        fetch(`/api/alerts/smart?${params.toString()}`).then(async (response) => {
-          const data = await response.json()
-          return { ok: response.ok, data }
-        }),
-        fetchTaskPriorityCounts()
-      ])
-
-      if (alertsResult.status === 'fulfilled' && alertsResult.value?.ok && alertsResult.value?.data?.success) {
-        setAlerts(alertsResult.value.data.alerts || [])
-      } else if (alertsResult.status === 'rejected') {
-        console.error('Error fetching alerts:', alertsResult.reason)
-      }
-
-      if (countsResult.status === 'fulfilled') {
-        setTaskPriorityCounts(countsResult.value.counts)
-        setTaskPriorityGroups(countsResult.value.groups)
-      } else {
-        console.error('Error fetching task priority counts:', countsResult.reason)
-        setTaskPriorityCounts({ ...EMPTY_TASK_PRIORITY_COUNTS })
-        setTaskPriorityGroups(createEmptyTaskPriorityGroups())
-      }
-    } catch (error) {
-      console.error('Error fetching alerts:', error)
-      setTaskPriorityCounts({ ...EMPTY_TASK_PRIORITY_COUNTS })
-      setTaskPriorityGroups(createEmptyTaskPriorityGroups())
-    }
-    setLoading(false)
-  }
+  }, [fetchAlerts])
 
   const dismissAlert = async (alertId) => {
     try {
@@ -558,7 +521,7 @@ export function SmartAlerts() {
       })
       
       if (response.ok) {
-        setAlerts(alerts.filter(alert => alert.id !== alertId))
+        setAlerts((prev) => prev.filter((alert) => alert.id !== alertId))
       }
     } catch (error) {
       console.error('Error dismissing alert:', error)
@@ -569,7 +532,7 @@ export function SmartAlerts() {
     setLoading(true)
     try {
       await fetch('/api/alerts/generate', { method: 'POST' })
-      await fetchAlerts()
+      await fetchAlerts({ includeCounts: true })
     } catch (error) {
       console.error('Error generating alerts:', error)
     }
@@ -785,7 +748,7 @@ export function SmartAlerts() {
       </div>
 
       {/* Alerts List */}
-      {loading && alerts.length === 0 ? (
+      {loading && alerts.length === 0 && !hasLoadedOnce ? (
         <div className="flex items-center justify-center py-12">
           <div className="text-center">
             <Loader2 className="h-8 w-8 animate-spin mx-auto mb-4" />
