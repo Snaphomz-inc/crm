@@ -24,13 +24,13 @@ export default function RootLayout({ children }) {
             <div className="container mx-auto px-4 py-3 flex items-center justify-between">
               <a href="/" className="flex items-center gap-3">
                 <Image
-                  src="/snaphomz-logo.svg"
+                  src="/snaphomz-wordmark-black.png"
                   alt="Snaphomz"
-                  width={36}
-                  height={36}
+                  width={224}
+                  height={64}
+                  className="h-10 w-auto"
                   priority
                 />
-                <span className="text-lg font-semibold tracking-tight">Snaphomz</span>
               </a>
               <HeaderAuthControls />
             </div>

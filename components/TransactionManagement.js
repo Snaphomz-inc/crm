@@ -263,67 +263,11 @@ export function TransactionManagement() {
   const fetchTransactions = async () => {
     setLoading(true)
     try {
-      const response = await fetch('/api/transactions')
+      const response = await fetch('/api/transactions?include_open_stages=1')
       const data = await response.json()
       if (data.success) {
         const baseTransactions = Array.isArray(data.transactions) ? data.transactions : []
-
-        const enrichedTransactions = await Promise.all(
-          baseTransactions.map(async (tx) => {
-            try {
-              const txType = (tx?.transaction_type || 'sale').toLowerCase()
-              const checklistRes = await fetch(`/api/transactions/${tx.id}/checklist`)
-              const checklistData = await checklistRes.json()
-              if (!checklistRes.ok || !checklistData?.success || !Array.isArray(checklistData.checklist_items)) {
-                return tx
-              }
-
-              const incompleteItems = checklistData.checklist_items.filter((item) => item?.status !== 'completed')
-              const stageHistory = Array.isArray(tx?.stage_history) ? tx.stage_history : []
-              const forcedStages = new Set(
-                stageHistory
-                  .filter((entry) => {
-                    if (!entry || !entry.stage) return false
-                    if (entry.forced === true) return true
-                    return entry?.validation_result?.valid === false
-                  })
-                  .flatMap((entry) => [entry.stage, entry.transitioned_from].filter(Boolean))
-              )
-
-              const scopedStages = new Set(forcedStages)
-              if (tx?.current_stage) scopedStages.add(tx.current_stage)
-
-              // Backward compatibility for records where forced stage history wasn't persisted.
-              if (forcedStages.size === 0 && tx?.current_stage) {
-                const currentOrder = getStageOrder(tx.current_stage, txType)
-                incompleteItems.forEach((task) => {
-                  const order = getStageOrder(task?.stage, txType)
-                  if (order <= currentOrder) scopedStages.add(task.stage)
-                })
-              }
-
-              const openStages = Array.from(
-                new Set(
-                  incompleteItems
-                    .map((task) => task?.stage)
-                    .filter((stage) => stage && scopedStages.has(stage))
-                )
-              ).sort((a, b) => getStageOrder(a, txType) - getStageOrder(b, txType))
-
-              return {
-                ...tx,
-                open_stages: openStages.length > 0
-                  ? openStages
-                  : (tx?.current_stage ? [tx.current_stage] : [])
-              }
-            } catch (error) {
-              console.error(`Error deriving open stages for transaction ${tx?.id}:`, error)
-              return tx
-            }
-          })
-        )
-
-        setTransactions(enrichedTransactions)
+        setTransactions(baseTransactions)
       }
     } catch (error) {
       console.error('Error fetching transactions:', error)

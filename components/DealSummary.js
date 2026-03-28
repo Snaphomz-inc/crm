@@ -443,7 +443,11 @@ export function SmartAlerts() {
       if (filters.type !== 'all') params.append('type', filters.type)
       const query = params.toString()
       const alertsPath = `/api/alerts/smart${query ? `?${query}` : ''}`
-      const countsPromise = includeCounts ? fetchTaskPriorityCounts() : null
+      const countsPromise = includeCounts
+        ? fetchTaskPriorityCounts()
+            .then((result) => ({ ok: true, result }))
+            .catch((error) => ({ ok: false, error }))
+        : null
       const response = await fetch(alertsPath)
       const data = await response.json().catch(() => ({}))
 
@@ -452,16 +456,15 @@ export function SmartAlerts() {
       }
 
       if (countsPromise) {
-        countsPromise
-          .then((result) => {
-            setTaskPriorityCounts(result.counts)
-            setTaskPriorityGroups(result.groups)
-          })
-          .catch((error) => {
-            console.error('Error fetching task priority counts:', error)
-            setTaskPriorityCounts({ ...EMPTY_TASK_PRIORITY_COUNTS })
-            setTaskPriorityGroups(createEmptyTaskPriorityGroups())
-          })
+        const countsOutcome = await countsPromise
+        if (countsOutcome?.ok) {
+          setTaskPriorityCounts(countsOutcome.result.counts)
+          setTaskPriorityGroups(countsOutcome.result.groups)
+        } else {
+          console.error('Error fetching task priority counts:', countsOutcome?.error)
+          setTaskPriorityCounts({ ...EMPTY_TASK_PRIORITY_COUNTS })
+          setTaskPriorityGroups(createEmptyTaskPriorityGroups())
+        }
       }
     } catch (error) {
       console.error('Error fetching alerts:', error)

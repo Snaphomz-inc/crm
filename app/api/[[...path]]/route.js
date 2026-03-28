@@ -53,19 +53,18 @@ const CALENDAR_PROVIDER_IDS = [CALENDAR_PROVIDER_GOOGLE, CALENDAR_PROVIDER_OUTLO
 const CALENDAR_TOKEN_ENCRYPTION_PREFIX = 'enc:v1'
 const GRAPH_API_BASE_URL = 'https://graph.microsoft.com/v1.0'
 const CRM_USER_SCOPED_COLLECTIONS = new Set([
-  'transactions',
-  'checklist_items',
-  'leads',
-  'smart_alerts',
-  'assistant_conversations',
-  'property_searches',
-  'pmd_plans',
-  'assistant_plans',
+  // Keep user scoping for personal notification preferences only.
+  // Core CRM entities (leads/transactions/checklists/assistant memory) are shared workspace data.
   'notifications',
   'notification_preferences',
   'notification_email_log'
 ])
 const requestScopeStorage = new AsyncLocalStorage()
+const CRM_DEMO_MODE = (
+  String(process.env.DEMO_MODE || '').toLowerCase() === 'true'
+  || process.env.NODE_ENV !== 'production'
+)
+const ASSISTANT_INSIGHTS_BUDGET_MS = Math.max(1200, Number(process.env.ASSISTANT_INSIGHTS_BUDGET_MS || 2500))
 
 function buildOwnerScopedFilter(filter = {}, ownerUserId = null) {
   const normalized = isPlainObject(filter) ? filter : {}
@@ -906,15 +905,36 @@ function heuristicAssistantParseSafe(message = '') {
   const text = String(message || '')
   const lc = text.toLowerCase()
 
+  const normalizePersonName = (raw) => {
+    const base = String(raw || '').trim().replace(/\s+/g, ' ')
+    if (!base) return null
+    const cutoff = base.split(/\s+(?:and|who|that|he|she|his|her|wants?|needs?|looking|for|in|email|phone)\b/i)[0]
+    const cleaned = cutoff.trim().replace(/[.,;:!?]+$/g, '')
+    if (!cleaned) return null
+    const tokens = cleaned.split(' ').slice(0, 3)
+    return tokens
+      .map((t) => t ? (t.charAt(0).toUpperCase() + t.slice(1).toLowerCase()) : t)
+      .join(' ')
+  }
+
   const leadType = /\b(seller|selling|list(?:ing)?)\b/.test(lc) ? 'seller' : 'buyer'
+  const conversationalNameMatch =
+    text.match(/\b(?:just\s+met|met|lead\s+for|client\s+is)\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,3})/i)
   const nameMatch = text.match(/\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b/)
   const zipMatch = text.match(/\b(\d{5})(?:-\d{4})?\b/)
   const bedMatch = lc.match(/(\d+(?:\.\d+)?)\s*(?:bhk|bed(?:room)?s?|br)\b/)
   const bathMatch = lc.match(/(\d+(?:\.\d+)?)\s*(?:bath(?:room)?s?|ba)\b/)
-  const underPrice = lc.match(/\b(?:under|below|upto|up to|max(?:imum)?|<=?)\s*\$?\s*([\d,.]+)\s*(k|m|million|thousand)?\b/)
+  const underPrice = lc.match(/\b(?:under|unde|below|upto|up to|max(?:imum)?|<=?)\s*\$?\s*([\d,.]+)\s*(k|m|million|thousand)?\b/)
   const abovePrice = lc.match(/\b(?:above|over|at least|min(?:imum)?|>=?)\s*\$?\s*([\d,.]+)\s*(k|m|million|thousand)?\b/)
-  const inCity = text.match(/\bin\s+([A-Za-z]+(?:\s+[A-Za-z]+){0,2})\b/i)
-  const city = inCity ? inCity[1].trim() : null
+  const standalonePrice = lc.match(/\$\s*([\d,.]+)\s*(k|m|million|thousand)?\b/)
+  const inCity = text.match(/\bin\s+([A-Za-z][A-Za-z\s]{0,40})/i)
+  const city = (() => {
+    if (!inCity?.[1]) return null
+    const raw = String(inCity[1])
+    const clipped = raw.split(/\s+(?:under|unde|below|above|over|upto|up\s+to|max|with|for|email|mail|phone|mobile|and)\b|[$,.;]/i)[0]
+    const out = clipped.trim().replace(/\s+/g, ' ')
+    return out || null
+  })()
 
   const toNumber = (raw, unit) => {
     if (!raw) return null
@@ -928,7 +948,7 @@ function heuristicAssistantParseSafe(message = '') {
 
   return {
     lead_info: {
-      name: nameMatch ? nameMatch[1] : null,
+      name: normalizePersonName(conversationalNameMatch?.[1]) || (nameMatch ? nameMatch[1] : null),
       phone: null,
       email: null,
       lead_type: leadType
@@ -938,7 +958,7 @@ function heuristicAssistantParseSafe(message = '') {
       city,
       state: null,
       min_price: abovePrice ? toNumber(abovePrice[1], abovePrice[2]) : null,
-      max_price: underPrice ? toNumber(underPrice[1], underPrice[2]) : null,
+      max_price: underPrice ? toNumber(underPrice[1], underPrice[2]) : (standalonePrice ? toNumber(standalonePrice[1], standalonePrice[2]) : null),
       bedrooms: bedMatch ? Number(bedMatch[1]) : null,
       bathrooms: bathMatch ? Number(bathMatch[1]) : null,
       property_type: null
@@ -1743,8 +1763,11 @@ async function fetchProperties(filters = {}) {
 
     // Build MLSSearch request body
     const requestBody = {
-      size: Math.min(250, Number(limit) || 60),
-      status: 'Active'
+      include_photos: true,
+      active: true,
+      sold: false,
+      status: 'Active',
+      size: Math.min(250, Number(limit) || 60)
     }
     // Pagination with MLSSearch uses resultIndex (1-based per API samples)
     if (Number(offset) > 0) {
@@ -2065,11 +2088,23 @@ async function fetchProperties(filters = {}) {
         src.apn || src.parcel_number || src.parcelNumber || src.property_identifier || null
       )
 
+      const bedrooms = (listing?.property?.bedroomsTotal ?? src.bedrooms ?? src.beds ?? publicRec?.bedrooms ?? null)
+      const bathrooms = (listing?.property?.bathroomsTotal ?? src.bathrooms ?? src.baths ?? publicRec?.bathrooms ?? null)
+      const bedNum = Number(bedrooms)
+      const bathNum = Number(bathrooms)
+      const hasBedsOrBaths = (Number.isFinite(bedNum) && bedNum >= 1) || (Number.isFinite(bathNum) && bathNum >= 1)
+
       const propertySubType = Array.isArray(listing?.property?.propertySubType)
         ? listing.property.propertySubType[0]
         : (listing?.property?.propertySubType || null)
       const propertyTypeMain = listing?.property?.propertyType || src.property_type || src.type || ''
-      const normalizedPropertyType = propertySubType || propertyTypeMain
+      const normalizedPropertyType = hasBedsOrBaths ? (propertySubType || propertyTypeMain) : 'land'
+      const normalizedPropertyTypeMain = hasBedsOrBaths ? propertyTypeMain : 'land'
+      const normalizedPropertyTypeSub = hasBedsOrBaths ? propertySubType : 'land'
+      const leadTypes = (listing?.leadTypes && typeof listing.leadTypes === 'object') ? listing.leadTypes : {}
+      const leadTypeKeys = Object.keys(leadTypes).map((k) => String(k || '').toLowerCase())
+      const hasRentalLeadType = leadTypeKeys.some((k) => /rent|rental|lease/.test(k))
+      const hasSaleLeadType = leadTypeKeys.some((k) => /sale|listing|listprice|mlslistingprice/.test(k))
 
       return {
         id: provider_id || `prop_${Date.now()}_${Math.random()}`,
@@ -2083,13 +2118,15 @@ async function fetchProperties(filters = {}) {
         price_source,
         // Use photos returned inline from MLSSearch/media extraction.
         primary_image,
-        bedrooms: (listing?.property?.bedroomsTotal ?? src.bedrooms ?? src.beds ?? publicRec?.bedrooms ?? null),
-        bathrooms: (listing?.property?.bathroomsTotal ?? src.bathrooms ?? src.baths ?? publicRec?.bathrooms ?? null),
+        bedrooms,
+        bathrooms,
         square_feet: (listing?.property?.livingArea ?? src.square_feet ?? src.sqft ?? (publicRec?.squareFeet ? Number(publicRec.squareFeet) : null)),
         property_type: normalizedPropertyType,
-        property_type_main: propertyTypeMain || null,
-        property_type_sub: propertySubType || null,
+        property_type_main: normalizedPropertyTypeMain || null,
+        property_type_sub: normalizedPropertyTypeSub || null,
         listing_status: (listing?.standardStatus || listing?.customStatus || src.listing_status || src.status || ''),
+        is_rental_listing: hasRentalLeadType,
+        is_for_sale_listing: hasSaleLeadType || !hasRentalLeadType,
         description: src.description || '',
         images,
         listing_date: src.listing_date || src.date_listed || null,
@@ -2111,21 +2148,35 @@ async function fetchProperties(filters = {}) {
     const numericPrice = Number(p?.price)
     const hasNumericPrice = Number.isFinite(numericPrice) && numericPrice > 0
     const isLikelyRentalStatus = /(rent|rental|lease)/i.test(status)
-    const isLikelyMonthlyRent = hasNumericPrice && numericPrice < 10000
+    const isLikelyMonthlyRent = hasNumericPrice && numericPrice < 50000
+    const isRentalTagged = Boolean(p?.is_rental_listing)
+    const explicitlyForSale = Boolean(p?.is_for_sale_listing)
+    const isClosedLike = /(sold|closed|pending|contingent|off market|off-market)/i.test(status)
+    const isActiveLike = /(active|for sale|new|coming soon)/i.test(status)
 
     if (normalizedListingStatus === 'for_sale') {
-      return !isLikelyRentalStatus && !isLikelyMonthlyRent
+      return !isRentalTagged && !isLikelyRentalStatus && !isLikelyMonthlyRent && !isClosedLike && (isActiveLike || explicitlyForSale)
     }
     if (normalizedListingStatus === 'for_rent') {
-      return isLikelyRentalStatus || isLikelyMonthlyRent
+      return isRentalTagged || isLikelyRentalStatus || isLikelyMonthlyRent
     }
     return true
   })
 
+  // By default, return "house-like" listings only: at least 1 bed or 1 bath.
+  // Records without both are treated as land and excluded unless explicitly requested.
+  const defaultHouseOnly = statusFiltered.filter((p) => {
+    const beds = Number(p?.bedrooms)
+    const baths = Number(p?.bathrooms)
+    const hasBedsOrBaths = (Number.isFinite(beds) && beds >= 1) || (Number.isFinite(baths) && baths >= 1)
+    return hasBedsOrBaths
+  })
+
   // Apply property type filtering locally because MLS schema/category values differ from UI labels.
+  const selectedTypeToken = normalizePropertyTypeToken(property_type)
   const typeFiltered = property_type
     ? statusFiltered.filter((p) => matchesPropertyTypeSelection(p, property_type))
-    : statusFiltered
+    : (selectedTypeToken === 'land' ? statusFiltered : defaultHouseOnly)
 
   // Apply deterministic server-side sorting so UI order always matches selected sort option.
   const sortedNormalized = sortPropertiesBySelection(typeFiltered, sort_by)
@@ -2206,14 +2257,130 @@ function sanitizePreferences(prefs = {}) {
 // Map Lead preferences to RealEstateAPI filter schema
 function mapLeadPreferencesToFilters(prefs = {}) {
   if (!prefs || typeof prefs !== 'object') return {}
+  const composedLocation =
+    prefs.zipcode ||
+    prefs.preferred_zipcode ||
+    prefs.location ||
+    ([prefs.city, prefs.state].filter(Boolean).join(', ') || prefs.state || prefs.city || undefined)
   return {
-    location: prefs.zipcode || prefs.preferred_zipcode || prefs.location || undefined,
+    location: composedLocation,
     beds: prefs.bedrooms || prefs.beds || undefined,
     baths: prefs.bathrooms || prefs.baths || undefined,
     min_price: prefs.min_price || prefs.minPrice || undefined,
     max_price: prefs.max_price || prefs.maxPrice || undefined,
     property_type: prefs.property_type || prefs.type || undefined,
   }
+}
+
+function normalizeStateToAbbr(input) {
+  const stateMap = {
+    alabama: 'AL', alaska: 'AK', arizona: 'AZ', arkansas: 'AR', california: 'CA', colorado: 'CO',
+    connecticut: 'CT', delaware: 'DE', 'district of columbia': 'DC', florida: 'FL', georgia: 'GA',
+    hawaii: 'HI', idaho: 'ID', illinois: 'IL', indiana: 'IN', iowa: 'IA', kansas: 'KS', kentucky: 'KY',
+    louisiana: 'LA', maine: 'ME', maryland: 'MD', massachusetts: 'MA', michigan: 'MI', minnesota: 'MN',
+    mississippi: 'MS', missouri: 'MO', montana: 'MT', nebraska: 'NE', nevada: 'NV', 'new hampshire': 'NH',
+    'new jersey': 'NJ', 'new mexico': 'NM', 'new york': 'NY', 'north carolina': 'NC', 'north dakota': 'ND',
+    ohio: 'OH', oklahoma: 'OK', oregon: 'OR', pennsylvania: 'PA', 'rhode island': 'RI', 'south carolina': 'SC',
+    'south dakota': 'SD', tennessee: 'TN', texas: 'TX', utah: 'UT', vermont: 'VT', virginia: 'VA',
+    washington: 'WA', 'west virginia': 'WV', wisconsin: 'WI', wyoming: 'WY'
+  }
+  const raw = String(input || '').trim()
+  if (!raw) return null
+  if (/^[A-Za-z]{2}$/.test(raw)) return raw.toUpperCase()
+  return stateMap[raw.toLowerCase()] || null
+}
+
+function filterPropertiesByLeadPrefs(list = [], prefs = {}) {
+  const desiredZip = prefs?.zipcode ? String(prefs.zipcode).slice(0, 5) : null
+  const desiredCity = prefs?.city ? String(prefs.city).trim().toLowerCase() : null
+  const desiredState = normalizeStateToAbbr(prefs?.state)
+  const minBeds = prefs?.bedrooms != null ? Number(prefs.bedrooms) : (prefs?.beds != null ? Number(prefs.beds) : null)
+  const exactBeds = prefs?.exact_bedrooms != null ? Number(prefs.exact_bedrooms) : null
+  const minBaths = prefs?.bathrooms != null ? Number(prefs.bathrooms) : (prefs?.baths != null ? Number(prefs.baths) : null)
+  const minPrice = prefs?.min_price != null ? Number(prefs.min_price) : (prefs?.minPrice != null ? Number(prefs.minPrice) : null)
+  const maxPrice = prefs?.max_price != null ? Number(prefs.max_price) : (prefs?.maxPrice != null ? Number(prefs.maxPrice) : null)
+
+  return Array.isArray(list) ? list.filter((p) => {
+    const pZip = String(p?.zipcode || '').slice(0, 5)
+    const pCity = String(p?.city || '').trim().toLowerCase()
+    const pState = normalizeStateToAbbr(p?.state)
+    if (desiredZip && pZip !== desiredZip) return false
+    if (desiredState && pState !== desiredState) return false
+    if (desiredCity && pCity && pCity !== desiredCity) return false
+    if (exactBeds !== null && Number.isFinite(exactBeds)) {
+      if (!(typeof p?.bedrooms === 'number') || p.bedrooms !== exactBeds) return false
+    } else if (minBeds !== null && Number.isFinite(minBeds) && (!(typeof p?.bedrooms === 'number') || p.bedrooms < minBeds)) return false
+    if (minBaths !== null && Number.isFinite(minBaths) && (!(typeof p?.bathrooms === 'number') || p.bathrooms < minBaths)) return false
+    if (minPrice !== null && Number.isFinite(minPrice) && (!(typeof p?.price === 'number') || p.price < minPrice)) return false
+    if (maxPrice !== null && Number.isFinite(maxPrice) && (!(typeof p?.price === 'number') || p.price > maxPrice)) return false
+    const status = String(p?.listing_status || '').toLowerCase()
+    const wantsRental = Boolean(prefs?.wants_rental)
+    if (!wantsRental && /\b(lease|rent|rental)\b/.test(status)) return false
+    return true
+  }) : []
+}
+
+function dedupeProperties(list = []) {
+  const seen = new Set()
+  const out = []
+  for (const p of (Array.isArray(list) ? list : [])) {
+    const key = [
+      String(p?.provider_id || p?.id || '').trim().toLowerCase(),
+      String(p?.address || '').trim().toLowerCase(),
+      String(p?.city || '').trim().toLowerCase(),
+      String(p?.state || '').trim().toLowerCase(),
+      String(p?.zipcode || '').trim().slice(0, 5),
+      String(p?.price ?? '')
+    ].join('|')
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    out.push(p)
+  }
+  return out
+}
+
+function relaxedPropertiesForDemo(list = [], prefs = {}) {
+  const minBeds = prefs?.bedrooms != null ? Number(prefs.bedrooms) : (prefs?.beds != null ? Number(prefs.beds) : null)
+  const minPrice = prefs?.min_price != null ? Number(prefs.min_price) : (prefs?.minPrice != null ? Number(prefs.minPrice) : null)
+  const maxPrice = prefs?.max_price != null ? Number(prefs.max_price) : (prefs?.maxPrice != null ? Number(prefs.maxPrice) : null)
+  const desiredState = normalizeStateToAbbr(prefs?.state)
+  const desiredZip = prefs?.zipcode ? String(prefs.zipcode).slice(0, 5) : null
+  const desiredCity = prefs?.city ? String(prefs.city).trim().toLowerCase() : null
+
+  const soft = (Array.isArray(list) ? list : []).filter((p) => {
+    if (minBeds !== null && Number.isFinite(minBeds) && (!(typeof p?.bedrooms === 'number') || p.bedrooms < minBeds)) return false
+    if (minPrice !== null && Number.isFinite(minPrice) && (!(typeof p?.price === 'number') || p.price < minPrice)) return false
+    if (maxPrice !== null && Number.isFinite(maxPrice) && (!(typeof p?.price === 'number') || p.price > maxPrice)) return false
+    if (desiredZip && String(p?.zipcode || '').slice(0, 5) !== desiredZip) return false
+    if (desiredState && normalizeStateToAbbr(p?.state) !== desiredState) return false
+    return true
+  })
+
+  if (soft.length) return soft
+
+  // Last resort: keep any same city/state candidates, then fallback to original list.
+  const cityState = (Array.isArray(list) ? list : []).filter((p) => {
+    const pCity = String(p?.city || '').trim().toLowerCase()
+    const pState = normalizeStateToAbbr(p?.state)
+    if (desiredCity && pCity && pCity === desiredCity) return true
+    if (desiredState && pState && pState === desiredState) return true
+    return false
+  })
+  return cityState.length ? cityState : (Array.isArray(list) ? list : [])
+}
+
+function buildDeterministicInsights(lead = {}, properties = []) {
+  const list = Array.isArray(properties) ? properties : []
+  if (!list.length) return 'Your request has been processed.'
+  const top = list.slice(0, 3)
+  const lines = top.map((p, idx) => {
+    const addr = p?.address || [p?.street, p?.city].filter(Boolean).join(', ') || 'Unknown address'
+    const price = typeof p?.price === 'number' ? `$${p.price.toLocaleString('en-US')}` : 'Price unavailable'
+    const beds = p?.bedrooms ?? '-'
+    const baths = p?.bathrooms ?? '-'
+    return `${idx + 1}) ${addr} - ${price} - ${beds} bed / ${baths} bath`
+  })
+  return `AI Insights\n${lines.join('\n')}\n\nSummary\nFound ${list.length} properties matching your search.\n\nNext Steps\n- Review the top matches.\n- Save the best-fit property to the lead.\n- Create a transaction when ready.`
 }
 
 // Stage Transition Validation using o1-mini (aware of buyer vs seller flows)
@@ -3629,6 +3796,28 @@ function getRequestAuthContext(request) {
     userKey,
     isAuthenticated: Boolean(token && claims)
   }
+}
+
+function deriveAgentDisplayName(auth = {}) {
+  const claims = auth?.claims || {}
+  const candidates = [
+    claims?.name,
+    [claims?.given_name, claims?.family_name].filter(Boolean).join(' ').trim(),
+    claims?.preferred_username,
+    claims?.['cognito:username']
+  ].map((v) => String(v || '').trim()).filter(Boolean)
+
+  for (const c of candidates) {
+    if (!c) continue
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(c)) continue
+    if (isEmailLike(c)) continue
+    return c
+  }
+
+  if (auth?.email && isEmailLike(auth.email)) {
+    return String(auth.email).split('@')[0]
+  }
+  return null
 }
 
 const NOTIFICATION_PREFS_DOC_ID = 'default'
@@ -7212,12 +7401,14 @@ async function syncTransactionCalendarDelete({ db, request, transactionId }) {
 
 // Lead deduplication check
 async function checkDuplicateLead(db, email, phone) {
-  const existingLead = await db.collection('leads').findOne({
-    $or: [
-      { email: email },
-      { phone: phone }
-    ]
-  })
+  const normalizedEmail = typeof email === 'string' ? email.trim() : ''
+  const normalizedPhone = typeof phone === 'string' ? phone.trim() : ''
+  const orConditions = []
+  if (normalizedEmail) orConditions.push({ email: normalizedEmail })
+  if (normalizedPhone) orConditions.push({ phone: normalizedPhone })
+  if (!orConditions.length) return null
+
+  const existingLead = await db.collection('leads').findOne({ $or: orConditions })
   return existingLead
 }
 
@@ -7279,7 +7470,10 @@ ${sellerAddress ? '- Suggest obtaining a CMA for the specific address.' : ''}`
       }
     ]
 
-    return await callOpenAI('gpt-4o-mini', messages)
+    return await callOpenAI('gpt-4o-mini', messages, {
+      requestTimeoutMs: 9000,
+      customRetries: 1
+    })
   }
 
   // Buyer (default): use existing property matching logic.
@@ -7292,14 +7486,13 @@ ${sellerAddress ? '- Suggest obtaining a CMA for the specific address.' : ''}`
       fetchedProps = res?.properties || []
 
       // Apply strict filtering to align with constraints
-      const desiredZip = filters.location ? String(filters.location).slice(0, 5) : null
       const minBeds = filters.beds ? Number(filters.beds) : null
       const minBaths = filters.baths ? Number(filters.baths) : null
       const minPrice = filters.min_price ? Number(filters.min_price) : null
       const maxPrice = filters.max_price ? Number(filters.max_price) : null
 
       fetchedProps = fetchedProps.filter(p => {
-        if (desiredZip && String(p.zipcode || '').slice(0, 5) !== desiredZip) return false
+        if (!filterPropertiesByLeadPrefs([p], safeLead?.preferences || {}).length) return false
         if (minBeds !== null && !(typeof p.bedrooms === 'number' && p.bedrooms >= minBeds)) return false
         if (minBaths !== null && !(typeof p.bathrooms === 'number' && p.bathrooms >= minBaths)) return false
         if (minPrice !== null || maxPrice !== null) {
@@ -7347,7 +7540,10 @@ ${sellerAddress ? '- Suggest obtaining a CMA for the specific address.' : ''}`
     }
   ]
 
-  return await callOpenAI('gpt-4o-mini', messages)
+  return await callOpenAI('gpt-4o-mini', messages, {
+    requestTimeoutMs: 9000,
+    customRetries: 1
+  })
 }
 
 // OPTIONS handler for CORS
@@ -7652,16 +7848,19 @@ async function handleRoute(request, { params }) {
     // POST /api/leads - Create new lead
     if (route === '/leads' && method === 'POST') {
       const body = await request.json()
-      
-      if (!body.name || !body.email || !body.phone) {
+
+      if (!body.name || !String(body.name).trim()) {
         return handleCORS(NextResponse.json(
-          { error: "Name, email, and phone are required" }, 
+          { error: "Name is required" },
           { status: 400 }
         ))
       }
 
+      const normalizedEmail = body.email ? String(body.email).trim() : null
+      const normalizedPhone = body.phone ? String(body.phone).trim() : null
+
       // Check for duplicates
-      const duplicate = await checkDuplicateLead(db, body.email, body.phone)
+      const duplicate = await checkDuplicateLead(db, normalizedEmail, normalizedPhone)
       if (duplicate) {
         return handleCORS(NextResponse.json(
           { error: "Lead with this email or phone already exists", existing_lead: duplicate.id }, 
@@ -7671,11 +7870,12 @@ async function handleRoute(request, { params }) {
 
       const lead = {
         id: uuidv4(),
-        name: body.name,
-        email: body.email,
-        phone: body.phone,
+        name: String(body.name).trim(),
+        email: normalizedEmail,
+        phone: normalizedPhone,
         lead_type: body.lead_type || 'buyer',
         preferences: body.preferences || {},
+        interested_properties: Array.isArray(body.interested_properties) ? body.interested_properties : [],
         assigned_agent: body.assigned_agent || null,
         tags: body.tags || [],
         source: body.source || 'manual',
@@ -7686,14 +7886,23 @@ async function handleRoute(request, { params }) {
 
       await db.collection('leads').insertOne(lead)
       
-      // Generate AI insights
-      const insights = await generateLeadInsights(lead)
-      if (insights) {
-        await db.collection('leads').updateOne(
-          { id: lead.id },
-          { $set: { ai_insights: insights, updated_at: new Date() } }
-        )
-        lead.ai_insights = insights
+      // Generate AI insights (best-effort; never block lead creation on AI failure).
+      const skipAiInsights =
+        body?.skip_ai_insights === true ||
+        String(body?.skip_ai_insights || '').toLowerCase() === 'true'
+      if (!skipAiInsights) {
+        try {
+          const insights = await generateLeadInsights(lead)
+          if (insights) {
+            await db.collection('leads').updateOne(
+              { id: lead.id },
+              { $set: { ai_insights: insights, updated_at: new Date() } }
+            )
+            lead.ai_insights = insights
+          }
+        } catch (e) {
+          console.warn('POST /api/leads: generateLeadInsights failed, continuing without ai_insights', e?.message || e)
+        }
       }
 
       const { _id, ...cleanedLead } = lead
@@ -7745,10 +7954,82 @@ async function handleRoute(request, { params }) {
       return handleCORS(NextResponse.json(cleanedLead))
     }
 
+    // GET /api/leads/:id/deletion-impact - Check linked transactions before delete
+    if (route.match(/^\/leads\/[^\/]+\/deletion-impact$/) && method === 'GET') {
+      const leadId = path[1]
+      const lead = await db.collection('leads').findOne({ id: leadId })
+      if (!lead) {
+        return handleCORS(NextResponse.json(
+          { error: "Lead not found" },
+          { status: 404 }
+        ))
+      }
+
+      const linkedTransactions = await db.collection('transactions')
+        .find({ lead_id: leadId })
+        .project({ id: 1, current_stage: 1, property_address: 1 })
+        .toArray()
+
+      return handleCORS(NextResponse.json({
+        success: true,
+        lead_id: leadId,
+        linked_transactions_count: linkedTransactions.length,
+        linked_transactions: linkedTransactions.map(({ _id, ...rest }) => rest)
+      }))
+    }
+
     // DELETE /api/leads/:id - Delete lead
     if (route.match(/^\/leads\/[^\/]+$/) && method === 'DELETE') {
       const leadId = path[1]
-      
+      const url = new URL(request.url)
+      const deleteTransactions = String(url.searchParams.get('delete_transactions') || '').toLowerCase() === 'true'
+      const keepTransactions = String(url.searchParams.get('keep_transactions') || '').toLowerCase() === 'true'
+
+      const lead = await db.collection('leads').findOne({ id: leadId })
+      if (!lead) {
+        return handleCORS(NextResponse.json(
+          { error: "Lead not found" },
+          { status: 404 }
+        ))
+      }
+
+      const linkedTransactions = await db.collection('transactions')
+        .find({ lead_id: leadId })
+        .project({ id: 1 })
+        .toArray()
+      const linkedCount = linkedTransactions.length
+
+      if (linkedCount > 0 && !deleteTransactions && !keepTransactions) {
+        return handleCORS(NextResponse.json({
+          success: false,
+          error: `This lead has ${linkedCount} linked transaction(s). Choose whether to keep or delete linked transactions.`,
+          code: 'LEAD_HAS_LINKED_TRANSACTIONS',
+          linked_transactions_count: linkedCount
+        }, { status: 409 }))
+      }
+
+      let deletedTransactionsCount = 0
+      if (linkedCount > 0 && deleteTransactions) {
+        const txIds = linkedTransactions.map((tx) => tx.id).filter(Boolean)
+        const txDeleteResult = await db.collection('transactions').deleteMany({ lead_id: leadId })
+        deletedTransactionsCount = txDeleteResult?.deletedCount || 0
+        if (txIds.length > 0) {
+          await db.collection('checklist_items').deleteMany({ transaction_id: { $in: txIds } })
+        }
+      } else if (linkedCount > 0 && keepTransactions) {
+        await db.collection('transactions').updateMany(
+          { lead_id: leadId },
+          {
+            $set: {
+              lead_id: null,
+              lead_deleted: true,
+              deleted_lead_name: lead?.name || null,
+              updated_at: new Date()
+            }
+          }
+        )
+      }
+
       const result = await db.collection('leads').deleteOne({ id: leadId })
       
       if (result.deletedCount === 0) {
@@ -7758,7 +8039,13 @@ async function handleRoute(request, { params }) {
         ))
       }
 
-      return handleCORS(NextResponse.json({ message: "Lead deleted successfully" }))
+      return handleCORS(NextResponse.json({
+        success: true,
+        message: "Lead deleted successfully",
+        linked_transactions_count: linkedCount,
+        deleted_transactions_count: deletedTransactionsCount,
+        kept_transactions: linkedCount > 0 && !deleteTransactions
+      }))
     }
 
     // POST /api/leads/:id/match - AI-powered property matching
@@ -7829,24 +8116,13 @@ async function handleRoute(request, { params }) {
       const properties = propertySearchResult?.properties || []
 
       // Apply strict, preference-aligned filtering so AI only sees valid candidates
-      const desiredZip = filters.location ? String(filters.location).slice(0, 5) : null
       const minBeds = filters.beds ? Number(filters.beds) : null
       const minBaths = filters.baths ? Number(filters.baths) : null
       const minPrice = filters.min_price ? Number(filters.min_price) : null
       const maxPrice = filters.max_price ? Number(filters.max_price) : null
 
       function filterStrict(list) {
-        return list.filter(p => {
-          if (desiredZip && String(p.zipcode || '').slice(0, 5) !== desiredZip) return false
-          if (minBeds !== null && !(typeof p.bedrooms === 'number' && p.bedrooms >= minBeds)) return false
-          if (minBaths !== null && !(typeof p.bathrooms === 'number' && p.bathrooms >= minBaths)) return false
-          if (minPrice !== null || maxPrice !== null) {
-            if (typeof p.price !== 'number') return false
-            if (minPrice !== null && p.price < minPrice) return false
-            if (maxPrice !== null && p.price > maxPrice) return false
-          }
-          return true
-        })
+        return filterPropertiesByLeadPrefs(list, lead.preferences || {})
       }
 
       // Progressive relaxation in case of zero strict matches
@@ -7856,7 +8132,7 @@ async function handleRoute(request, { params }) {
       if (matchingPool.length === 0) {
         // Allow unknown baths
         matchingPool = properties.filter(p => {
-          if (desiredZip && String(p.zipcode || '').slice(0, 5) !== desiredZip) return false
+          if (!filterPropertiesByLeadPrefs([p], lead.preferences || {}).length) return false
           if (minBeds !== null && !(typeof p.bedrooms === 'number' && p.bedrooms >= minBeds)) return false
           if (minPrice !== null || maxPrice !== null) {
             if (typeof p.price !== 'number') return false
@@ -7871,7 +8147,7 @@ async function handleRoute(request, { params }) {
       if (matchingPool.length === 0) {
         // Allow unknown beds too
         matchingPool = properties.filter(p => {
-          if (desiredZip && String(p.zipcode || '').slice(0, 5) !== desiredZip) return false
+          if (!filterPropertiesByLeadPrefs([p], lead.preferences || {}).length) return false
           if (minBaths !== null && !(typeof p.bathrooms === 'number' && p.bathrooms >= minBaths)) return false
           if (minPrice !== null || maxPrice !== null) {
             if (typeof p.price !== 'number') return false
@@ -7888,7 +8164,7 @@ async function handleRoute(request, { params }) {
         const adjMin = minPrice !== null ? Math.floor(minPrice * 0.9) : null
         const adjMax = maxPrice !== null ? Math.ceil(maxPrice * 1.1) : null
         matchingPool = properties.filter(p => {
-          if (desiredZip && String(p.zipcode || '').slice(0, 5) !== desiredZip) return false
+          if (!filterPropertiesByLeadPrefs([p], lead.preferences || {}).length) return false
           if (minBeds !== null && typeof p.bedrooms === 'number' && p.bedrooms < minBeds) return false
           if (minBaths !== null && typeof p.bathrooms === 'number' && p.bathrooms < minBaths) return false
           if (typeof p.price !== 'number') return false
@@ -8164,7 +8440,12 @@ async function handleRoute(request, { params }) {
           }
         ]
 
-        const response = await callOpenAI('gpt-4o-mini', messages, { maxTokens: 700, temperature: 0 })
+        const response = await callOpenAI('gpt-4o-mini', messages, {
+          maxTokens: 700,
+          temperature: 0,
+          requestTimeoutMs: 9000,
+          customRetries: 1
+        })
         
         if (!response) {
           throw new Error('No response from OpenAI')
@@ -8197,10 +8478,13 @@ async function handleRoute(request, { params }) {
       try {
         const body = await request.json()
         let { parsed_data, original_message, agent_name, lead_id: incomingLeadId } = body
+        const authCtx = getRequestAuthContext(request)
+        const resolvedAgentName = String(agent_name || deriveAgentDisplayName(authCtx) || '').trim() || null
 
         // Allow flexible inputs from frontend: query/text/message/original_message
         let query = (body.query || body.text || body.message || original_message || '').toString()
         if (!original_message && query) original_message = query
+        const sessionId = String(body.session_id || body.ai_session_id || body.sessionId || uuidv4())
 
         // AI Search bridge (optional): if AI_SEARCH_BASE_URL is set, route through Snaphomz-ai-search tool framework first.
         const skipAiSearchBridge =
@@ -8216,7 +8500,75 @@ async function handleRoute(request, { params }) {
           body?.skip_property_search === true ||
           String(body?.skip_property_search || '').toLowerCase() === 'true'
 
-        if (query && !skipAiSearchBridge) {
+        const crmMutationLikeIntent = (() => {
+          const text = String(query || '').toLowerCase().trim()
+          if (!text) return false
+          if (body?.force_crm === true || String(body?.force_crm || '').toLowerCase() === 'true') return true
+          // Keep CRM writes local so bridge responses don't bypass transaction creation.
+          return (
+            /\b(create|open|start|save|log|record)\b/.test(text) &&
+            /\b(transaction|deal|crm)\b/.test(text)
+          ) ||
+          /\bsave it\b|\blog it\b|\bsave to my profile\b/.test(text) ||
+          (
+            /\b(continue|resume|counter[-\s]?offer|closing costs?|price drop|listing update|valuation report|rate buydown|cash flow|cap rate|draft|prepare)\b/.test(text) &&
+            /\b(transaction|deal|crm|brooklyn|riverside|oakwood|smith|duplex)\b/.test(text)
+          )
+        })()
+
+        const crmLeadCaptureIntent = (() => {
+          const text = String(query || '').toLowerCase().trim()
+          if (!text) return false
+          return (
+            /\bjust met\b|\bmet\s+[a-z]/.test(text) ||
+            /\b[a-z][a-z'.-]*(?:\s+[a-z][a-z'.-]*){0,2}\s+(?:wants?|needs?|is\s+looking)\b/.test(text) ||
+            /\bcreate\b.*\blead\b/.test(text) ||
+            /\bsave\b.*\blead\b/.test(text) ||
+            /\bnew\s+lead\b/.test(text) ||
+            /\blead\s+for\b/.test(text) ||
+            /\bclient\b/.test(text)
+          )
+        })()
+
+        const crmLeadLookupIntent = (() => {
+          const text = String(query || '').toLowerCase().trim()
+          if (!text) return false
+          return (
+            /\bis\s+.+\s+in\s+(our\s+)?leads?\b/.test(text) ||
+            /\bdo\s+we\s+have\s+.+\s+lead\b/.test(text) ||
+            /\bdo\s+we\s+have\s+any\s+leads?\s+on\s+the\s+name\s+of\b/.test(text) ||
+            /\bleads?\s+on\s+the\s+name\s+of\b/.test(text) ||
+            /\bleads?\s+for\s+[a-z]/.test(text) ||
+            /\bcheck\s+.+\s+lead\b/.test(text) ||
+            /\bfind\s+lead\b/.test(text)
+          )
+        })()
+
+        const crmTransactionLookupIntent = (() => {
+          const text = String(query || '').toLowerCase().trim()
+          if (!text) return false
+          const hasCreateVerb = /\b(create|open|start|save|log|record)\b/.test(text)
+          if (hasCreateVerb) return false
+          return (
+            (/\b(transaction|deal)\b/.test(text) && /\b(did\s+we\s+create|do\s+(?:we|u)\s+have|is\s+there|check|find|status|stage)\b/.test(text)) ||
+            /\btransaction\s+for\b/.test(text) ||
+            /\bdeal\s+for\b/.test(text) ||
+            /\btransaction\s+on\s+(?:that\s+)?name\b/.test(text) ||
+            /\bdeal\s+on\s+(?:that\s+)?name\b/.test(text) ||
+            /\btransaction\s+with\s+client\s+name\b/.test(text) ||
+            /\bdeal\s+with\s+client\s+name\b/.test(text)
+          )
+        })()
+        const crmFollowupCreateIntent = (() => {
+          const text = String(query || '').toLowerCase().trim()
+          if (!text) return false
+          return (
+            /^(yes|yeah|yep|sure|ok|okay)\b.*\b(create|open|start|save|log|record)\b/.test(text) ||
+            /^(create|open|start|save|log|record)\b$/.test(text)
+          )
+        })()
+
+        if (query && !skipAiSearchBridge && !crmMutationLikeIntent && !crmFollowupCreateIntent && !crmLeadCaptureIntent && !crmLeadLookupIntent && !crmTransactionLookupIntent) {
           try {
             const external = await tryAiSearchBridge({ query, sessionId: body.session_id || body.ai_session_id || null })
             if (external?.success) {
@@ -8228,23 +8580,34 @@ async function handleRoute(request, { params }) {
         }
         // Backward compatibility: if parsed_data missing, invoke the heavy parser internally
         if (!parsed_data && query) {
-          try {
-            const parseRes = await handleRoute(
-              new Request(request.url, {
-                method: 'POST',
-                body: JSON.stringify({ message: query }),
-                headers: { 'content-type': 'application/json' }
-              }),
-              { params: { path: ['assistant', 'parse'] } }
-            )
-            const parsedJson = await parseRes.json()
-            if (parsedJson?.success && parsedJson.parsed_data) {
-              parsed_data = parsedJson.parsed_data
-            } else if (parsedJson?.parsed_data) {
-              parsed_data = parsedJson.parsed_data
+          // Fast-path parse for CRM-centric intents to avoid unnecessary model latency.
+          parsed_data = heuristicAssistantParseSafe(query)
+          const needsAiParse =
+            !CRM_DEMO_MODE &&
+            !crmMutationLikeIntent &&
+            !crmLeadCaptureIntent &&
+            !crmLeadLookupIntent &&
+            !crmTransactionLookupIntent &&
+            !crmFollowupCreateIntent
+          if (needsAiParse) {
+            try {
+              const parseRes = await handleRoute(
+                new Request(request.url, {
+                  method: 'POST',
+                  body: JSON.stringify({ message: query }),
+                  headers: { 'content-type': 'application/json' }
+                }),
+                { params: { path: ['assistant', 'parse'] } }
+              )
+              const parsedJson = await parseRes.json()
+              if (parsedJson?.success && parsedJson.parsed_data) {
+                parsed_data = parsedJson.parsed_data
+              } else if (parsedJson?.parsed_data) {
+                parsed_data = parsedJson.parsed_data
+              }
+            } catch (e) {
+              console.warn('Fallback heavy parse failed:', e)
             }
-          } catch (e) {
-            console.warn('Fallback heavy parse failed:', e)
           }
         }
 
@@ -8260,9 +8623,73 @@ async function handleRoute(request, { params }) {
 
         // Extract entities and enhance for seller detection
         let { lead_info = {}, preferences = {}, intent = '', summary = '', transaction_info = {} } = parsed_data || {}
+        const parsedPreferencesInput = { ...(preferences || {}) }
 
         const wholeMessage = (original_message || query || '').toString()
         const lcWhole = wholeMessage.toLowerCase()
+        const normalizedQuery = String(wholeMessage || '').toLowerCase()
+        const personNamePattern = "([A-Za-z][A-Za-z'.-]*(?:\\s+[A-Za-z][A-Za-z'.-]*){0,2})"
+        const isPlaceholderLeadName = (raw) => {
+          const v = String(raw || '').toLowerCase().trim().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ')
+          if (!v) return true
+          const singleBlocked = new Set(['any', 'lead', 'leads', 'transaction', 'transactions', 'deal', 'deals', 'name', 'on', 'for', 'of', 'that', 'this', 'is', 'there', 'in', 'at', 'to', 'client', 'buyer', 'seller'])
+          const phraseBlocked = new Set(['this lead', 'that lead', 'the lead', 'new lead', 'existing lead', 'my lead', 'our lead', 'the client', 'this client', 'that client'])
+          return singleBlocked.has(v) || phraseBlocked.has(v)
+        }
+        const normalizeLeadNameForMatch = (raw) => {
+          let v = String(raw || '').trim().replace(/\s+/g, ' ').replace(/'s$/i, '')
+          if (!v) return null
+          // Remove trailing helper words ("baba lead" => "baba")
+          v = v.replace(/\b(?:lead|client|name)\b\s*$/i, '').trim()
+          // Remove leading fillers ("the baba" => "baba")
+          v = v.replace(/^the\s+/i, '').trim()
+          if (!v) return null
+          return v
+        }
+        const sanitizeRequestedName = (raw) => {
+          const name = normalizeLeadNameForMatch(raw)
+          if (!name) return null
+          if (isPlaceholderLeadName(name)) return null
+          return name
+        }
+        const requestedLeadName =
+          sanitizeRequestedName(wholeMessage.match(new RegExp(`\\bis\\s+${personNamePattern}\\s+in\\s+(?:our\\s+)?leads?\\b`, 'i'))?.[1])
+          || sanitizeRequestedName(wholeMessage.match(new RegExp(`\\bdo\\s+(?:we|u)\\s+have\\s+(?:any\\s+)?(?:lead|leads?)\\s+(?:on|for)\\s+(?:the\\s+)?name\\s+(?:of\\s+)?${personNamePattern}\\b`, 'i'))?.[1])
+          || sanitizeRequestedName(wholeMessage.match(new RegExp(`\\bdo\\s+(?:we|u)\\s+have\\s+${personNamePattern}\\s+in\\s+(?:our\\s+)?leads?\\b`, 'i'))?.[1])
+          || sanitizeRequestedName(wholeMessage.match(new RegExp(`\\bcheck\\s+${personNamePattern}\\s+lead\\b`, 'i'))?.[1])
+          || sanitizeRequestedName(wholeMessage.match(new RegExp(`\\bleads?\\s+on\\s+(?:the\\s+)?name\\s+(?:of\\s+)?${personNamePattern}\\b`, 'i'))?.[1])
+          || sanitizeRequestedName(wholeMessage.match(new RegExp(`\\bleads?\\s+for\\s+${personNamePattern}\\b`, 'i'))?.[1])
+        const requestedTransactionLeadName =
+          sanitizeRequestedName(wholeMessage.match(new RegExp(`\\bwhat\\s+stage\\s+is\\s+${personNamePattern}(?:'s)?\\s+(?:transaction|deal)\\b`, 'i'))?.[1])
+          || sanitizeRequestedName(wholeMessage.match(new RegExp(`\\b(?:transaction|deal)\\s+for\\s+${personNamePattern}\\b`, 'i'))?.[1])
+          || sanitizeRequestedName(wholeMessage.match(new RegExp(`\\bdid\\s+we\\s+create\\s+(?:a\\s+)?(?:transaction|deal)\\s+for\\s+${personNamePattern}\\b`, 'i'))?.[1])
+          || sanitizeRequestedName(wholeMessage.match(new RegExp(`\\bdo\\s+(?:we|u)\\s+have\\s+(?:any\\s+)?(?:transaction|deal)\\s+for\\s+${personNamePattern}\\b`, 'i'))?.[1])
+          || sanitizeRequestedName(wholeMessage.match(new RegExp(`\\bdo\\s+(?:we|u)\\s+have\\s+(?:any\\s+)?(?:transaction|deal)\\s+on\\s+(?:the\\s+)?name\\s+(?:of\\s+)?${personNamePattern}\\b`, 'i'))?.[1])
+          || sanitizeRequestedName(wholeMessage.match(new RegExp(`\\b(?:transaction|deal)\\s+with\\s+client\\s+name\\s+${personNamePattern}\\b`, 'i'))?.[1])
+          || sanitizeRequestedName(wholeMessage.match(new RegExp(`\\b(?:at\\s+what\\s+)?stage\\b.*\\b(?:transaction|deal)\\b.*\\b(?:client\\s+name\\s+)?${personNamePattern}\\b`, 'i'))?.[1])
+        const explicitTargetLeadName = requestedTransactionLeadName || requestedLeadName || null
+        const saveOrLogSignal = (
+          (
+            /\b(save|log|record|create|open|start)\b/.test(normalizedQuery) &&
+            /\b(transaction|deal|crm)\b/.test(normalizedQuery)
+          ) ||
+          /^(yes|yeah|yep|sure|ok|okay)\b.*\b(save|log)\b/.test(normalizedQuery) ||
+          /\bsave it\b|\blog it\b|\bsave to my profile\b/.test(normalizedQuery)
+        )
+        const explicitLeadSaveSignal = (
+          /\b(save|create|add|log|record)\b.*\blead\b/.test(normalizedQuery) ||
+          /\bsave\s+this\s+lead\b/.test(normalizedQuery) ||
+          /\bcreate\s+new\s+lead\b/.test(normalizedQuery)
+        )
+        const explicitCreateTransactionSignal = (
+          /\b(create|open|start)\b/.test(normalizedQuery) &&
+          /\b(transaction|deal|crm)\b/.test(normalizedQuery)
+        )
+        const followupCreateTransactionSignal = (
+          /^(yes|yeah|yep|sure|ok|okay)\b.*\b(create|open|start|save|log|record)\b/.test(normalizedQuery) ||
+          /^(create|open|start|save|log|record)\b$/.test(normalizedQuery)
+        )
+        const prefersNewTransaction = /\bnew\s+transaction\b|\bnew\s+deal\b/.test(normalizedQuery)
         const sellerHints = (
           /\bseller\b/.test(lcWhole) ||
           /\bsell(?:ing)?\b/.test(lcWhole) ||
@@ -8276,6 +8703,50 @@ async function handleRoute(request, { params }) {
         )
         if (!lead_info.lead_type && (sellerHints || explicitSellerFields)) {
           lead_info.lead_type = 'seller'
+        }
+        if (!lead_info?.name && explicitTargetLeadName) {
+          lead_info.name = explicitTargetLeadName
+        }
+        if (lead_info?.name) {
+          lead_info.name = normalizeLeadNameForMatch(lead_info.name)
+        }
+        if (isPlaceholderLeadName(lead_info?.name)) {
+          lead_info.name = null
+        }
+        if (crmLeadCaptureIntent) {
+          if (!lead_info?.name) {
+            const normalizePersonName = (raw) => {
+              const base = String(raw || '').trim().replace(/\s+/g, ' ')
+              if (!base) return null
+              const cutoff = base.split(/\s+(?:and|who|that|he|she|his|her|wants?|needs?|looking|for|in|email|phone)\b/i)[0]
+              const cleaned = cutoff.trim().replace(/[.,;:!?]+$/g, '')
+              if (!cleaned) return null
+              if (isPlaceholderLeadName(cleaned)) return null
+              const tokens = cleaned.split(' ').slice(0, 3)
+              const normalized = tokens
+                .map((t) => t ? (t.charAt(0).toUpperCase() + t.slice(1).toLowerCase()) : t)
+                .join(' ')
+              if (isPlaceholderLeadName(normalized)) return null
+              return normalized
+            }
+            const justMetName =
+              wholeMessage.match(/\b(?:just\s+met|met)\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})/i)?.[1]
+              || wholeMessage.match(/\b(?:lead\s+for|client\s+is)\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})/i)?.[1]
+              || wholeMessage.match(/\b([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})\s+(?:wants?|needs?|is\s+looking)\b/i)?.[1]
+            const normalizedName = normalizePersonName(justMetName)
+            if (normalizedName) lead_info.name = normalizedName
+          }
+          if (!lead_info?.email) {
+            const email = wholeMessage.match(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i)?.[0]
+            if (email) lead_info.email = email
+          }
+          if (!lead_info?.phone) {
+            const phone = wholeMessage.match(/(?:\+?\d{1,2}\s*)?(?:\(?\d{3}\)?[\s-]*)?\d{3}[\s-]?\d{4}\b/)?.[0]
+            if (phone) lead_info.phone = phone
+          }
+          if (!lead_info?.lead_type) {
+            lead_info.lead_type = 'buyer'
+          }
         }
 
         function findLikelyPrice(text) {
@@ -8328,6 +8799,203 @@ async function handleRoute(request, { params }) {
             if (best4 >= 10000) return best4
             return null
           } catch { return null }
+        }
+
+        const parseAmountToken = (token) => {
+          if (!token) return null
+          const t = String(token).toLowerCase().replace(/\$/g, '').trim()
+          const m = t.match(/([0-9][\d,.]*)(?:\s*)(k|m|million|thousand)?/)
+          if (!m) return null
+          let n = parseFloat(String(m[1]).replace(/,/g, ''))
+          if (!isFinite(n)) return null
+          const u = (m[2] || '').toLowerCase()
+          if (u === 'm' || u === 'million') n *= 1_000_000
+          if (u === 'k' || u === 'thousand') n *= 1_000
+          return Math.round(n)
+        }
+
+        const extractTransactionContextFromText = (text) => {
+          const out = {}
+          const t = String(text || '')
+          const l = t.toLowerCase()
+
+          const dealMatch = t.match(/\b([A-Za-z][A-Za-z\s]{1,40})\s+deal\b/i)
+          if (dealMatch?.[1]) out.deal_label = dealMatch[1].trim()
+
+          const dropMatch = t.match(/(?:requested|asking|ask(?:ed)?|wants?)\s*(?:for)?\s*(\$?\s*[\d,.]+\s*(?:k|m|million|thousand)?)\s*(?:price\s*)?drop/i)
+            || t.match(/(\$?\s*[\d,.]+\s*(?:k|m|million|thousand)?)\s*(?:price\s*)?drop/i)
+          const closeCostMatch = t.match(/(\$?\s*[\d,.]+\s*(?:k|m|million|thousand)?)\s*(?:in\s*)?closing\s*costs?/i)
+          if (dropMatch?.[1]) out.buyer_requested_price_drop = parseAmountToken(dropMatch[1])
+          if (closeCostMatch?.[1]) out.counter_closing_cost_credit = parseAmountToken(closeCostMatch[1])
+
+          if (/\bcounter[-\s]?offer\b/.test(l)) out.action_type = 'counter_offer'
+          else if (/\blisting\s+update\b/.test(l)) out.action_type = 'listing_update'
+          else if (/\bvaluation\s+report\b/.test(l)) out.action_type = 'valuation_report'
+          else if (/\brate\s+buydown\b/.test(l)) out.action_type = 'rate_buydown'
+          else if (/\bcash\s*flow\b/.test(l)) out.action_type = 'cash_flow_projection'
+          return out
+        }
+
+        let recentConversation = null
+        try {
+          recentConversation = await db.collection('assistant_conversations')
+            .find({ session_id: sessionId })
+            .sort({ created_at: -1 })
+            .limit(1)
+            .next()
+        } catch (e) {
+          console.warn('Failed to load recent assistant conversation context:', e?.message || e)
+        }
+        const recentParsed = recentConversation?.parsed_data || {}
+        const hasFreshInputContext = Boolean(
+          crmLeadCaptureIntent
+          || lead_info?.name
+          || lead_info?.email
+          || lead_info?.phone
+          || parsedPreferencesInput?.city
+          || parsedPreferencesInput?.state
+          || parsedPreferencesInput?.zipcode
+          || parsedPreferencesInput?.bedrooms
+          || parsedPreferencesInput?.bathrooms
+          || parsedPreferencesInput?.min_price
+          || parsedPreferencesInput?.max_price
+        )
+        const shouldMergeRecentParsed = !hasFreshInputContext
+        if (shouldMergeRecentParsed) {
+          if (!lead_info?.name && recentParsed?.lead_info?.name) lead_info.name = recentParsed.lead_info.name
+          if (!lead_info?.email && recentParsed?.lead_info?.email) lead_info.email = recentParsed.lead_info.email
+          if (!lead_info?.phone && recentParsed?.lead_info?.phone) lead_info.phone = recentParsed.lead_info.phone
+          if (!lead_info?.lead_type && recentParsed?.lead_info?.lead_type) lead_info.lead_type = recentParsed.lead_info.lead_type
+          preferences = { ...(recentParsed?.preferences || {}), ...(preferences || {}) }
+          transaction_info = { ...(recentParsed?.transaction_info || {}), ...(transaction_info || {}) }
+        }
+        // If current message provided a fresh city without explicit state/zip, avoid stale prior location context.
+        if (parsedPreferencesInput?.city && !parsedPreferencesInput?.state && !parsedPreferencesInput?.zipcode) {
+          delete preferences.state
+          delete preferences.zipcode
+        }
+        // If current message provided a zipcode, prioritize it over stale city/state.
+        if (parsedPreferencesInput?.zipcode) {
+          delete preferences.city
+          delete preferences.state
+        }
+        const extractedTxContext = extractTransactionContextFromText(wholeMessage)
+        if (!transaction_info?.property_address && extractedTxContext?.deal_label) {
+          transaction_info.property_address = extractedTxContext.deal_label
+        }
+        if (!transaction_info?.contract_price && extractedTxContext?.buyer_requested_price_drop) {
+          transaction_info.contract_price = extractedTxContext.buyer_requested_price_drop
+        }
+        if (!transaction_info?.listing_price && extractedTxContext?.counter_closing_cost_credit) {
+          transaction_info.listing_price = extractedTxContext.counter_closing_cost_credit
+        }
+
+        // Fast path: explicit "transaction for X?" queries should check CRM directly and never create/update leads.
+        const normalizedRequestedTxName = String(requestedTransactionLeadName || '').trim().toLowerCase()
+        const isPronounTarget = ['this', 'that', 'it', 'this one', 'that one'].includes(normalizedRequestedTxName)
+        if ((crmTransactionLookupIntent || (requestedTransactionLeadName && !isPronounTarget))
+          && !explicitCreateTransactionSignal
+          && !followupCreateTransactionSignal
+          && !saveOrLogSignal) {
+          const lookupName = requestedTransactionLeadName || requestedLeadName || lead_info?.name
+          if (!lookupName) {
+            return handleCORS(NextResponse.json({
+              success: true,
+              session_id: sessionId,
+              intent: 'transaction_lookup',
+              answer: 'Please share the lead/client name you want me to check transactions for.',
+              transactions: [],
+              properties: [],
+              properties_count: 0,
+              ai_recommendations: 'Please share the lead/client name you want me to check transactions for.',
+              summary: 'Transaction lookup requested without a name'
+            }))
+          }
+
+          const txs = await db.collection('transactions')
+            .find({ client_name: { $regex: new RegExp(`^${lookupName}$`, 'i') } })
+            .sort({ updated_at: -1 })
+            .limit(20)
+            .toArray()
+
+          if (!Array.isArray(txs) || txs.length === 0) {
+            return handleCORS(NextResponse.json({
+              success: true,
+              session_id: sessionId,
+              intent: 'transaction_lookup',
+              answer: `No transactions found for ${lookupName}.`,
+              transactions: [],
+              properties: [],
+              properties_count: 0,
+              ai_recommendations: `No transactions found for ${lookupName}.`,
+              summary: `No transactions for ${lookupName}`
+            }))
+          }
+
+          const cleanedTxs = txs.map(({ _id: _txMongoId, ...rest }) => rest)
+          return handleCORS(NextResponse.json({
+            success: true,
+            session_id: sessionId,
+            intent: 'transaction_lookup',
+            answer: `Yes — found ${cleanedTxs.length} transaction(s) for ${lookupName}.`,
+            transactions: cleanedTxs,
+            properties: [],
+            properties_count: 0,
+            ai_recommendations: `Yes — found ${cleanedTxs.length} transaction(s) for ${lookupName}.`,
+            summary: `Found ${cleanedTxs.length} transaction(s) for ${lookupName}`
+          }))
+        }
+
+        // Fast path: explicit "is X in leads?" queries should check CRM directly and never create/update leads.
+        if (crmLeadLookupIntent || requestedLeadName) {
+          const lookupName = requestedLeadName || lead_info?.name
+          if (!lookupName) {
+            return handleCORS(NextResponse.json({
+              success: true,
+              session_id: sessionId,
+              intent: 'lead_lookup',
+              answer: 'Please share the lead name you want me to check.',
+              lead: null,
+              is_new_lead: false,
+              properties: [],
+              properties_count: 0,
+              ai_recommendations: 'Please share the lead name you want me to check.',
+              summary: 'Lead lookup requested without a name'
+            }))
+          }
+
+          const foundLead = await db.collection('leads').findOne({
+            name: { $regex: new RegExp(`^${lookupName}$`, 'i') }
+          })
+
+          if (!foundLead) {
+            return handleCORS(NextResponse.json({
+              success: true,
+              session_id: sessionId,
+              intent: 'lead_lookup',
+              answer: `${lookupName} is not currently in CRM leads.`,
+              lead: null,
+              is_new_lead: false,
+              properties: [],
+              properties_count: 0,
+              ai_recommendations: `${lookupName} is not currently in CRM leads.`,
+              summary: `Lead ${lookupName} not found`
+            }))
+          }
+
+          const { _id: _leadMongoId, ...cleanedLead } = foundLead
+          return handleCORS(NextResponse.json({
+            success: true,
+            session_id: sessionId,
+            intent: 'lead_lookup',
+            answer: `${cleanedLead.name} is in CRM leads.`,
+            lead: cleanedLead,
+            is_new_lead: false,
+            properties: [],
+            properties_count: 0,
+            ai_recommendations: `${cleanedLead.name} is in CRM leads.`,
+            summary: `Lead ${cleanedLead.name} found`
+          }))
         }
 
         function extractSellerDetailsFromText(text) {
@@ -8439,10 +9107,13 @@ function heuristicAssistantParse(message = '') {
   const zipMatch = text.match(/\b(\d{5})(?:-\d{4})?\b/)
   const bedMatch = lc.match(/(\d+(?:\.\d+)?)\s*(?:bhk|bed(?:room)?s?|br)\b/)
   const bathMatch = lc.match(/(\d+(?:\.\d+)?)\s*(?:bath(?:room)?s?|ba)\b/)
-  const underPrice = lc.match(/\b(?:under|below|upto|up to|max(?:imum)?|<=?)\s*\$?\s*([\d,.]+)\s*(k|m|million|thousand)?\b/)
+  const underPrice = lc.match(/\b(?:under|unde|below|upto|up to|max(?:imum)?|<=?)\s*\$?\s*([\d,.]+)\s*(k|m|million|thousand)?\b/)
   const abovePrice = lc.match(/\b(?:above|over|at least|min(?:imum)?|>=?)\s*\$?\s*([\d,.]+)\s*(k|m|million|thousand)?\b/)
+  const standalonePrice = lc.match(/\$\s*([\d,.]+)\s*(k|m|million|thousand)?\b/)
   const inCity = text.match(/\bin\s+([A-Za-z]+(?:\s+[A-Za-z]+){0,2})\b/i)
-  const city = inCity ? inCity[1].trim() : null
+  const inToken = inCity ? inCity[1].split(/\s+(?:under|unde|below|above|over|upto|up\s+to|max|with|for|email|mail|phone|mobile|and)\b|[$,.;]/i)[0].trim() : null
+  const inferredState = normalizeStateToAbbr(inToken)
+  const city = inferredState ? null : inToken
 
   const toNumber = (raw, unit) => {
     if (!raw) return null
@@ -8464,9 +9135,9 @@ function heuristicAssistantParse(message = '') {
     preferences: {
       zipcode: zipMatch ? zipMatch[1] : null,
       city: city,
-      state: null,
+      state: inferredState,
       min_price: abovePrice ? toNumber(abovePrice[1], abovePrice[2]) : null,
-      max_price: underPrice ? toNumber(underPrice[1], underPrice[2]) : null,
+      max_price: underPrice ? toNumber(underPrice[1], underPrice[2]) : (standalonePrice ? toNumber(standalonePrice[1], standalonePrice[2]) : null),
       bedrooms: bedMatch ? Number(bedMatch[1]) : null,
       bathrooms: bathMatch ? Number(bathMatch[1]) : null,
       property_type: null
@@ -8501,10 +9172,14 @@ function heuristicAssistantParse(message = '') {
         // Step 1: Find or create lead (pre-lookup)
         let lead = null
         let isNewLead = false
+        let leadDraft = null
 
         // If the frontend sent a specific lead_id, prefer it
         if (incomingLeadId) {
           try { lead = await db.collection('leads').findOne({ id: String(incomingLeadId) }) } catch (_) {}
+        }
+        if (!lead && recentConversation?.lead_id && !explicitTargetLeadName) {
+          try { lead = await db.collection('leads').findOne({ id: String(recentConversation.lead_id) }) } catch (_) {}
         }
 
         const leadQuery = []
@@ -8512,12 +9187,67 @@ function heuristicAssistantParse(message = '') {
         if (lead_info.phone) leadQuery.push({ phone: lead_info.phone })
         if (leadQuery.length) {
           lead = await db.collection('leads').findOne({ $or: leadQuery })
+          // Guard against accidental cross-person merge when user gives a different name/email.
+          if (lead) {
+            const providedName = String(lead_info?.name || '').trim().toLowerCase()
+            const foundName = String(lead?.name || '').trim().toLowerCase()
+            const providedEmail = String(lead_info?.email || '').trim().toLowerCase()
+            const foundEmail = String(lead?.email || '').trim().toLowerCase()
+            const hasStrongIdentityConflict =
+              Boolean(providedName && foundName && providedName !== foundName) &&
+              Boolean(providedEmail) &&
+              Boolean(foundEmail) &&
+              providedEmail !== foundEmail
+            if (hasStrongIdentityConflict) {
+              lead = null
+            }
+          }
         }
         if (!lead && lead_info.name) {
-          lead = await db.collection('leads').findOne({ name: { $regex: new RegExp(`^${lead_info.name}$`, 'i') } })
+          const requestedName = normalizeLeadNameForMatch(lead_info.name)
+          if (requestedName) {
+            // Exact match first
+            lead = await db.collection('leads').findOne({ name: { $regex: new RegExp(`^${requestedName}$`, 'i') } })
+            // Fuzzy best-match fallback (helps for inputs like "baba lead")
+            if (!lead) {
+              const tokenPattern = requestedName.split(/\s+/).filter(Boolean).join('|')
+              const rx = tokenPattern ? new RegExp(tokenPattern, 'i') : null
+              if (rx) {
+                const candidates = await db.collection('leads')
+                  .find({ name: { $regex: rx } })
+                  .limit(12)
+                  .toArray()
+                const normReq = requestedName.toLowerCase()
+                const scoreLead = (l) => {
+                  const n = String(l?.name || '').trim().toLowerCase()
+                  let s = 0
+                  if (!n) return s
+                  if (n === normReq) s += 50
+                  if (n.includes(normReq)) s += 20
+                  const normNoHelper = String(n).replace(/\b(?:lead|client|name)\b\s*$/i, '').trim()
+                  if (normNoHelper === normReq) s += 15
+                  if (Array.isArray(l?.interested_properties) && l.interested_properties.length > 0) s += 8
+                  if (String(l?.email || '').trim()) s += 4
+                  if (String(l?.phone || '').trim()) s += 4
+                  return s
+                }
+                candidates.sort((a, b) => scoreLead(b) - scoreLead(a))
+                if (candidates[0] && scoreLead(candidates[0]) > 0) {
+                  lead = candidates[0]
+                }
+              }
+            }
+          }
         }
 
-        if (!lead && ((lead_info.name || lead_info.email || lead_info.phone) || (sellerHints || explicitSellerFields))) {
+        const shouldPersistLeadNow =
+          Boolean(incomingLeadId) ||
+          explicitLeadSaveSignal ||
+          explicitCreateTransactionSignal ||
+          followupCreateTransactionSignal ||
+          saveOrLogSignal
+
+        if (!lead && shouldPersistLeadNow && ((lead_info.name || lead_info.email || lead_info.phone) || crmLeadCaptureIntent || (sellerHints || explicitSellerFields))) {
           const defaultName = lead_info.name || ((sellerHints || explicitSellerFields) ? 'Unknown Seller' : 'Unknown')
           const newLead = {
             id: uuidv4(),
@@ -8526,7 +9256,7 @@ function heuristicAssistantParse(message = '') {
             phone: lead_info.phone || null,
             lead_type: (lead_info.lead_type || (sellerHints || explicitSellerFields ? 'seller' : 'buyer')).toLowerCase(),
             preferences: preferences || {},
-            assigned_agent: agent_name || null,
+            assigned_agent: resolvedAgentName,
             source: 'assistant',
             tags: [],
             status: 'new',
@@ -8547,15 +9277,49 @@ function heuristicAssistantParse(message = '') {
             )
             lead = await db.collection('leads').findOne({ id: lead.id })
           }
+        } else if (!lead && ((lead_info.name || lead_info.email || lead_info.phone) || Object.keys(preferences || {}).length > 0)) {
+          // Draft-only lead context for chat UI/property save flow.
+          leadDraft = {
+            id: null,
+            name: lead_info.name || 'Unknown',
+            email: lead_info.email || null,
+            phone: lead_info.phone || null,
+            lead_type: (lead_info.lead_type || (sellerHints || explicitSellerFields ? 'seller' : 'buyer')).toLowerCase(),
+            preferences: preferences || {},
+            assigned_agent: resolvedAgentName,
+            source: 'assistant_draft'
+          }
         }
 
         // Step 2: Determine effective preferences (incoming or stored)
         const cleanedIncoming = sanitizePreferences(preferences)
-        const effectivePrefs = Object.keys(cleanedIncoming).length ? cleanedIncoming : (lead?.preferences || {})
+        const effectivePrefs = Object.keys(cleanedIncoming).length ? cleanedIncoming : (lead?.preferences || leadDraft?.preferences || {})
+        // If user explicitly says "x BHK", enforce exact bedroom match.
+        const bhkMatch = wholeMessage.match(/\b(\d+(?:\.\d+)?)\s*bhk\b/i)
+        if (bhkMatch) {
+          const exact = Number(bhkMatch[1])
+          if (Number.isFinite(exact)) {
+            effectivePrefs.exact_bedrooms = exact
+          }
+        }
+        // Buyer queries default to purchase unless user explicitly asks for rent/lease.
+        const wantsRental = /\b(rent|rental|lease)\b/i.test(wholeMessage)
+        effectivePrefs.wants_rental = wantsRental
         // Branch by lead type: sellers get insights (no listing search); buyers get property search
         const leadType = String(lead?.lead_type || lead_info?.lead_type || '').toLowerCase()
         let properties = []
         let filters = null
+        const intentText = String(intent || '').toLowerCase()
+        const isMutationIntent =
+          skipPropertySearch ||
+          crmMutationLikeIntent ||
+          saveOrLogSignal ||
+          explicitCreateTransactionSignal ||
+          intentText.includes('create_transaction') ||
+          intentText.includes('start_transaction') ||
+          intentText.includes('save_transaction') ||
+          intentText.includes('create deal') ||
+          intentText.includes('open a deal')
         if (leadType === 'seller') {
           // No property search for sellers. Ensure we capture seller-specific fields for insights.
           const prefsUpdate = {}
@@ -8607,15 +9371,24 @@ function heuristicAssistantParse(message = '') {
             lead = await db.collection('leads').findOne({ id: lead.id })
           }
         } else {
-          if (skipPropertySearch) {
+          if (isMutationIntent) {
             properties = []
             filters = mapLeadPreferencesToFilters(effectivePrefs)
           } else {
             filters = mapLeadPreferencesToFilters(effectivePrefs)
             const propertySearchResult = await searchProperties(filters)
-            properties = Array.isArray(propertySearchResult)
+            const rawProperties = Array.isArray(propertySearchResult)
               ? propertySearchResult
               : (propertySearchResult?.properties || [])
+            const dedupedRaw = dedupeProperties(rawProperties)
+            const strictProperties = filterPropertiesByLeadPrefs(dedupedRaw, effectivePrefs)
+            if (strictProperties.length > 0) {
+              properties = strictProperties
+            } else if (CRM_DEMO_MODE && dedupedRaw.length > 0) {
+              properties = dedupeProperties(relaxedPropertiesForDemo(dedupedRaw, effectivePrefs))
+            } else {
+              properties = strictProperties
+            }
           }
         }
 
@@ -8625,9 +9398,13 @@ function heuristicAssistantParse(message = '') {
           (normalizedIntent.includes('create') && normalizedIntent.includes('transaction')) ||
           normalizedIntent.includes('open a deal') ||
           normalizedIntent.includes('start a transaction') ||
-          normalizedIntent.includes('create deal')
+          normalizedIntent.includes('create deal') ||
+          explicitCreateTransactionSignal ||
+          followupCreateTransactionSignal ||
+          saveOrLogSignal
 
         let createdTransaction = null
+        let createdTransactionWasExisting = false
         if (isCreateTransaction && lead) {
           try {
             const txInfo = transaction_info || {}
@@ -8636,38 +9413,103 @@ function heuristicAssistantParse(message = '') {
             const listingPrice = typeof txInfo.listing_price === 'number' ? txInfo.listing_price : (resolvedType === 'sale' ? priceValue : undefined)
             const contractPrice = typeof txInfo.contract_price === 'number' ? txInfo.contract_price : (resolvedType !== 'sale' ? priceValue : undefined)
             const closingDate = txInfo.closing_date ? new Date(txInfo.closing_date) : null
+            const savedProps = Array.isArray(lead?.interested_properties) ? lead.interested_properties : []
+            const latestSavedProp = savedProps.length > 0 ? savedProps[savedProps.length - 1] : null
+            const savedPropertyAddress = latestSavedProp
+              ? (
+                latestSavedProp?.address
+                || [latestSavedProp?.street, latestSavedProp?.city, latestSavedProp?.state, latestSavedProp?.zipcode].filter(Boolean).join(', ')
+              )
+              : ''
+            const propertyAddress =
+              txInfo.property_address ||
+              effectivePrefs?.seller_address ||
+              effectivePrefs?.address ||
+              preferences?.seller_address ||
+              savedPropertyAddress ||
+              preferences?.zipcode ||
+              preferences?.city ||
+              ''
 
-            const initialStage = (resolvedType === 'purchase') ? 'pre_approval' : 'pre_listing'
-            const transactionDoc = {
-              id: uuidv4(),
+            // Idempotency guard: if same lead + same message already created recently, reuse it.
+            const duplicateCutoff = new Date(Date.now() - 30 * 60 * 1000)
+            const existingTx = await db.collection('transactions').findOne({
               lead_id: lead.id,
-              property_address: txInfo.property_address || preferences?.zipcode || '',
-              client_name: lead.name,
-              client_email: lead.email,
-              client_phone: lead.phone,
-              transaction_type: resolvedType || 'sale',
-              current_stage: initialStage,
-              assigned_agent: agent_name || lead.assigned_agent || 'AI Assistant',
-              listing_price: listingPrice,
-              contract_price: contractPrice,
-              closing_date: closingDate,
-              add_to_calendar: false,
-              created_at: new Date(),
-              updated_at: new Date(),
-              stage_history: [{
-                stage: initialStage,
-                entered_at: new Date(),
-                status: 'active'
-              }],
               source: 'assistant',
-              original_message: original_message
+              original_message: original_message,
+              created_at: { $gte: duplicateCutoff }
+            })
+            if (existingTx) {
+              if (!existingTx?.property_address && propertyAddress) {
+                await db.collection('transactions').updateOne(
+                  { id: existingTx.id },
+                  { $set: { property_address: propertyAddress, updated_at: new Date() } }
+                )
+                existingTx.property_address = propertyAddress
+              }
+              const { _id, ...cleanedExistingTx } = existingTx
+              createdTransaction = cleanedExistingTx
+              createdTransactionWasExisting = true
             }
 
-            await db.collection('transactions').insertOne(transactionDoc)
-            await createDefaultChecklistItems(db, transactionDoc.id, initialStage, resolvedType)
+            if (!createdTransaction && saveOrLogSignal && !prefersNewTransaction) {
+              const recentTx = await db.collection('transactions').findOne(
+                {
+                  lead_id: lead.id,
+                  source: 'assistant',
+                  created_at: { $gte: new Date(Date.now() - 2 * 60 * 60 * 1000) }
+                },
+                { sort: { created_at: -1 } }
+              )
+              if (recentTx) {
+                if (!recentTx?.property_address && propertyAddress) {
+                  await db.collection('transactions').updateOne(
+                    { id: recentTx.id },
+                    { $set: { property_address: propertyAddress, updated_at: new Date() } }
+                  )
+                  recentTx.property_address = propertyAddress
+                }
+                const { _id, ...cleanedRecentTx } = recentTx
+                createdTransaction = cleanedRecentTx
+                createdTransactionWasExisting = true
+              }
+            }
 
-            const { _id, ...cleanedTx } = transactionDoc
-            createdTransaction = cleanedTx
+            if (!createdTransaction) {
+              const initialStage = (resolvedType === 'purchase') ? 'pre_approval' : 'pre_listing'
+              const transactionDoc = {
+                id: uuidv4(),
+                lead_id: lead.id,
+                property_address: propertyAddress,
+                client_name: lead.name,
+                client_email: lead.email,
+                client_phone: lead.phone,
+                transaction_type: resolvedType || 'sale',
+                current_stage: initialStage,
+                assigned_agent: resolvedAgentName || lead.assigned_agent || 'AI Assistant',
+                listing_price: listingPrice,
+                contract_price: contractPrice,
+                closing_date: closingDate,
+                add_to_calendar: false,
+                created_at: new Date(),
+                updated_at: new Date(),
+                stage_history: [{
+                  stage: initialStage,
+                  entered_at: new Date(),
+                  status: 'active'
+                }],
+                source: 'assistant',
+                original_message: original_message,
+                assistant_summary: summary || null,
+                assistant_context: extractedTxContext
+              }
+
+              await db.collection('transactions').insertOne(transactionDoc)
+              await createDefaultChecklistItems(db, transactionDoc.id, initialStage, resolvedType)
+
+              const { _id, ...cleanedTx } = transactionDoc
+              createdTransaction = cleanedTx
+            }
           } catch (txErr) {
             console.error('Assistant create transaction error:', txErr)
           }
@@ -8676,19 +9518,37 @@ function heuristicAssistantParse(message = '') {
         // Step 4: AI recommendations/confirmation
         let aiRecommendations = ''
         if (skipAiInsights) {
-          aiRecommendations = 'Your request has been processed.'
+          aiRecommendations = buildDeterministicInsights(lead, properties)
         } else {
           try {
             if (leadType === 'seller') {
               // Seller-focused insights: valuation/pricing/listing-prep, no property suggestions
-              aiRecommendations = await generateLeadInsights(lead, [])
+              aiRecommendations = await Promise.race([
+                generateLeadInsights(lead, []),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Insights timeout budget exceeded')), ASSISTANT_INSIGHTS_BUDGET_MS))
+              ])
             } else {
-              // Buyer-focused insights that can leverage the found properties
-              aiRecommendations = await generateLeadInsights(lead, properties)
+              // Buyer-focused insights:
+              // Prefer explicitly saved lead properties so lead card insights remain
+              // stable after refresh/new tab and reflect selected property choices.
+              const savedLeadProperties = Array.isArray(lead?.interested_properties)
+                ? dedupeProperties(lead.interested_properties)
+                : []
+              const insightSource = savedLeadProperties.length > 0
+                ? savedLeadProperties
+                : dedupeProperties(properties)
+              if (CRM_DEMO_MODE) {
+                aiRecommendations = buildDeterministicInsights(lead, insightSource)
+              } else {
+                aiRecommendations = await Promise.race([
+                  generateLeadInsights(lead, insightSource),
+                  new Promise((_, reject) => setTimeout(() => reject(new Error('Insights timeout budget exceeded')), ASSISTANT_INSIGHTS_BUDGET_MS))
+                ])
+              }
             }
           } catch (e) {
             console.warn('AI recommendation generation failed:', e)
-            aiRecommendations = 'Your request has been processed.'
+            aiRecommendations = buildDeterministicInsights(lead, properties)
           }
         }
 
@@ -8718,6 +9578,13 @@ function heuristicAssistantParse(message = '') {
           }
         }
 
+        if (createdTransaction?.id) {
+          const txLabel = createdTransactionWasExisting ? 'Already saved' : 'Saved'
+          const addressLabel = createdTransaction.property_address || 'this deal'
+          const saveMessage = `${txLabel} transaction in CRM for ${addressLabel}.`
+          assistantAnswer = assistantAnswer ? `${saveMessage}\n\n${assistantAnswer}` : saveMessage
+        }
+
         // Persist AI insights on the lead for UI display
         try {
           if (lead?.id && aiRecommendations) {
@@ -8733,25 +9600,45 @@ function heuristicAssistantParse(message = '') {
         // Step 5: Store conversation in chat history
         const conversationEntry = {
           id: uuidv4(),
+          session_id: sessionId,
           agent_message: original_message,
           parsed_data,
           lead_id: lead?.id || null,
           transaction_id: createdTransaction?.id || null,
-          properties_found: properties.length,
+          properties_found: dedupeProperties(properties).length,
           ai_response: aiRecommendations,
           created_at: new Date()
         }
 
         await db.collection('assistant_conversations').insertOne(conversationEntry)
 
+        let leadTransactions = []
+        if (lead?.id) {
+          try {
+            const txs = await db.collection('transactions')
+              .find({ lead_id: lead.id })
+              .sort({ updated_at: -1 })
+              .limit(10)
+              .toArray()
+            leadTransactions = txs.map(({ _id, ...rest }) => rest)
+          } catch (e) {
+            console.warn('Failed to load lead transactions for assistant context:', e?.message || e)
+          }
+        }
+
+        const uniqueProperties = dedupeProperties(properties)
         return handleCORS(NextResponse.json({
           success: true,
+          session_id: sessionId,
+          intent: normalizedIntent || (isCreateTransaction ? 'create_transaction' : null),
           lead: lead ? { ...lead, _id: undefined } : null,
+          lead_draft: (!lead && leadDraft) ? leadDraft : null,
           is_new_lead: isNewLead,
           created_transaction: createdTransaction || null,
           transaction_id: createdTransaction?.id || null,
-          properties: properties.slice(0, 10),
-          properties_count: properties.length,
+          transactions: createdTransaction ? [createdTransaction] : leadTransactions,
+          properties: uniqueProperties.slice(0, 10),
+          properties_count: uniqueProperties.length,
           ai_recommendations: aiRecommendations,
           answer: assistantAnswer || undefined,
           require_more_details: Boolean(assistantAnswer),
@@ -8799,6 +9686,7 @@ function heuristicAssistantParse(message = '') {
         const status = url.searchParams.get('status')
         const agent = url.searchParams.get('agent')
         const limit = parseInt(url.searchParams.get('limit')) || 50
+        const includeOpenStages = String(url.searchParams.get('include_open_stages') || '').toLowerCase() !== '0'
         
         let query = {}
         if (status) query.status = status
@@ -8810,7 +9698,43 @@ function heuristicAssistantParse(message = '') {
           .limit(limit)
           .toArray()
 
-        const cleanedTransactions = transactions.map(({ _id, ...rest }) => rest)
+        let cleanedTransactions = transactions.map(({ _id, ...rest }) => rest)
+
+        if (includeOpenStages && cleanedTransactions.length > 0) {
+          try {
+            const txIds = cleanedTransactions.map((tx) => tx?.id).filter(Boolean)
+            if (txIds.length > 0) {
+              const checklistItems = await db.collection('checklist_items')
+                .find({
+                  transaction_id: { $in: txIds },
+                  status: { $ne: 'completed' }
+                })
+                .toArray()
+
+              const stagesByTxId = new Map()
+              for (const item of checklistItems) {
+                const txId = item?.transaction_id
+                const stage = item?.stage
+                if (!txId || !stage) continue
+                if (!stagesByTxId.has(txId)) stagesByTxId.set(txId, new Set())
+                stagesByTxId.get(txId).add(stage)
+              }
+
+              cleanedTransactions = cleanedTransactions.map((tx) => {
+                const openSet = stagesByTxId.get(tx.id)
+                const openStages = openSet ? Array.from(openSet) : []
+                return {
+                  ...tx,
+                  open_stages: openStages.length > 0
+                    ? openStages
+                    : (tx?.current_stage ? [tx.current_stage] : [])
+                }
+              })
+            }
+          } catch (stageErr) {
+            console.warn('Failed to enrich transactions with open_stages:', stageErr)
+          }
+        }
         
         return handleCORS(NextResponse.json({
           success: true,
@@ -8830,6 +9754,8 @@ function heuristicAssistantParse(message = '') {
     if (route === '/transactions' && method === 'POST') {
       try {
         const body = await request.json()
+        const authCtx = getRequestAuthContext(request)
+        const resolvedAgentName = String(deriveAgentDisplayName(authCtx) || '').trim() || null
         const closingDate = toDateOnlyString(body?.closing_date)
         const addToCalendar = Boolean(body?.add_to_calendar)
         
@@ -8850,7 +9776,7 @@ function heuristicAssistantParse(message = '') {
           client_phone: body.client_phone,
           transaction_type: txType, // sale, purchase, lease
           current_stage: initialStage,
-          assigned_agent: body.assigned_agent,
+          assigned_agent: body.assigned_agent || resolvedAgentName || null,
           listing_price: body.listing_price,
           contract_price: body.contract_price,
           closing_date: closingDate,
@@ -10283,7 +11209,12 @@ function heuristicAssistantParse(message = '') {
               .toArray()
             enriched.push({ ...stripId(tx), next_tasks: nextTasks.map(stripId) })
           }
-          const bullets = enriched.map(t => `Deal ${t.id || ''} (${t.title || t.property_address || t.address || 'Untitled'}): stage ${t.current_stage || 'n/a'}; next ${t.next_tasks?.[0]?.title || 'no pending tasks'}`)
+          const bullets = enriched.map(t => {
+            const propertyLabel = t.title || t.property_address || t.address || 'Not specified'
+            const clientLabel = t.client_name || 'Not specified'
+            const nextLabel = t.next_tasks?.[0]?.title || 'no pending tasks'
+            return `Client: ${clientLabel}; Property: ${propertyLabel}; Stage: ${t.current_stage || 'n/a'}; Next: ${nextLabel}`
+          })
           const answer = makeAnswer('Here is the current status of your active transactions:', bullets.length ? bullets : ['No matching transactions found'])
           return handleCORS(NextResponse.json({ success: true, intent, answer, transactions: enriched }))
         }

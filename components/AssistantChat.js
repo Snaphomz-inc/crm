@@ -24,6 +24,7 @@ import {
   AlertCircle,
   Loader2,
   FileText,
+  MessageSquarePlus,
   X
 } from 'lucide-react'
 
@@ -31,23 +32,65 @@ import ChatPropertyResults from '@/components/ChatPropertyResults'
 
 const ASSISTANT_MATCH_TIMEOUT_MS = 120000
 const ASSISTANT_LOADING_GUARD_MS = ASSISTANT_MATCH_TIMEOUT_MS + 5000
+const ASSISTANT_CHAT_STORAGE_KEY = 'crm.assistant.chat.v1'
+const createDefaultAssistantMessages = () => ([
+  {
+    id: '1',
+    type: 'assistant',
+    content: 'Hi! I\'m your AI real estate assistant. You can tell me about leads in natural language like: "Just met Priya Sharma. 2BHK in Frisco under $500K." I\'ll help you create leads and find matching properties!',
+    timestamp: new Date(),
+  }
+])
 
 export function AssistantChat() {
-  const [messages, setMessages] = useState([
-    {
-      id: '1',
-      type: 'assistant',
-      content: 'Hi! I\'m your AI real estate assistant. You can tell me about leads in natural language like: "Just met Priya Sharma. 2BHK in Frisco under $500K." I\'ll help you create leads and find matching properties!',
-      timestamp: new Date(),
-    }
-  ])
+  const [messages, setMessages] = useState(() => createDefaultAssistantMessages())
   const [inputMessage, setInputMessage] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   // Keep track of the lead we are enriching via slot-filling
   const [currentLeadId, setCurrentLeadId] = useState(null)
+  const [currentLead, setCurrentLead] = useState(null)
   // Session continuity when bridged to Snaphomz-ai-search
   const [aiSessionId, setAiSessionId] = useState(null)
   const activeRequestRef = useRef(null)
+  const didHydrateRef = useRef(false)
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || didHydrateRef.current) return
+    didHydrateRef.current = true
+    try {
+      const raw = window.sessionStorage.getItem(ASSISTANT_CHAT_STORAGE_KEY)
+      if (!raw) return
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed?.messages) && parsed.messages.length > 0) {
+        setMessages(parsed.messages.map((m) => ({
+          ...m,
+          timestamp: m?.timestamp ? new Date(m.timestamp) : new Date()
+        })))
+      }
+      if (parsed?.currentLeadId) setCurrentLeadId(String(parsed.currentLeadId))
+      if (parsed?.currentLead && typeof parsed.currentLead === 'object') setCurrentLead(parsed.currentLead)
+      if (parsed?.aiSessionId) setAiSessionId(String(parsed.aiSessionId))
+    } catch (e) {
+      console.warn('Failed to restore assistant chat state:', e)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !didHydrateRef.current) return
+    try {
+      window.sessionStorage.setItem(
+        ASSISTANT_CHAT_STORAGE_KEY,
+        JSON.stringify({
+          messages,
+          currentLeadId,
+          currentLead,
+          aiSessionId
+        })
+      )
+    } catch (e) {
+      console.warn('Failed to persist assistant chat state:', e)
+    }
+  }, [messages, currentLeadId, currentLead, aiSessionId])
 
   useEffect(() => {
     return () => {
@@ -76,6 +119,52 @@ export function AssistantChat() {
     }).format(n)
   }
 
+  const extractLeadNameFromText = (text) => {
+    const raw = String(text || '')
+    const m =
+      raw.match(/\b(?:just\s+met|met)\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})/i) ||
+      raw.match(/\b(?:lead\s+for|client\s+is)\s+([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})/i) ||
+      raw.match(/\b([A-Za-z][A-Za-z'.-]*(?:\s+[A-Za-z][A-Za-z'.-]*){0,2})\s+(?:wants?|needs?|is\s+looking)\b/i)
+    const name = m?.[1]?.trim() || null
+    if (!name) return null
+    const normalized = name.toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim()
+    if (['this lead', 'that lead', 'the lead', 'new lead', 'existing lead', 'lead', 'client', 'buyer', 'seller'].includes(normalized)) {
+      return null
+    }
+    return name
+  }
+
+  const extractContactFromText = (text) => {
+    const raw = String(text || '')
+    const emailMatch = raw.match(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i)
+    // Supports +country, spaces, hyphens, brackets.
+    const phoneMatch = raw.match(/(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{3}\)?[\s-]?)\d{3}[\s-]?\d{4}\b/)
+    return {
+      email: emailMatch?.[0] ? emailMatch[0].trim().toLowerCase() : null,
+      phone: phoneMatch?.[0] ? phoneMatch[0].trim() : null
+    }
+  }
+
+  const getMissingContactFields = (lead) => {
+    const missing = []
+    if (!String(lead?.email || '').trim()) missing.push('email')
+    if (!String(lead?.phone || '').trim()) missing.push('phone')
+    return missing
+  }
+
+  const isContactOnlyMessage = (text) => {
+    const t = String(text || '').toLowerCase()
+    if (!t.trim()) return false
+    const hasContact = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(t) || /(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{3}\)?[\s-]?)\d{3}[\s-]?\d{4}\b/.test(t)
+    const hasSearchIntent = /\b(home|house|property|properties|show|find|search|under\s*\$|\bbhk\b|bed|bath|transaction|deal|save)\b/.test(t)
+    return hasContact && !hasSearchIntent
+  }
+
+  const isLikelyContactUpdateIntent = (text) => {
+    const t = String(text || '').toLowerCase()
+    return /\b(email|mail|phone|mobile|contact|number)\b/.test(t)
+  }
+
   const handleSendMessage = async () => {
     if (!inputMessage.trim() || isLoading) return
 
@@ -91,10 +180,86 @@ export function AssistantChat() {
     
     const currentInput = inputMessage
     setInputMessage('')
+    let contactUpdated = null
     let matchController = null
     let matchTimeout = null
 
     try {
+      // If user provides contact details for an active lead, persist immediately.
+      if (currentLeadId) {
+        const extractedContact = extractContactFromText(currentInput)
+        if (extractedContact.email || extractedContact.phone) {
+          try {
+            const current = currentLead || {}
+            const payload = {
+              email: extractedContact.email || current.email || null,
+              phone: extractedContact.phone || current.phone || null
+            }
+            const contactRes = await fetch(`/api/leads/${currentLeadId}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            })
+            if (contactRes.ok) {
+              const updated = await contactRes.json()
+              setCurrentLead(updated)
+              contactUpdated = {
+                emailUpdated: Boolean(extractedContact.email),
+                phoneUpdated: Boolean(extractedContact.phone),
+                leadName: updated?.name || current?.name || 'Lead'
+              }
+            }
+          } catch (contactErr) {
+            console.warn('Failed to update lead contact from chat:', contactErr)
+          }
+        }
+      }
+
+      // Contact-update fast path: avoid full assistant/match run for contact messages.
+      if (contactUpdated && (isContactOnlyMessage(currentInput) || isLikelyContactUpdateIntent(currentInput))) {
+        const parts = []
+        if (contactUpdated.emailUpdated) parts.push('email')
+        if (contactUpdated.phoneUpdated) parts.push('phone')
+        let latestLead = currentLead
+        try {
+          if (currentLeadId) {
+            const latestLeadRes = await fetch(`/api/leads/${currentLeadId}`)
+            if (latestLeadRes.ok) {
+              latestLead = await latestLeadRes.json()
+              setCurrentLead(latestLead)
+            }
+          }
+        } catch (_) {}
+
+        const missing = getMissingContactFields(latestLead || {})
+        const quickMessages = [
+          {
+            id: (Date.now() + 1).toString(),
+            type: 'assistant',
+            content: `${parts.length ? `Saved ${parts.join(' and ')} for ${contactUpdated.leadName}.` : 'Contact details updated.'}`,
+            timestamp: new Date()
+          }
+        ]
+        if (missing.length > 0) {
+          quickMessages.push({
+            id: (Date.now() + 2).toString(),
+            type: 'assistant',
+            content: `To move this lead into transactions, please share ${missing.join(' and ')}.`,
+            timestamp: new Date()
+          })
+        } else {
+          quickMessages.push({
+            id: (Date.now() + 3).toString(),
+            type: 'assistant',
+            content: 'Great, contact profile is complete. You can start a transaction now.',
+            timestamp: new Date()
+          })
+        }
+        setMessages(prev => [...prev, ...quickMessages])
+        setIsLoading(false)
+        return
+      }
+
       // Single-step: let backend self-parse and fulfill
       matchController = new AbortController()
       activeRequestRef.current = matchController
@@ -138,6 +303,43 @@ export function AssistantChat() {
         throw new Error(matchData?.error || 'Failed to process request')
       }
 
+      // AI may return a lead id that does not exist in CRM yet. Validate and recover.
+      if (matchData?.lead?.id) {
+        try {
+          const checkLeadResponse = await fetch(`/api/leads/${matchData.lead.id}`)
+          if (checkLeadResponse.status === 404) {
+            const recoverName = String(matchData?.lead?.name || '').trim() || extractLeadNameFromText(currentInput)
+            if (recoverName) {
+              const createLeadResponse = await fetch('/api/leads', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  name: recoverName,
+                  email: matchData?.lead?.email || null,
+                  phone: matchData?.lead?.phone || null,
+                  lead_type: matchData?.lead?.lead_type || 'buyer',
+                  preferences: matchData?.lead?.preferences || {},
+                  source: 'assistant'
+                })
+              })
+              if (createLeadResponse.ok) {
+                const createdLead = await createLeadResponse.json()
+                if (createdLead?.id) {
+                  matchData.lead = createdLead
+                  matchData.is_new_lead = true
+                }
+              } else {
+                delete matchData.lead.id
+              }
+            } else {
+              delete matchData.lead.id
+            }
+          }
+        } catch (leadRecoveryErr) {
+          console.warn('Assistant lead id validation failed:', leadRecoveryErr)
+        }
+      }
+
       // Create assistant response with results
       const assistantMessage = {
         id: (Date.now() + 1).toString(),
@@ -146,6 +348,7 @@ export function AssistantChat() {
         timestamp: new Date(),
         data: {
           lead: matchData.lead,
+          leadDraft: matchData.lead_draft || null,
           isNewLead: matchData.is_new_lead,
           properties: Array.isArray(matchData.properties) ? matchData.properties : null,
           propertiesCount: matchData.properties_count || 0,
@@ -158,12 +361,40 @@ export function AssistantChat() {
           missingFields: Array.isArray(matchData.missing_fields) ? matchData.missing_fields : []
         }
       }
+      const contactLead = matchData?.lead || currentLead || null
+      const missingContactFields = getMissingContactFields(contactLead)
+      const followUps = []
+      if (contactUpdated) {
+        const parts = []
+        if (contactUpdated.emailUpdated) parts.push('email')
+        if (contactUpdated.phoneUpdated) parts.push('phone')
+        if (parts.length > 0) {
+          followUps.push({
+            id: (Date.now() + 2).toString(),
+            type: 'assistant',
+            content: `Saved ${parts.join(' and ')} for ${contactUpdated.leadName}.`,
+            timestamp: new Date()
+          })
+        }
+      }
+      if (contactLead && missingContactFields.length > 0) {
+        followUps.push({
+          id: (Date.now() + 3).toString(),
+          type: 'assistant',
+          content: `To move this lead into transactions, please share ${missingContactFields.join(' and ')}.`,
+          timestamp: new Date()
+        })
+      }
 
-      setMessages(prev => [...prev, assistantMessage])
+      setMessages(prev => [...prev, assistantMessage, ...followUps])
 
       // Persist the lead id for subsequent slot-filling messages
       if (matchData?.lead?.id) {
         setCurrentLeadId(matchData.lead.id)
+        setCurrentLead(matchData.lead)
+      } else if (matchData?.lead_draft) {
+        setCurrentLeadId(null)
+        setCurrentLead(matchData.lead_draft)
       }
       if (matchData?.session_id) {
         setAiSessionId(matchData.session_id)
@@ -218,19 +449,41 @@ export function AssistantChat() {
     }
   }
 
+  const handleNewChat = () => {
+    if (activeRequestRef.current) {
+      try { activeRequestRef.current.abort() } catch {}
+      activeRequestRef.current = null
+    }
+    setIsLoading(false)
+    setInputMessage('')
+    setCurrentLeadId(null)
+    setCurrentLead(null)
+    setAiSessionId(null)
+    setMessages(createDefaultAssistantMessages())
+    if (typeof window !== 'undefined') {
+      try { window.sessionStorage.removeItem(ASSISTANT_CHAT_STORAGE_KEY) } catch {}
+    }
+  }
+
   return (
     <div className="flex flex-col h-[600px] w-full">
       {/* Chat Header */}
-      <div className="flex items-center space-x-3 p-4 border-b bg-muted/50">
-        <Avatar className="h-8 w-8">
-          <AvatarFallback className="bg-primary/10 text-primary">
-            <Bot className="h-4 w-4" />
-          </AvatarFallback>
-        </Avatar>
-        <div>
-          <h3 className="font-semibold">AI Real Estate Assistant</h3>
-          <p className="text-sm text-muted-foreground">Lead & Property Matching</p>
+      <div className="flex items-center justify-between p-4 border-b bg-muted/50">
+        <div className="flex items-center space-x-3">
+          <Avatar className="h-8 w-8">
+            <AvatarFallback className="bg-primary/10 text-primary">
+              <Bot className="h-4 w-4" />
+            </AvatarFallback>
+          </Avatar>
+          <div>
+            <h3 className="font-semibold">AI Real Estate Assistant</h3>
+            <p className="text-sm text-muted-foreground">Lead & Property Matching</p>
+          </div>
         </div>
+        <Button variant="outline" size="sm" onClick={handleNewChat} disabled={isLoading}>
+          <MessageSquarePlus className="mr-2 h-4 w-4" />
+          New Chat
+        </Button>
       </div>
 
       {/* Chat Messages */}
@@ -292,7 +545,12 @@ export function AssistantChat() {
                           <CardContent className="pt-0 pr-4 md:pr-6 space-y-2">
                             {message.data.transactions.slice(0,5).map((t, idx) => (
                               <div key={idx} className="text-sm">
-                                <div className="font-medium">{t.title || t.property_address || t.address || `Deal ${t.id}`}</div>
+                                <div className="font-medium">
+                                  Property: {t.title || t.property_address || t.address || 'Not specified'}
+                                </div>
+                                <div className="text-muted-foreground">
+                                  Client: {t.client_name || 'Not specified'}
+                                </div>
                                 <div className="text-muted-foreground">Stage: {t.current_stage || 'n/a'}</div>
                                 {t.next_tasks && t.next_tasks.length > 0 && (
                                   <div className="text-muted-foreground">Next: {t.next_tasks[0].title}</div>
@@ -366,7 +624,7 @@ export function AssistantChat() {
                       )}
 
                       {/* Lead Information */}
-                      {message.data.lead && (
+                      {message.data.lead?.id && (
                         <Card className="bg-background">
                           <CardHeader className="pb-2 pr-4 md:pr-6">
                             <div className="flex items-center justify-between gap-2">
@@ -383,8 +641,8 @@ export function AssistantChat() {
                             <div className="space-y-2">
                               <p className="font-medium">{message.data.lead.name}</p>
                               <div className="grid grid-cols-2 gap-2 text-sm text-muted-foreground">
-                                <span>Email: {message.data.lead.email}</span>
-                                <span>Phone: {message.data.lead.phone}</span>
+                                <span>Email: {message.data.lead.email || 'Not provided'}</span>
+                                <span>Phone: {message.data.lead.phone || 'Not provided'}</span>
                               </div>
                               {message.data.lead.preferences && Object.keys(message.data.lead.preferences).length > 0 && (
                                 <div className="mt-2 p-2 bg-muted rounded text-sm">
@@ -459,6 +717,8 @@ export function AssistantChat() {
                         <ChatPropertyResults
                           properties={message.data.properties}
                           totalCount={message.data.propertiesCount}
+                          leadId={message.data?.lead?.id || null}
+                          lead={message.data?.lead || message.data?.leadDraft || currentLead || null}
                         />
                       )}
 

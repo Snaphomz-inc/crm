@@ -18,17 +18,6 @@ import { AssistantPanel } from '@/components/AssistantPanel'
 import { TransactionManagement } from '@/components/TransactionManagement'
 import { SmartAlerts } from '@/components/DealSummary'
 import { MarkdownText } from '@/components/ui/markdown'
-import { 
-  AlertDialog,
-  AlertDialogContent,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogCancel,
-  AlertDialogAction,
-  AlertDialogTrigger,
-} from '@/components/ui/alert-dialog'
 import {
   SidebarProvider,
   Sidebar,
@@ -57,6 +46,13 @@ export default function RealEstateCRM() {
   const [removingPropertyKey, setRemovingPropertyKey] = useState(null)
   const [dashboardStats, setDashboardStats] = useState({})
   const [loading, setLoading] = useState(false)
+  const [deleteLeadDialog, setDeleteLeadDialog] = useState({
+    open: false,
+    lead: null,
+    checking: false,
+    deleting: false,
+    linkedTransactionsCount: 0
+  })
   const [propertyMatches, setPropertyMatches] = useState(null)
   const [isStartTransDialogOpen, setIsStartTransDialogOpen] = useState(false)
   const [transactionDraft, setTransactionDraft] = useState({
@@ -120,6 +116,16 @@ export default function RealEstateCRM() {
     const handleFocusTask = () => setActiveTab('transactions')
     window.addEventListener('crm:focus-task', handleFocusTask)
     return () => window.removeEventListener('crm:focus-task', handleFocusTask)
+  }, [])
+
+  useEffect(() => {
+    const handleLeadPropertySaved = () => {
+      // Keep Leads list and counters fresh even when save is triggered from Assistant tab.
+      fetchLeads()
+      fetchDashboardStats()
+    }
+    window.addEventListener('crm:lead-property-saved', handleLeadPropertySaved)
+    return () => window.removeEventListener('crm:lead-property-saved', handleLeadPropertySaved)
   }, [])
 
   useEffect(() => {
@@ -392,17 +398,46 @@ export default function RealEstateCRM() {
     setLoading(false)
   }
 
-  const handleDeleteLead = async (leadId) => {
-    if (!leadId) return
-    setLoading(true)
+  const openDeleteLeadDialog = async (lead) => {
+    if (!lead?.id) return
+    setDeleteLeadDialog({
+      open: true,
+      lead,
+      checking: true,
+      deleting: false,
+      linkedTransactionsCount: 0
+    })
     try {
-      const response = await fetch(`/api/leads/${leadId}`, { method: 'DELETE' })
+      const res = await fetch(`/api/leads/${lead.id}/deletion-impact`)
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data?.error || 'Failed to load linked transaction details')
+      setDeleteLeadDialog((prev) => ({
+        ...prev,
+        checking: false,
+        linkedTransactionsCount: Number(data?.linked_transactions_count || 0)
+      }))
+    } catch (error) {
+      console.error('Error checking lead deletion impact:', error)
+      setDeleteLeadDialog((prev) => ({ ...prev, checking: false }))
+      alert(error?.message || 'Could not check linked transactions')
+    }
+  }
+
+  const handleDeleteLead = async (leadId, deleteMode = 'keep_transactions') => {
+    if (!leadId) return
+    setDeleteLeadDialog((prev) => ({ ...prev, deleting: true }))
+    try {
+      const query = deleteMode === 'delete_transactions'
+        ? '?delete_transactions=true'
+        : '?keep_transactions=true'
+      const response = await fetch(`/api/leads/${leadId}${query}`, { method: 'DELETE' })
       if (response.ok) {
         setLeads(prev => prev.filter(l => l.id !== leadId))
         if (selectedLead?.id === leadId) {
           setIsEditDialogOpen(false)
           setSelectedLead(null)
         }
+        setDeleteLeadDialog({ open: false, lead: null, checking: false, deleting: false, linkedTransactionsCount: 0 })
         fetchDashboardStats()
       } else {
         const err = await response.json().catch(() => ({}))
@@ -412,7 +447,7 @@ export default function RealEstateCRM() {
       console.error('Error deleting lead:', error)
       alert('Error deleting lead')
     }
-    setLoading(false)
+    setDeleteLeadDialog((prev) => ({ ...prev, deleting: false }))
   }
 
   const getInitials = (name) => {
@@ -429,6 +464,12 @@ export default function RealEstateCRM() {
       currency: 'USD',
       minimumFractionDigits: 0,
     }).format(parsed)
+  }
+
+  const hasLeadContact = (lead) => {
+    const email = String(lead?.email || '').trim()
+    const phone = String(lead?.phone || '').trim()
+    return Boolean(email && phone)
   }
 
   return (
@@ -497,7 +538,7 @@ export default function RealEstateCRM() {
             </TabsList>
 
             {/* Dashboard Tab */}
-            <TabsContent value="dashboard" className="space-y-6">
+            <TabsContent value="dashboard" forceMount className="space-y-6">
               {/* Dashboard Stats */}
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
                 <Card>
@@ -615,11 +656,11 @@ export default function RealEstateCRM() {
                           <div className="flex flex-col space-y-1 text-sm">
                             <div className="flex items-center text-muted-foreground">
                               <Mail className="mr-2 h-4 w-4" />
-                              {lead.email}
+                              {lead.email || 'Not provided'}
                             </div>
                             <div className="flex items-center text-muted-foreground">
                               <Phone className="mr-2 h-4 w-4" />
-                              {lead.phone}
+                              {lead.phone || 'Not provided'}
                             </div>
                             {lead.preferences?.zipcode && (
                               <div className="flex items-center text-muted-foreground">
@@ -650,37 +691,22 @@ export default function RealEstateCRM() {
                               variant="default"
                               size="sm"
                               onClick={() => openStartTransaction(lead)}
+                              disabled={!hasLeadContact(lead)}
+                              title={!hasLeadContact(lead) ? 'Add both email and phone to start a transaction' : 'Start Transaction'}
                             >
                               <FileText className="mr-2 h-4 w-4" />
                               Start Transaction
                             </Button>
-                            <AlertDialog>
-                              <AlertDialogTrigger asChild>
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  className="text-red-600 border-red-600 hover:bg-red-50"
-                                  disabled={loading}
-                                >
-                                  <Trash2 className="mr-2 h-4 w-4" />
-                                  Delete
-                                </Button>
-                              </AlertDialogTrigger>
-                              <AlertDialogContent>
-                                <AlertDialogHeader>
-                                  <AlertDialogTitle>Delete lead?</AlertDialogTitle>
-                                  <AlertDialogDescription>
-                                    This action cannot be undone. This will permanently remove {lead.name}'s lead and related insights.
-                                  </AlertDialogDescription>
-                                </AlertDialogHeader>
-                                <AlertDialogFooter>
-                                  <AlertDialogCancel>Cancel</AlertDialogCancel>
-                                  <AlertDialogAction onClick={() => handleDeleteLead(lead.id)}>
-                                    Delete
-                                  </AlertDialogAction>
-                                </AlertDialogFooter>
-                              </AlertDialogContent>
-                            </AlertDialog>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="text-red-600 border-red-600 hover:bg-red-50"
+                              disabled={loading}
+                              onClick={() => openDeleteLeadDialog(lead)}
+                            >
+                              <Trash2 className="mr-2 h-4 w-4" />
+                              Delete
+                            </Button>
                           </div>
                         </div>
                       </div>
@@ -725,7 +751,7 @@ export default function RealEstateCRM() {
           
 
             {/* Transactions Tab */}
-            <TabsContent value="transactions" className="space-y-6">
+            <TabsContent value="transactions" forceMount className="space-y-6">
               <div className="grid gap-6 lg:grid-cols-3">
                 <div className="lg:col-span-2">
                   <TransactionManagement key={transactionsRefresh} />
@@ -744,12 +770,12 @@ export default function RealEstateCRM() {
             </TabsContent>
 
             {/* Property Search Tab */}
-            <TabsContent value="properties" className="space-y-6">
+            <TabsContent value="properties" forceMount className="space-y-6">
               <PropertySearch />
             </TabsContent>
 
             {/* Assistant Tab */}
-            <TabsContent value="assistant" className="space-y-6">
+            <TabsContent value="assistant" forceMount className="space-y-6">
             <AssistantPanel />
               <Card>
                 <CardHeader>
@@ -1569,6 +1595,70 @@ export default function RealEstateCRM() {
           </DialogContent>
         </Dialog>
       )}
+
+      <Dialog
+        open={deleteLeadDialog.open}
+        onOpenChange={(open) => {
+          if (!deleteLeadDialog.deleting) {
+            setDeleteLeadDialog((prev) => ({ ...prev, open }))
+          }
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Delete lead?</DialogTitle>
+            <DialogDescription>
+              {deleteLeadDialog.checking
+                ? 'Checking linked transactions...'
+                : `This will delete ${deleteLeadDialog.lead?.name || 'this lead'}.`}
+            </DialogDescription>
+          </DialogHeader>
+
+          {!deleteLeadDialog.checking && (
+            <div className="space-y-3 text-sm">
+              {deleteLeadDialog.linkedTransactionsCount > 0 ? (
+                <p>
+                  This lead has <span className="font-semibold">{deleteLeadDialog.linkedTransactionsCount}</span> linked transaction(s). Choose what to do:
+                </p>
+              ) : (
+                <p>No linked transactions found.</p>
+              )}
+            </div>
+          )}
+
+          <div className="flex justify-end gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setDeleteLeadDialog({ open: false, lead: null, checking: false, deleting: false, linkedTransactionsCount: 0 })}
+              disabled={deleteLeadDialog.deleting || deleteLeadDialog.checking}
+            >
+              Cancel
+            </Button>
+
+            {!deleteLeadDialog.checking && deleteLeadDialog.linkedTransactionsCount > 0 && (
+              <Button
+                variant="outline"
+                onClick={() => handleDeleteLead(deleteLeadDialog.lead?.id, 'keep_transactions')}
+                disabled={deleteLeadDialog.deleting}
+              >
+                {deleteLeadDialog.deleting ? 'Deleting...' : 'Delete Lead Only'}
+              </Button>
+            )}
+
+            {!deleteLeadDialog.checking && (
+              <Button
+                className={deleteLeadDialog.linkedTransactionsCount > 0 ? 'bg-red-600 hover:bg-red-700' : ''}
+                onClick={() => handleDeleteLead(deleteLeadDialog.lead?.id, deleteLeadDialog.linkedTransactionsCount > 0 ? 'delete_transactions' : 'keep_transactions')}
+                disabled={deleteLeadDialog.deleting}
+              >
+                {deleteLeadDialog.deleting
+                  ? 'Deleting...'
+                  : (deleteLeadDialog.linkedTransactionsCount > 0 ? 'Delete Lead + Transactions' : 'Delete Lead')}
+              </Button>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* Start Transaction from Lead Dialog */}
       <Dialog open={isStartTransDialogOpen} onOpenChange={setIsStartTransDialogOpen}>
