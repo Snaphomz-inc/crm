@@ -400,6 +400,17 @@ export function AssistantChat() {
         setAiSessionId(matchData.session_id)
       }
 
+      // Notify outer shell to refresh transaction widgets immediately.
+      if (Array.isArray(matchData?.transactions) && matchData.transactions.length > 0 && typeof window !== 'undefined') {
+        window.dispatchEvent(
+          new CustomEvent('crm:transaction-created', {
+            detail: {
+              count: matchData.transactions.length
+            }
+          })
+        )
+      }
+
     } catch (error) {
       console.error('Assistant error:', error)
       

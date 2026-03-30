@@ -129,6 +129,15 @@ export default function RealEstateCRM() {
   }, [])
 
   useEffect(() => {
+    const handleTransactionCreated = () => {
+      // Refresh transactions tab data even when creation happens from Assistant tab.
+      setTransactionsRefresh((prev) => prev + 1)
+    }
+    window.addEventListener('crm:transaction-created', handleTransactionCreated)
+    return () => window.removeEventListener('crm:transaction-created', handleTransactionCreated)
+  }, [])
+
+  useEffect(() => {
     if (activeTab === 'dashboard') {
       filterLeads()
     }

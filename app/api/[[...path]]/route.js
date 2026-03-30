@@ -3705,7 +3705,7 @@ function getGoogleOAuthConfig() {
     redirectUri: String(
       process.env.GOOGLE_REDIRECT_URI ||
       process.env.NEXT_PUBLIC_GOOGLE_REDIRECT_URI ||
-      'http://localhost:3000/api/google/callback'
+      'http://localhost:5000/api/google/callback'
     ).trim(),
     calendarId: String(process.env.GOOGLE_CALENDAR_ID || 'primary').trim() || 'primary',
     stateSecret: String(
@@ -4779,7 +4779,7 @@ function getOutlookOAuthConfig() {
     redirectUri: String(
       process.env.MICROSOFT_REDIRECT_URI ||
       process.env.REDIRECT_URI ||
-      'http://localhost:3000/api/calendar/outlook/callback'
+      'http://localhost:5000/api/calendar/outlook/callback'
     ).trim(),
     stateSecret: getCalendarOAuthStateSecret(),
     authorizationUrl: `https://login.microsoftonline.com/${encodeURIComponent(tenant)}/oauth2/v2.0/authorize`,
@@ -9509,6 +9509,36 @@ function heuristicAssistantParse(message = '') {
 
               const { _id, ...cleanedTx } = transactionDoc
               createdTransaction = cleanedTx
+
+              // Auto-create a calendar event for newly created assistant transactions.
+              // This writes to CRM calendar immediately, and syncs to connected providers when available.
+              try {
+                const authCtx = getRequestAuthContext(request)
+                const eventDate = toDateOnlyString(closingDate) || toDateOnlyString(new Date(Date.now() + 24 * 60 * 60 * 1000))
+                const eventStart = `${eventDate}T10:00:00.000Z`
+                const eventEnd = `${eventDate}T11:00:00.000Z`
+                const calendarService = new CalendarService({ db, logger: console })
+                await calendarService.createEvent({
+                  userKey: authCtx.userKey,
+                  event: {
+                    title: `Transaction: ${propertyAddress || lead.name || 'Client Deal'}`,
+                    description: `Auto-created from Assistant for ${lead.name || 'client'} (${resolvedType || 'sale'}).`,
+                    location: propertyAddress || '',
+                    attendees: lead?.email
+                      ? [{ email: String(lead.email).trim().toLowerCase(), name: lead.name || '' }]
+                      : [],
+                    start_time: eventStart,
+                    end_time: eventEnd
+                  },
+                  source: {
+                    type: 'transaction',
+                    id: createdTransaction.id,
+                    transaction_id: createdTransaction.id
+                  }
+                })
+              } catch (calendarCreateErr) {
+                console.warn('Assistant transaction calendar auto-create failed:', calendarCreateErr?.message || calendarCreateErr)
+              }
             }
           } catch (txErr) {
             console.error('Assistant create transaction error:', txErr)
