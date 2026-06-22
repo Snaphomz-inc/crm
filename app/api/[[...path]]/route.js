@@ -57,6 +57,15 @@ async function connectToMongo() {
             list.push({ ...doc, id })
             return { insertedId: id }
           },
+          insertMany: async (docs) => {
+            const ids = []
+            for (const doc of docs) {
+              const id = doc.id || uuidv4()
+              list.push({ ...doc, id })
+              ids.push(id)
+            }
+            return { insertedIds: ids, insertedCount: ids.length }
+          },
           updateOne: async (filter, { $set }) => {
             const idx = list.findIndex((d) => d.id === filter.id)
             if (idx !== -1) {
@@ -89,6 +98,118 @@ async function connectToMongo() {
         }
       }
     }
+
+    // Seed in-memory stub with demo data
+    const _now = Date.now()
+    const _d = (offsetDays) => new Date(_now + offsetDays * 86400000).toISOString()
+    const _p = (offsetDays) => new Date(_now - offsetDays * 86400000).toISOString()
+
+    const seedLeads = [
+      { id: 'lead-1', name: 'Sarah Johnson', email: 'sarah@email.com', phone: '(555) 123-4567', lead_type: 'buyer', status: 'active', assigned_agent: 'Mike Rodriguez', tags: ['first-time-buyer', 'qualified'], preferences: { zipcode: '90210', min_price: '400000', max_price: '600000', bedrooms: '3', bathrooms: '2' }, ai_insights: 'High-potential buyer with clear preferences for Beverly Hills.', created_at: _p(10), updated_at: _p(1) },
+      { id: 'lead-2', name: 'Robert Chen', email: 'robert@email.com', phone: '(555) 987-6543', lead_type: 'seller', status: 'active', assigned_agent: 'Lisa Park', tags: ['luxury', 'urgent'], preferences: { zipcode: '10001', min_price: '800000', max_price: '1200000', bedrooms: '2', bathrooms: '2' }, ai_insights: 'Luxury Manhattan seller. High-value transaction potential.', created_at: _p(5), updated_at: _p(0) },
+      { id: 'lead-3', name: 'Emily Davis', email: 'emily@email.com', phone: '(555) 456-7890', lead_type: 'buyer', status: 'active', assigned_agent: 'Carlos Martinez', tags: ['investor', 'cash-buyer'], preferences: { zipcode: '33101', min_price: '300000', max_price: '450000', bedrooms: '2', bathrooms: '1' }, ai_insights: 'Cash investor in Miami market. Highly competitive buyer.', created_at: _p(8), updated_at: _p(2) },
+      { id: 'lead-4', name: 'Michael Thompson', email: 'michael@email.com', phone: '(555) 789-0123', lead_type: 'buyer', status: 'new', assigned_agent: 'Jennifer White', tags: ['relocating', 'family'], preferences: { zipcode: '78701', min_price: '250000', max_price: '400000', bedrooms: '3', bathrooms: '2' }, ai_insights: 'Family relocating to Austin. Needs move-in ready with good schools.', created_at: _p(3), updated_at: _p(0) },
+      { id: 'lead-5', name: 'Amanda Garcia', email: 'amanda@email.com', phone: '(555) 321-6547', lead_type: 'seller', status: 'active', assigned_agent: 'David Kim', tags: ['downsizing'], preferences: { zipcode: '94102', min_price: '900000', max_price: '1300000', bedrooms: '3', bathrooms: '2' }, ai_insights: 'SF downsizer. Motivated to move quickly once right terms found.', created_at: _p(12), updated_at: _p(1) },
+    ]
+
+    // SALE transactions (seller flow): pre_listing → listing → under_contract → escrow_closing
+    const seedSaleTx = [
+      { id: 'tx-sale-1', property_address: '742 Evergreen Terrace, Springfield, IL 62701', client_name: 'Amanda Garcia', transaction_type: 'sale', current_stage: 'pre_listing', assigned_agent: 'David Kim', lead_id: 'lead-5', price: '950000', created_at: _p(4), updated_at: _p(1) },
+      { id: 'tx-sale-2', property_address: '1600 Pennsylvania Ave, Beverly Hills, CA 90210', client_name: 'Robert Chen', transaction_type: 'sale', current_stage: 'listing', assigned_agent: 'Lisa Park', lead_id: 'lead-2', price: '1100000', created_at: _p(14), updated_at: _p(3) },
+      { id: 'tx-sale-3', property_address: '221B Baker Street, Chicago, IL 60601', client_name: 'Carlos Mendez', transaction_type: 'sale', current_stage: 'under_contract', assigned_agent: 'Mike Rodriguez', price: '520000', created_at: _p(30), updated_at: _p(2) },
+      { id: 'tx-sale-4', property_address: '4 Privet Drive, Austin, TX 78701', client_name: 'Linda Morrison', transaction_type: 'sale', current_stage: 'escrow_closing', assigned_agent: 'Jennifer White', price: '375000', created_at: _p(45), updated_at: _p(0) },
+    ]
+
+    // PURCHASE transactions (buyer flow): pre_approval → home_search → offer → under_contract → escrow_closing
+    const seedPurchaseTx = [
+      { id: 'tx-buy-1', property_address: 'TBD — Pre-Approval Phase', client_name: 'Michael Thompson', transaction_type: 'purchase', current_stage: 'pre_approval', assigned_agent: 'Jennifer White', lead_id: 'lead-4', price: '350000', created_at: _p(2), updated_at: _p(0) },
+      { id: 'tx-buy-2', property_address: 'Active Search — Miami, FL 33101', client_name: 'Emily Davis', transaction_type: 'purchase', current_stage: 'home_search', assigned_agent: 'Carlos Martinez', lead_id: 'lead-3', price: '400000', created_at: _p(10), updated_at: _p(1) },
+      { id: 'tx-buy-3', property_address: '500 Ocean Drive, Miami, FL 33139', client_name: 'James Rivera', transaction_type: 'purchase', current_stage: 'offer', assigned_agent: 'Carlos Martinez', price: '425000', created_at: _p(18), updated_at: _p(2) },
+      { id: 'tx-buy-4', property_address: '88 Maple Street, Portland, OR 97201', client_name: 'Sarah Johnson', transaction_type: 'purchase', current_stage: 'under_contract', assigned_agent: 'Mike Rodriguez', lead_id: 'lead-1', price: '560000', created_at: _p(25), updated_at: _p(1) },
+      { id: 'tx-buy-5', property_address: '900 Pine Ave, Seattle, WA 98101', client_name: 'Kevin Patel', transaction_type: 'purchase', current_stage: 'escrow_closing', assigned_agent: 'Lisa Park', price: '720000', created_at: _p(40), updated_at: _p(0) },
+    ]
+
+    // LEASE transactions (rental flow — uses sale stage order as fallback)
+    const seedLeaseTx = [
+      { id: 'tx-lease-1', property_address: '300 Riverside Blvd Apt 4B, New York, NY 10024', client_name: 'Tanya Okonkwo', transaction_type: 'lease', current_stage: 'pre_listing', assigned_agent: 'Lisa Park', price: '4500/mo', created_at: _p(3), updated_at: _p(0) },
+      { id: 'tx-lease-2', property_address: '77 Harbor View, San Diego, CA 92101', client_name: 'Derek Walsh', transaction_type: 'lease', current_stage: 'listing', assigned_agent: 'David Kim', price: '3200/mo', created_at: _p(9), updated_at: _p(2) },
+      { id: 'tx-lease-3', property_address: '15 Sunset Lane, Nashville, TN 37201', client_name: 'Priya Nair', transaction_type: 'lease', current_stage: 'under_contract', assigned_agent: 'Jennifer White', price: '2100/mo', created_at: _p(20), updated_at: _p(1) },
+    ]
+
+    const allTx = [...seedSaleTx, ...seedPurchaseTx, ...seedLeaseTx]
+
+    // Checklist items — built from getDefaultTasksForStage (same fn used on stage-advance)
+    const seedChecklist = []
+    const saleStages     = ['pre_listing', 'listing', 'under_contract', 'escrow_closing']
+    const purchaseStages = ['pre_approval', 'home_search', 'offer', 'under_contract', 'escrow_closing']
+
+    for (const tx of allTx) {
+      const txType     = tx.transaction_type === 'purchase' ? 'purchase' : 'sale'
+      const stageOrder = txType === 'purchase' ? purchaseStages : saleStages
+      const currentIdx = stageOrder.indexOf(tx.current_stage)
+
+      stageOrder.forEach((stage, si) => {
+        const isPast    = si < currentIdx
+        const isCurrent = si === currentIdx
+        // past=all completed, current=first half done, future=all pending
+        const tasks = getDefaultTasksForStage(stage, txType)
+        tasks.forEach((task, ti) => {
+          const parentId = `cl-${tx.id}-${stage}-${ti}`
+          const completed = isPast ? true : (isCurrent ? ti < Math.ceil(tasks.length / 2) : false)
+          const status    = completed ? 'completed' : 'not_started'
+          seedChecklist.push({
+            id: parentId,
+            transaction_id: tx.id,
+            title: task.title,
+            description: task.description || '',
+            stage,
+            status,
+            completed,
+            priority: task.priority || 'medium',
+            assignee: '',
+            due_date: task.due_days ? new Date(_now + task.due_days * 86400000) : null,
+            completed_date: completed ? new Date(_now - (currentIdx - si + 1) * 86400000) : null,
+            notes: '',
+            order: ti + 1,
+            stage_order: si + 1,
+            dependencies: task.dependencies || [],
+            weight: typeof task.weight === 'number' ? task.weight : 1,
+            parent_id: null,
+            created_at: _p(5 + Math.abs(currentIdx - si) * 2),
+            updated_at: _p(Math.max(0, currentIdx - si))
+          })
+          ;(task.subtasks || []).forEach((sub, sIdx) => {
+            const subCompleted = isPast ? true : (isCurrent ? ti < Math.ceil(tasks.length / 2) : false)
+            seedChecklist.push({
+              id: `${parentId}-sub-${sIdx}`,
+              transaction_id: tx.id,
+              title: sub.title,
+              description: sub.description || '',
+              stage,
+              status: subCompleted ? 'completed' : 'not_started',
+              completed: subCompleted,
+              priority: sub.priority || task.priority || 'medium',
+              assignee: '',
+              due_date: null,
+              completed_date: subCompleted ? new Date(_now - (currentIdx - si + 1) * 86400000) : null,
+              notes: '',
+              order: ti + 1,
+              stage_order: si + 1,
+              dependencies: [],
+              weight: typeof sub.weight === 'number' ? sub.weight : 1,
+              parent_id: parentId,
+              created_at: _p(5 + Math.abs(currentIdx - si) * 2),
+              updated_at: _p(Math.max(0, currentIdx - si))
+            })
+          })
+        })
+      })
+    }
+
+    db._data['leads'] = seedLeads
+    db._data['transactions'] = allTx
+    db._data['checklist_items'] = seedChecklist
+
     return db
   }
 
@@ -1370,10 +1491,12 @@ async function validateStageTransition(db, transactionId, currentStage, targetSt
       }
     ]
 
-    const validationResponse = await callOpenAI('o1-mini', validationMessages)
+    let validationResponse
+    try { validationResponse = await callOpenAI('o1-mini', validationMessages) } catch (_aiErr) { validationResponse = null }
     let validationResult
 
     try {
+      if (!validationResponse) throw new Error('no AI response')
       validationResult = JSON.parse(validationResponse)
     } catch (parseError) {
       // Fallback validation logic including stage order enforcement and dependency checks
