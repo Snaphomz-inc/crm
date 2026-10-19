@@ -1,0 +1,220 @@
+{
+  "id": "SnzMetaPages0001",
+  "name": "Snaphomz | Meta Page connection (run once)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "bcfa6b2d-d19c-53bb-88c4-c59e2d003c5d",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v26.0/me/accounts",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "facebookGraphApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "id,name,access_token"
+            },
+            {
+              "name": "limit",
+              "value": "100"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "eeaf2ecc-821d-502d-902c-a23b06a16064",
+      "name": "Pages the system user manages",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        0
+      ],
+      "credentials": {
+        "facebookGraphApi": {
+          "id": "meta-graph",
+          "name": "Meta Graph API (system user)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "data",
+        "options": {}
+      },
+      "id": "0a076f84-6819-5edf-87d9-b445bf468274",
+      "name": "One item per page",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v26.0/{{ $json.id }}/subscribed_apps",
+        "authentication": "none",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "subscribed_fields",
+              "value": "leadgen"
+            },
+            {
+              "name": "access_token",
+              "value": "={{ $json.access_token }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "87b05e00-796b-5724-861f-d2b32a4ae198",
+      "name": "Subscribe page to lead events",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v26.0/{{ $('One item per page').item.json.id }}/leadgen_forms",
+        "authentication": "none",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "id,name,status"
+            },
+            {
+              "name": "limit",
+              "value": "100"
+            },
+            {
+              "name": "access_token",
+              "value": "={{ $('One item per page').item.json.access_token }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "29c4d64c-d0c7-5433-b5b4-7fdbbd7b5982",
+      "name": "Lead forms on the page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const page = $('One item per page').item.json;\nreturn { json: {\n  page: `${page.name} (${page.id})`,\n  subscribed_to_leads: $('Subscribe page to lead events').item.json.success === true,\n  forms: ($json.data || []).map(f => `${f.name} (${f.id}, ${f.status})`),\n} };"
+      },
+      "id": "22c64cb2-6304-5210-9bd0-b2fe8f80db4b",
+      "name": "Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Pages the system user manages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pages the system user manages": {
+      "main": [
+        [
+          {
+            "node": "One item per page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One item per page": {
+      "main": [
+        [
+          {
+            "node": "Subscribe page to lead events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Subscribe page to lead events": {
+      "main": [
+        [
+          {
+            "node": "Lead forms on the page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lead forms on the page": {
+      "main": [
+        [
+          {
+            "node": "Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "errorWorkflow": "SnzErrorAlert001",
+    "saveManualExecutions": false
+  },
+  "active": false,
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [],
+  "staticData": null
+}

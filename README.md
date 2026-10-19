@@ -26,9 +26,9 @@ off for everyone except a break-glass admin. Setup: `docs/deployment.md` §3a.
 |---|---|
 | `addons/snaphomz_crm/` | The single version-controlled add-on: fields, workflow, intake, Loops sync, security, views, reports, tests |
 | `docker-compose.yml`, `config/odoo.conf`, `caddy/Caddyfile` | Pinned stack: Odoo 19.0-20261015, PostgreSQL 17.11 (separate servers for Odoo and n8n), n8n 2.43.8, Caddy 2.11.7 |
-| `n8n/workflows/` | Workflow exports without secrets (Meta intake, Loops relay, Loops outbound, Meta reconciliation, error alert) |
-| `scripts/` | Tests, dev bootstrap, API key, backup/restore, CSV import, smoke test, sample data |
-| `docs/` | Deployment, integration API, field dictionary, operations runbook, salesperson guide, acceptance status, decisions |
+| `n8n/` | Workflow exports without secrets (Meta intake, Meta Page connection, Loops relay, Loops outbound, Meta reconciliation, error alert) and the generator that writes them |
+| `scripts/` | Tests, dev bootstrap, API key, n8n import, Meta Page connection, backup/restore, CSV import, smoke test, sample data |
+| `docs/` | Deployment, Meta lead ads setup, integration API, field dictionary, operations runbook, salesperson guide, acceptance status, decisions |
 
 ## Local quick start
 

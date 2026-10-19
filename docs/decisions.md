@@ -11,6 +11,13 @@
   supported external API in this release; XML-RPC/JSON-RPC are deprecated.
 * **Loops webhooks are verified in Odoo**, not n8n, so the security check lives next to the
   data and is unit-tested. n8n only relays raw bodies when another consumer needs the events.
+* **Meta leads use a Business system user** (decided 19 Oct 2026), not n8n's Facebook Lead
+  Ads node: that node reads every lead with a personal Facebook sign-in, which Meta expires
+  after about 60 days. n8n's generic Facebook Trigger receives the Page `leadgen` webhook
+  (app ID and secret); the lead is then read from Meta with the Page token derived from the
+  never-expiring system-user token. One workflow serves every Page and form the system user
+  manages; the daily reconciliation discovers the forms itself. Website forms keep calling
+  the intake API directly; Meta is the only source routed through n8n.
 * **Concurrency**: events are stored first (unique provider + event ID), then processed;
   identity keys and "one active acquisition per person" are unique indexes. A losing
   concurrent transaction is deferred and retried by the minute job, so there are no duplicates.

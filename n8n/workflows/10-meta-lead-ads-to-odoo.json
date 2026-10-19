@@ -4,95 +4,175 @@
   "nodes": [
     {
       "parameters": {
-        "event": "newLead",
-        "page": {
-          "__rl": true,
-          "mode": "id",
-          "value": "REPLACE_WITH_PAGE_ID"
-        },
-        "form": {
-          "__rl": true,
-          "mode": "id",
-          "value": "REPLACE_WITH_FORM_ID"
-        },
+        "authType": "accessToken",
+        "appId": "REPLACE_WITH_META_APP_ID",
+        "object": "page",
+        "fields": [
+          "leadgen"
+        ],
         "options": {
-          "simplifyOutput": true
+          "includeValues": true
         }
       },
-      "id": "1b34802b-28f6-5c48-b08f-4917f6dba585",
-      "name": "Meta lead form",
-      "type": "n8n-nodes-base.facebookLeadAdsTrigger",
+      "id": "399db852-7735-5f0e-b68c-2c1e9104bc80",
+      "name": "Meta Page leads",
+      "type": "n8n-nodes-base.facebookTrigger",
       "typeVersion": 1,
       "position": [
         0,
         0
       ],
       "credentials": {
-        "facebookLeadAdsOAuth2Api": {
-          "id": "meta-lead-ads",
-          "name": "Meta Lead Ads"
+        "facebookGraphAppApi": {
+          "id": "meta-app",
+          "name": "Meta app (webhooks)"
         }
       },
-      "webhookId": "dbda20ca-8ad5-5719-ae4d-5d4d916a0fd7"
+      "webhookId": "de6a7fab-56c5-5872-b015-7104a194fabf"
     },
     {
       "parameters": {
-        "url": "=https://graph.facebook.com/v21.0/{{ $json.id }}",
-        "authentication": "predefinedCredentialType",
-        "nodeCredentialType": "facebookLeadAdsOAuth2Api",
-        "sendQuery": true,
-        "queryParameters": {
-          "parameters": [
-            {
-              "name": "fields",
-              "value": "campaign_id,campaign_name"
-            }
-          ]
-        },
-        "options": {
-          "timeout": 10000
-        }
+        "jsCode": "// One delivery can carry several Page changes; keep the new lead-form leads.\nconst leads = [];\nfor (const { json: entry } of $input.all()) {\n  for (const change of entry.changes || []) {\n    const v = change.value || {};\n    if (change.field !== 'leadgen' || !v.leadgen_id) continue;\n    leads.push({ json: {\n      leadgen_id: String(v.leadgen_id),\n      page_id: String(v.page_id || entry.id),\n      form_id: v.form_id ? String(v.form_id) : null,\n      ad_id: v.ad_id ? String(v.ad_id) : null,\n      adset_id: v.adgroup_id ? String(v.adgroup_id) : null,\n    } });\n  }\n}\nreturn leads;"
       },
-      "id": "d02a99e8-4fc5-5134-81d1-68fff8923c72",
-      "name": "Campaign details",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        240,
-        0
-      ],
-      "credentials": {
-        "facebookLeadAdsOAuth2Api": {
-          "id": "meta-lead-ads",
-          "name": "Meta Lead Ads"
-        }
-      },
-      "onError": "continueRegularOutput"
-    },
-    {
-      "parameters": {
-        "mode": "runOnceForEachItem",
-        "jsCode": "const lead = $('Meta lead form').item.json;\nconst extra = $json.error ? {} : $json;\nreturn { json: { ...lead, campaign_id: extra.campaign_id || null, campaign_name: extra.campaign_name || null } };"
-      },
-      "id": "b091b837-3981-5105-84b2-842053c979e2",
-      "name": "Merge campaign",
+      "id": "027f8911-b6de-5c30-81b9-36209fe9777b",
+      "name": "One item per lead",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        480,
+        220,
         0
       ]
     },
     {
       "parameters": {
-        "jsCode": "// Map a Meta lead (simplified n8n output, or raw Graph field_data) to the\n// canonical Snaphomz intake payload. Odoo enforces identity and ownership\n// rules; this node only reshapes data.\nconst STANDARD = new Set(['full_name', 'first_name', 'last_name', 'email', 'phone_number', 'phone',\n  'city', 'state', 'zip_code', 'post_code', 'country']);\n\nfunction flatten(lead) {\n  if (lead.data) return lead.data;\n  const out = {};\n  for (const f of lead.field_data || []) out[f.name] = (f.values || [])[0] ?? null;\n  return out;\n}\n\nreturn $input.all().map(({ json: lead }) => {\n  const d = flatten(lead);\n  const pick = (...keys) => keys.map(k => d[k]).find(v => v !== undefined && v !== null && v !== '') ?? null;\n  const answers = {};\n  for (const [k, v] of Object.entries(d)) if (!STANDARD.has(k)) answers[k] = v;\n  // A custom checkbox whose key contains \"consent\" records marketing consent.\n  const consentKey = Object.keys(answers).find(k => k.toLowerCase().includes('consent'));\n  const consent = consentKey ? ['yes', 'true', '1', 'i agree'].includes(String(answers[consentKey]).toLowerCase()) : false;\n  return {\n    json: {\n      payload: {\n        provider: 'meta',\n        event_type: 'lead_form',\n        event_id: String(lead.id),\n        event_time: lead.created_time,\n        person: {\n          name: pick('full_name'),\n          first_name: pick('first_name'),\n          last_name: pick('last_name'),\n          email: pick('email'),\n          phone: pick('phone_number', 'phone'),\n          country_code: pick('country'),\n        },\n        buyer_needs: { locations: pick('city', 'zip_code', 'post_code') },\n        attribution: {\n          source: 'facebook',\n          medium: 'paid_social',\n          campaign: lead.campaign_name || lead.campaign?.name || null,\n          meta: {\n            page_id: lead.page?.id || null,\n            form_id: lead.form?.id || lead.form_id || null,\n            campaign_id: lead.campaign_id || lead.campaign?.id || null,\n            adset_id: lead.adset?.id || lead.adset_id || null,\n            ad_id: lead.ad?.id || lead.ad_id || null,\n            lead_id: String(lead.id),\n          },\n        },\n        consent: consent ? { marketing_email: true, source: 'meta lead form', captured_at: lead.created_time } : {},\n        answers,\n      },\n    },\n  };\n});"
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v26.0/{{ $json.page_id }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "facebookGraphApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "access_token"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "bf630b96-0339-5ddb-87cd-ef1b4190b098",
+      "name": "Page access token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "facebookGraphApi": {
+          "id": "meta-graph",
+          "name": "Meta Graph API (system user)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v26.0/{{ $('One item per lead').item.json.leadgen_id }}",
+        "authentication": "none",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "id,created_time,field_data,form_id,ad_id,adset_id,campaign_id,platform,is_organic"
+            },
+            {
+              "name": "access_token",
+              "value": "={{ $json.access_token }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "a2166f81-ac97-5cef-8114-9b988b0fd9fc",
+      "name": "Fetch lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://graph.facebook.com/v26.0/{{ $json.id }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "facebookGraphApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "campaign_name"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "07aa1c55-c15d-5d60-831e-00f51c8216c8",
+      "name": "Campaign name",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "facebookGraphApi": {
+          "id": "meta-graph",
+          "name": "Meta Graph API (system user)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const event = $('One item per lead').item.json;\nconst lead = $('Fetch lead').item.json;\nconst names = $json.error ? {} : $json;  // campaign name is best effort\nreturn { json: {\n  ...lead,\n  page_id: event.page_id,\n  form_id: lead.form_id || event.form_id,\n  ad_id: lead.ad_id || event.ad_id,\n  adset_id: lead.adset_id || event.adset_id,\n  campaign_name: names.campaign_name || null,\n} };"
+      },
+      "id": "31cad1f7-6654-55f7-88c7-0a3c384107cf",
+      "name": "Combine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Map a Meta lead (Graph API lead with field_data) to the canonical Snaphomz\n// intake payload. Odoo enforces identity and ownership rules; this node only\n// reshapes data.\nconst STANDARD = new Set(['full_name', 'first_name', 'last_name', 'email', 'phone_number', 'phone',\n  'city', 'state', 'zip_code', 'post_code', 'country']);\n\nfunction flatten(lead) {\n  const out = {};\n  for (const f of lead.field_data || []) out[f.name] = (f.values || [])[0] ?? null;\n  return out;\n}\n\nreturn $input.all().map(({ json: lead }) => {\n  const d = flatten(lead);\n  const pick = (...keys) => keys.map(k => d[k]).find(v => v !== undefined && v !== null && v !== '') ?? null;\n  const answers = {};\n  for (const [k, v] of Object.entries(d)) if (!STANDARD.has(k)) answers[k] = v;\n  // A custom checkbox whose key contains \"consent\" records marketing consent.\n  const consentKey = Object.keys(answers).find(k => k.toLowerCase().includes('consent'));\n  const consent = consentKey ? ['yes', 'true', '1', 'i agree'].includes(String(answers[consentKey]).toLowerCase()) : false;\n  const id = (v) => (v === undefined || v === null || v === '') ? null : String(v);\n  return {\n    json: {\n      payload: {\n        provider: 'meta',\n        event_type: 'lead_form',\n        event_id: String(lead.id),\n        event_time: lead.created_time,\n        person: {\n          name: pick('full_name'),\n          first_name: pick('first_name'),\n          last_name: pick('last_name'),\n          email: pick('email'),\n          phone: pick('phone_number', 'phone'),\n          country_code: pick('country'),\n        },\n        buyer_needs: { locations: pick('city', 'zip_code', 'post_code') },\n        attribution: {\n          source: lead.platform === 'ig' ? 'instagram' : 'facebook',\n          medium: lead.is_organic ? 'social' : 'paid_social',\n          campaign: lead.campaign_name || null,\n          meta: {\n            page_id: id(lead.page_id),\n            form_id: id(lead.form_id),\n            campaign_id: id(lead.campaign_id),\n            adset_id: id(lead.adset_id),\n            ad_id: id(lead.ad_id),\n            lead_id: String(lead.id),\n          },\n        },\n        consent: consent ? { marketing_email: true, source: 'meta lead form', captured_at: lead.created_time } : {},\n        answers,\n      },\n    },\n  };\n});"
       },
       "id": "fd2031ac-9a0e-50e2-84c4-513f1b32a30e",
       "name": "Map to intake payload",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        720,
+        1320,
         0
       ]
     },
@@ -123,7 +203,7 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        960,
+        1540,
         0
       ],
       "credentials": {
@@ -138,29 +218,62 @@
     }
   ],
   "connections": {
-    "Meta lead form": {
+    "Meta Page leads": {
       "main": [
         [
           {
-            "node": "Campaign details",
+            "node": "One item per lead",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Campaign details": {
+    "One item per lead": {
       "main": [
         [
           {
-            "node": "Merge campaign",
+            "node": "Page access token",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Merge campaign": {
+    "Page access token": {
+      "main": [
+        [
+          {
+            "node": "Fetch lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch lead": {
+      "main": [
+        [
+          {
+            "node": "Campaign name",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Campaign name": {
+      "main": [
+        [
+          {
+            "node": "Combine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Combine": {
       "main": [
         [
           {

@@ -34,7 +34,7 @@ their preferences.
 | Identity conflict | Event goes to *Intake review*; managers notified | Resolve identity. |
 | Loops API outage / 429 / 5xx | Queue entry retries with exponential backoff (up to 8 attempts) | None unless it ends *failed*: then *Retry*. |
 | Loops 4xx (e.g. unknown property) | Entry *failed*, technical owner notified | Fix the property in Loops, then *Retry*. |
-| Meta token or permission failure | n8n execution errors; *Integration error alert* records it in Odoo and notifies | Reconnect the credential; reconciliation catches up the next morning, or run it manually. |
+| Meta token or permission failure | n8n execution errors; *Integration error alert* records it in Odoo and notifies | Check the system user still has the Page and its token is valid; paste a new token into *Meta Graph API (system user)* if needed. Reconciliation catches up the next morning, or run it manually. See `docs/meta-lead-ads-setup.md` › Troubleshooting. |
 | n8n down | Meta retries its webhook; reconciliation recovers the rest; Loops queue waits in Odoo | Restart n8n. |
 
 To pause an automation: deactivate the n8n workflow (the Odoo queue keeps building and is
@@ -86,7 +86,7 @@ docker compose run --rm --no-deps -T odoo odoo shell --config=/etc/odoo/odoo.con
 | Integration API key | Secret store, n8n credential, website backend | Yearly (expires); revoke in the integration user's preferences |
 | Loops API key | Secret store, n8n credential | On staff change |
 | Loops signing secret | Odoo settings | After rotating in Loops, enter old and new separated by a space for 24 h |
-| Meta tokens | n8n credentials | Per Meta policy / on owner change |
+| Meta app secret, system-user token | Secret store, n8n credentials *Meta app (webhooks)* and *Meta Graph API (system user)* | Token never expires: regenerate if the system user is removed or exposed. App secret: only if reset in the Meta app dashboard |
 | Entra client secret | Secret store, Odoo Settings › CRM › Microsoft sign-in | Before it expires (max 24 months): add a new secret in Entra, paste it in Odoo, test, then delete the old one |
 | Break-glass admin password | Secret store only | Yearly and after every use |
 | DB passwords, `N8N_ENCRYPTION_KEY` | `.env` + secret store | Encryption key: never rotate without re-entering credentials |
