@@ -1,0 +1,29 @@
+# Cloudflare Tunnel for the Snaphomz CRM: https://crm.trysnaphomz.com -> this machine.
+# No inbound ports are opened; Cloudflare terminates HTTPS. Copy to
+# ~/.cloudflared/snaphomz-crm.yml and fill in the tunnel ID (from
+# `cloudflared tunnel create snaphomz-crm`). Never commit the credentials JSON.
+tunnel: <TUNNEL-ID>
+credentials-file: /home/<user>/.cloudflared/<TUNNEL-ID>.json
+
+# HTTP/2 over TCP works on networks that block QUIC (UDP 7844).
+protocol: http2
+# Use IPv4 to reach Cloudflare when the network has no public IPv6.
+edge-ip-version: "4"
+
+ingress:
+  # Database manager is disabled in Odoo; block it at the edge too.
+  - hostname: crm.trysnaphomz.com
+    path: ^/web/database/
+    service: http_status:404
+  # n8n production webhooks only (Meta Lead Ads, Loops relay). The n8n editor is never exposed.
+  - hostname: crm.trysnaphomz.com
+    path: ^/webhook/
+    service: http://localhost:5678
+  # Odoo live notifications are served by the gevent worker.
+  - hostname: crm.trysnaphomz.com
+    path: ^/websocket
+    service: http://localhost:8072
+  # Everything else: Odoo (web client, JSON-2 API, Loops webhook route).
+  - hostname: crm.trysnaphomz.com
+    service: http://localhost:8069
+  - service: http_status:404

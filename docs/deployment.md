@@ -52,6 +52,41 @@ manager blocked). The n8n editor is reachable only through an SSH tunnel:
 ssh -L 5678:127.0.0.1:5678 deploy@crm.trysnaphomz.com
 ```
 
+### Alternative: Cloudflare Tunnel (current setup)
+
+Since 19 October 2026 `crm.trysnaphomz.com` is served through a **Cloudflare Tunnel**
+(`snaphomz-crm`) from a Mac running this stack. Cloudflare terminates HTTPS and the
+machine opens no inbound ports, so Caddy, the firewall rules for 80/443 and the A record
+above are not needed. The DNS record is a proxied CNAME that Cloudflare manages.
+
+* Routing: `cloudflared/config.example.yml` (same rules as the Caddyfile); the live copy
+  is `~/.cloudflared/snaphomz-crm.yml` next to the tunnel credentials (never commit them).
+* On the Mac it runs as a login service `com.snaphomz.crm-tunnel` with logs in
+  `~/Library/Logs/snaphomz-crm-tunnel.log`. **The CRM is only reachable while that Mac is
+  on, awake and running Docker**: enable *Start Docker Desktop when you sign in* and, on
+  power, *Prevent automatic sleeping when the display is off*. Treat it as a demo
+  environment with sample data, not production.
+
+Restart, stop and status on the Mac:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.snaphomz.crm-tunnel
+```
+
+```bash
+launchctl bootout gui/$(id -u)/com.snaphomz.crm-tunnel
+```
+
+```bash
+cloudflared tunnel info snaphomz-crm
+```
+
+**Moving to a server** (e.g. Oracle Always Free): install the stack there, install
+`cloudflared`, copy `~/.cloudflared/cert.pem`, the tunnel credentials JSON and the config
+(fix `credentials-file`), run `sudo cloudflared --config <file> service install`, confirm it
+connects, then stop the Mac's service. The hostname and DNS record stay the same. To use
+Caddy with an A record instead, delete the tunnel's `crm` CNAME in Cloudflare first.
+
 Pinned versions: Odoo `19.0-20261015`, PostgreSQL `17.11`, n8n `2.43.8`, Caddy `2.11.7`.
 Upgrade deliberately: change the tag, run the test suite (`scripts/run_tests.sh`) against
 the new image on the test environment, take a backup, then deploy.
