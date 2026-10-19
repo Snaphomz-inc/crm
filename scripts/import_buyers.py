@@ -5,7 +5,7 @@ Dry run (default) writes a report of matches, conflicts and new buyers and
 changes nothing. --apply submits each row as an "import" event; re-running
 the same file is safe because every row has a stable event ID.
 
-  ODOO_URL=https://crm.snaphomz.com ODOO_API_KEY=... \
+  ODOO_URL=https://crm.trysnaphomz.com ODOO_API_KEY=... \
       scripts/import_buyers.py buyers.csv --report report.csv
   ... scripts/import_buyers.py buyers.csv --apply
 

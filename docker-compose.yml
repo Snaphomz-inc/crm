@@ -3,9 +3,9 @@
 # Odoo and n8n each get their own PostgreSQL server, database user and
 # persistent volume. Images are pinned; never switch to floating tags.
 # Application ports bind to 127.0.0.1 only. In production the `proxy`
-# profile adds Caddy, which terminates HTTPS and exposes only:
-#   https://${CRM_HOSTNAME}         -> Odoo (web + websocket)
-#   https://${HOOKS_HOSTNAME}/webhook/* -> n8n production webhooks
+# profile adds Caddy, which terminates HTTPS for one hostname and exposes only:
+#   https://${CRM_HOSTNAME}/webhook/* -> n8n production webhooks
+#   https://${CRM_HOSTNAME}/...       -> Odoo (web + websocket)
 # The n8n editor stays private (SSH tunnel to 127.0.0.1:5678).
 
 name: snaphomz-crm
@@ -74,9 +74,9 @@ services:
       DB_POSTGRESDB_USER: ${N8N_DB_USER:-n8n}
       DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASSWORD}
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?set N8N_ENCRYPTION_KEY in .env}
-      N8N_HOST: ${HOOKS_HOSTNAME:-localhost}
+      N8N_HOST: ${CRM_HOSTNAME:-localhost}
       N8N_PROTOCOL: https
-      N8N_WEBHOOK_URL: https://${HOOKS_HOSTNAME:-localhost}/
+      N8N_WEBHOOK_URL: https://${CRM_HOSTNAME:-localhost}/
       N8N_PROXY_HOPS: 1
       GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-UTC}
       TZ: UTC
@@ -100,7 +100,6 @@ services:
     depends_on: [odoo, n8n]
     environment:
       CRM_HOSTNAME: ${CRM_HOSTNAME}
-      HOOKS_HOSTNAME: ${HOOKS_HOSTNAME}
       ACME_EMAIL: ${ACME_EMAIL}
     ports:
       - "80:80"

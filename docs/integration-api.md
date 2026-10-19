@@ -4,7 +4,7 @@ All integrations authenticate as the **Snaphomz Integration** user with an API k
 (`scripts/create_integration_key.sh`). Keys never go to browsers: the website calls Odoo
 from its backend only.
 
-Odoo 19 JSON-2 endpoint: `POST https://crm.snaphomz.com/json/2/<model>/<method>`
+Odoo 19 JSON-2 endpoint: `POST https://crm.trysnaphomz.com/json/2/<model>/<method>`
 
 | Header | Value |
 |---|---|
@@ -149,7 +149,7 @@ Body sent to Loops (never includes `subscribed`, so unsubscribes are preserved):
 `POST /snaphomz/webhooks/loops` verifies the `Webhook-Signature` on the raw body (Standard
 Webhooks, `whsec_` secret in Settings › CRM), rejects timestamps older than 5 minutes,
 de-duplicates on `Webhook-Id`, stores the event, then returns 200. 401 = bad signature.
-Point Loops at it directly, or at the n8n relay (`https://hooks.snaphomz.com/webhook/loops`)
+Point Loops at it directly, or at the n8n relay (`https://crm.trysnaphomz.com/webhook/loops`)
 when other systems also need Loops events.
 
 Effects: unsubscribe / hard bounce / spam complaint / resubscribe update the buyer's email

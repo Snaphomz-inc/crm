@@ -89,5 +89,5 @@ docker compose run --rm --no-deps odoo odoo --config=/etc/odoo/odoo.conf -d snap
 ```
 
 ```bash
-ODOO_URL=https://crm.snaphomz.com ODOO_API_KEY=... scripts/import_buyers.py buyers.csv --report dry-run.csv
+ODOO_URL=https://crm.trysnaphomz.com ODOO_API_KEY=... scripts/import_buyers.py buyers.csv --report dry-run.csv
 ```

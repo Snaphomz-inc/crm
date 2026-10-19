@@ -2,37 +2,38 @@
 	email {$ACME_EMAIL}
 }
 
-# Odoo: web client, JSON-2 API and the Loops webhook route.
+# One public hostname (crm.trysnaphomz.com):
+#   /webhook/*  -> n8n production webhooks (Meta Lead Ads, Loops relay)
+#   everything else -> Odoo (web client, JSON-2 API, Loops webhook route)
+# The n8n editor, REST API and test webhooks are never exposed: they are
+# reachable only through an SSH tunnel to 127.0.0.1:5678.
 {$CRM_HOSTNAME} {
 	encode gzip
 
 	# Database manager is disabled in odoo.conf; block it at the edge too.
-	@dbmanager path /web/database/*
-	respond @dbmanager 404
-
-	# Live notifications (bus) are served by the gevent worker.
-	@websocket path /websocket*
-	reverse_proxy @websocket odoo:8072
-
-	reverse_proxy odoo:8069 {
-		header_up X-Forwarded-Host {host}
+	# (handle blocks are mutually exclusive, so this must be a handle as well.)
+	handle /web/database/* {
+		respond 404
 	}
 
-	header {
-		Strict-Transport-Security "max-age=31536000; includeSubDomains"
-		X-Content-Type-Options nosniff
-		Referrer-Policy strict-origin-when-cross-origin
-	}
-}
-
-# n8n: only production webhook routes are public. The editor, REST API and
-# test webhooks are reachable only through an SSH tunnel to 127.0.0.1:5678.
-{$HOOKS_HOSTNAME} {
 	@webhooks path /webhook/*
 	handle @webhooks {
 		reverse_proxy n8n:5678
 	}
+
 	handle {
-		respond 404
+		# Live notifications (bus) are served by the gevent worker.
+		@websocket path /websocket*
+		reverse_proxy @websocket odoo:8072
+
+		reverse_proxy odoo:8069 {
+			header_up X-Forwarded-Host {host}
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
 	}
 }

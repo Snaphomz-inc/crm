@@ -8,7 +8,12 @@ details in the handover as you go.
 * One VM, about 4 vCPU / 8 GB RAM / 80 GB SSD (starting estimate; watch usage and resize).
   Ubuntu 24.04 LTS, Docker Engine with the compose plugin, `gpg`, `rclone`, `git`.
 * Firewall: allow 22 (restricted to the team's IPs), 80 and 443. Nothing else.
-* DNS (subject to availability): `crm.snaphomz.com` and `hooks.snaphomz.com` → VM public IP.
+* DNS: one record in the **trysnaphomz.com** Cloudflare zone (DNS › Records › Add record):
+  type **A**, name **`crm`**, IPv4 = the VM's public IP, proxy status **DNS only** (grey
+  cloud), TTL Auto. DNS-only lets Caddy obtain the Let's Encrypt certificate directly and
+  keeps Odoo's websocket and the webhook signatures untouched. Check it with
+  `dig +short crm.trysnaphomz.com` before starting Caddy. (If you later want Cloudflare's
+  proxy, switch SSL/TLS to *Full (strict)* first.)
 * A separate **test** environment (a second VM, or a second checkout with another compose
   project name and hostnames) with synthetic data only.
 
@@ -39,12 +44,12 @@ docker compose --profile proxy up -d
 ```
 
 Caddy obtains HTTPS certificates automatically. Only these routes are public:
-`https://crm.snaphomz.com` (Odoo, with the database manager blocked) and
-`https://hooks.snaphomz.com/webhook/*` (n8n production webhooks). The n8n editor is
-reachable only through an SSH tunnel:
+`https://crm.trysnaphomz.com/webhook/*` (n8n production webhooks: Meta and the Loops
+relay) and everything else on `https://crm.trysnaphomz.com` (Odoo, with the database
+manager blocked). The n8n editor is reachable only through an SSH tunnel:
 
 ```bash
-ssh -L 5678:127.0.0.1:5678 deploy@crm.snaphomz.com
+ssh -L 5678:127.0.0.1:5678 deploy@crm.trysnaphomz.com
 ```
 
 Pinned versions: Odoo `19.0-20261015`, PostgreSQL `17.11`, n8n `2.43.8`, Caddy `2.11.7`.
@@ -53,10 +58,13 @@ the new image on the test environment, take a backup, then deploy.
 
 ## 3. Odoo configuration (as administrator)
 
-1. Sign in at `https://crm.snaphomz.com` as `admin` (password `admin` on a new database):
+1. Sign in at `https://crm.trysnaphomz.com` as `admin` (password `admin` on a new database):
    **change it immediately** to a long random password kept in the secret store (this is
    the break-glass account once Microsoft sign-in is required), and set the company
    country and timezone. Snaphomz name, logo and colours are applied on install.
+   In Settings › Technical › System Parameters set `web.base.url` to
+   `https://crm.trysnaphomz.com` and add `web.base.url.freeze` = `True`, so links in
+   emails and the Microsoft redirect URI always use the public address.
 2. **Users**: one named login per salesperson (*Sales: User: Own Documents Only*) and per
    manager (*Sales: User: All Documents*; add *Administrator* only for whoever configures
    stages). **The login must be the person's Microsoft work email** (e.g.
@@ -93,7 +101,7 @@ Needs a Microsoft Entra administrator. In the Entra admin center:
 
 1. **App registrations › New registration**: name *Snaphomz CRM*; supported account types
    **Accounts in this organizational directory only (single tenant)**; redirect URI
-   platform **Web**: `https://crm.snaphomz.com/snaphomz/auth/entra/callback` (Odoo shows
+   platform **Web**: `https://crm.trysnaphomz.com/snaphomz/auth/entra/callback` (Odoo shows
    the exact value under Settings › CRM › Microsoft sign-in).
 2. Copy the **Application (client) ID** and **Directory (tenant) ID**.
 3. **Certificates & secrets › New client secret** (24 months). Copy the secret *Value*
@@ -108,6 +116,10 @@ Needs a Microsoft Entra administrator. In the Entra admin center:
    a token at all.
 7. Optional, recommended: a Conditional Access policy requiring MFA for this app.
 
+The CRM is served from `crm.trysnaphomz.com`, but staff Microsoft 365 accounts live on
+`snaphomz.com` (its MX points to Microsoft; `trysnaphomz.com` mail is Private Email), so
+the allowed sign-in domain stays `snaphomz.com`.
+
 In Odoo (Settings › CRM › Microsoft sign-in): enable it, enter the tenant ID, client ID,
 client secret and allowed domains (`snaphomz.com`), save, then sign out and test
 **Sign in with Microsoft** with a real staff account. Only when that works, tick
@@ -116,7 +128,7 @@ client secret and allowed domains (`snaphomz.com`), save, then sign out and test
 * Everyone signs in with Microsoft; passwords and passkeys are refused (API keys for
   scripts and the integration user keep working).
 * Break-glass logins (default `admin`) sign in with a password at
-  `https://crm.snaphomz.com/web/login?local=1`.
+  `https://crm.trysnaphomz.com/web/login?local=1`.
 * New users get no "set your password" email: tell them to sign in with Microsoft.
 
 What the CRM checks on every Microsoft sign-in: the Snaphomz tenant, that the token was
@@ -164,7 +176,7 @@ route (`scripts/import_buyers.py`) for interruptions.
 
 1. **Check the existing webhook endpoint first** (Loops allows one). If another system uses
    it, keep it working through the n8n relay. Otherwise set the endpoint to
-   `https://crm.snaphomz.com/snaphomz/webhooks/loops`. Subscribe to contact, sending,
+   `https://crm.trysnaphomz.com/snaphomz/webhooks/loops`. Subscribe to contact, sending,
    delivery, click, open, bounce, spam and unsubscribe events. Copy the signing secret into
    Odoo settings.
 2. Create the contact properties: `crmPersonId` (string), `buyerStage` (string),
@@ -192,6 +204,6 @@ Configure `rclone config` for the off-server destination and import the backup G
 key (the private key stays offline / in the secret store). Before launch, restore into the
 test environment with `scripts/restore.sh` and record the evidence.
 
-Monitor: HTTPS uptime of `https://crm.snaphomz.com/web/login` and
-`https://hooks.snaphomz.com/webhook/` (404 expected = up), disk space, the daily backup log,
+Monitor: HTTPS uptime of `https://crm.trysnaphomz.com/web/login` and
+`https://crm.trysnaphomz.com/webhook/` (n8n answers 404 = up), disk space, the daily backup log,
 **Manager › Failed integrations**, **Failed Loops updates** and the n8n executions list.
