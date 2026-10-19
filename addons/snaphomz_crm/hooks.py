@@ -9,7 +9,7 @@ BRAND = {
     'name': 'Snaphomz',
     'app_name': 'Snaphomz CRM',
     'primary_color': '#171717',
-    'secondary_color': '#e8804c',
+    'secondary_color': '#d4f776',
     'logo': 'snaphomz_crm/static/src/img/snaphomz-logo.png',
 }
 

@@ -1,8 +1,23 @@
 // Snaphomz accents for the backend web client.
 
 .o_main_navbar {
-    // Thin Snaphomz-orange rule under the black navbar.
-    box-shadow: inset 0 -3px 0 $snz-orange;
+    // Lime rule under the black navbar. Drawn on top: the menu entries paint
+    // their own black background over the navbar's full height.
+    position: relative;
+    // Open menu: lime text on black (14.8:1).
+    --NavBar-entry-color--active: #{$snz-lime};
+
+    &::after {
+        content: "";
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        height: 3px;
+        background-color: $snz-lime;
+        pointer-events: none;
+        z-index: 1;
+    }
 
     .o_snaphomz_navbar_brand {
         padding: 0 0.5rem 0 0.25rem;
@@ -19,15 +34,10 @@
         width: auto;
         display: block;
     }
-
-    .o_menu_sections .dropdown-toggle.show,
-    .o_menu_sections .o_nav_entry.active {
-        box-shadow: inset 0 -3px 0 $snz-orange;
-    }
 }
 
-// Current step of status bars and highlighted buttons stay black; give
-// the active status-bar step the brand accent so progress reads at a glance.
-.o_statusbar_status .o_arrow_button_current {
-    border-bottom: 2px solid $snz-orange;
+// Current status-bar step: lime fill behind black text.
+.o_statusbar_status .o_arrow_button_current.o_arrow_button {
+    background-color: $snz-lime !important;
+    color: $snz-black !important;
 }

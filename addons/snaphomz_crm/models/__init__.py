@@ -13,3 +13,5 @@ from . import snaphomz_outbound_queue
 from . import snaphomz_inbound_email
 from . import res_config_settings
 from . import res_users_sso
+from . import ir_http
+from . import res_users_admin

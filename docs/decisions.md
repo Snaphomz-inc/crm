@@ -29,11 +29,18 @@
   manager access. Either manager can authorise; a two-person approval was not built.
 * **Branding** comes from the Snaphomz web app: logo files from
   `Snaphomz-frontend-prod-prod-feature/public/assets/images` (`logo-01.svg`, recoloured for
-  dark backgrounds) and the favicon, Snaphomz black `#171717` for the navbar and primary
-  buttons, Snaphomz orange `#e8804c` as the accent, a darkened terracotta `#b4572a` for links
-  (orange on white fails contrast). Odoo is themed through its own SCSS variables and view
-  inheritance, so upgrades stay clean. Existing company name/logo are only replaced while
-  they are still Odoo's defaults.
+  dark backgrounds) and the favicon. Snaphomz black `#171717` for the navbar and primary
+  buttons, Snaphomz lime `#d4f776` as the highlight (navbar rule, the "CRM" label, the current
+  status step), white backgrounds, and dark olive `#4b6600` for links. Lime has almost no
+  contrast on white (1.2:1), so it is only used on black or behind black text (14.8:1).
+  Odoo is themed through its own SCSS variables and view inheritance, so upgrades stay
+  clean. Existing company name/logo are only replaced while they are still Odoo's defaults.
+* **Web addresses** use `/app` instead of Odoo's `/odoo` (e.g. `/app/unassigned`,
+  `/app/buyers/12`) through Odoo's documented router patch points; old `/odoo` links still
+  work. After sign-in people land on their role's main list (salespeople: *My new leads*,
+  managers: *Unassigned intake*, admin: *All active buyers*) unless they set a personal
+  Home Action. `admin` holds every internal permission (re-granted on each upgrade) and
+  Odoo's onboarding tours are off for it, because they hijack direct links.
 * **Microsoft sign-in** is built into `snaphomz_crm` rather than using Odoo's `auth_oauth`:
   `auth_oauth` uses the implicit flow (tokens in the browser URL) and does not check which
   app a token was issued to. This implementation uses the authorization-code flow with

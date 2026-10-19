@@ -24,8 +24,11 @@
             <attribute name="class">o_snaphomz_login_logo</attribute>
             <attribute name="style"/>
         </xpath>
+        <xpath expr="//img[contains(@t-attf-src, 'company_logo')]/.." position="attributes">
+            <attribute name="class" add="o_snaphomz_login_brand" separator=" "/>
+        </xpath>
         <xpath expr="//img[contains(@t-attf-src, 'company_logo')]" position="after">
-            <div class="o_snaphomz_login_title mt-2">Buyer CRM</div>
+            <span class="o_snaphomz_login_product">CRM</span>
         </xpath>
         <xpath expr="//a[contains(@href, 'odoo.com')]" position="replace">
             <span class="o_snaphomz_footer">Snaphomz CRM · authorised staff only</span>

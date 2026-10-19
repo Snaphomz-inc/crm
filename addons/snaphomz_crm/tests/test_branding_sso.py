@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import re
 import time
 from datetime import datetime, timedelta
 from unittest.mock import patch
@@ -60,7 +61,7 @@ class TestBranding(TransactionCase):
         company = self.env.ref('base.main_company')
         self.assertEqual(company.name, 'Snaphomz')
         self.assertFalse(company.uses_default_logo)
-        self.assertEqual((company.primary_color, company.secondary_color), ('#171717', '#e8804c'))
+        self.assertEqual((company.primary_color, company.secondary_color), ('#171717', '#d4f776'))
         self.assertEqual(company.email_secondary_color, '#171717')
         self.assertEqual(self.env['ir.config_parameter'].sudo().get_param('web.web_app_name'), 'Snaphomz CRM')
         self.assertEqual(self.env.ref('base.partner_root').name, 'Snaphomz Bot')
@@ -236,7 +237,7 @@ class TestEntraFlow(HttpCase):
         with patch(POST, return_value=FakeResponse(200, {'id_token': token})) as post:
             res = self.get(f"/snaphomz/auth/entra/callback?code=auth-code&state={query['state']}")
         self.assertEqual(res.status_code, 303)
-        self.assertTrue(res.headers['Location'].endswith('/odoo/crm'), res.headers['Location'])
+        self.assertTrue(res.headers['Location'].endswith('/app/crm'), res.headers['Location'])
         sent = post.call_args.kwargs['data']
         self.assertEqual(sent['code'], 'auth-code')
         self.assertEqual(b64url(hashlib.sha256(sent['code_verifier'].encode()).digest()), query['code_challenge'])
@@ -266,9 +267,79 @@ class TestEntraFlow(HttpCase):
         self.assertIn('/snaphomz_crm/static/src/img/favicon.ico', page)
         self.assertIn('Sign in with Microsoft', page)
         self.assertNotIn('Powered by', page)
+        self.assertIn('o_snaphomz_login_product">CRM</span>', page, "CRM sits next to the logo")
+        self.assertNotIn('Buyer CRM', page)
         self.assertNotIn('o_snaphomz_password_hidden', page)
 
         configure(self.env, enforce=True)
         self.assertIn('o_snaphomz_password_hidden', self.get('/web/login').text)
         self.assertNotIn('o_snaphomz_password_hidden', self.get('/web/login?local=1').text)
         self.assertIn('Only @snaphomz.com', self.get('/web/login?entra_error=domain').text)
+
+
+@tagged('post_install', '-at_install', 'snaphomz')
+class TestAppUrlsAndAdmin(HttpCase):
+
+    def session_info(self, path='/app'):
+        page = self.url_open(path).text
+        match = re.search(r'odoo.__session_info__ = (\{.*?\});', page, re.S)
+        self.assertTrue(match, "web client page with session info")
+        return json.loads(match.group(1))
+
+    def test_web_client_lives_under_app(self):
+        self.authenticate(None, None)  # anonymous browser session on the test database
+        res = self.url_open('/app/buyers', allow_redirects=False)
+        self.assertEqual(res.status_code, 303)
+        self.assertIn('redirect=/app/buyers', res.headers['Location'].replace('%2F', '/'))
+
+        self.authenticate('admin', 'admin')
+        res = self.url_open('/', allow_redirects=False)
+        self.assertTrue(res.headers['Location'].endswith('/app'), res.headers['Location'])
+        for path in ('/app', '/app/my-new-leads', '/app/unassigned', '/odoo'):
+            self.assertEqual(self.url_open(path, allow_redirects=False).status_code, 200, path)
+
+    def test_sign_in_lands_on_app(self):
+        self.authenticate(None, None)
+        page = self.url_open('/web/login').text
+        csrf = re.search(r'name="csrf_token" value="([^"]+)"', page).group(1)
+        res = self.url_open('/web/login', data={'login': 'admin', 'password': 'admin', 'csrf_token': csrf},
+                            allow_redirects=False)
+        self.assertEqual(res.status_code, 303)
+        self.assertTrue(res.headers['Location'].endswith('/app'), res.headers['Location'])
+
+    def test_landing_page_by_role(self):
+        rep = new_test_user(self.env, 'landing_rep', groups='sales_team.group_sale_salesman', password='landing-rep-1')
+        boss = new_test_user(self.env, 'landing_boss', groups='sales_team.group_sale_salesman_all_leads',
+                             password='landing-boss-1')
+        expected = {
+            ('landing_rep', 'landing-rep-1'): 'snaphomz_crm.action_my_new_leads',
+            ('landing_boss', 'landing-boss-1'): 'snaphomz_crm.action_unassigned_intake',
+            ('admin', 'admin'): 'snaphomz_crm.action_all_active_buyers',
+        }
+        for (login, password), xmlid in expected.items():
+            self.authenticate(login, password)
+            self.assertEqual(self.session_info()['home_action_id'], self.env.ref(xmlid).id, login)
+        # A personal Home Action still wins.
+        rep.action_id = self.env.ref('snaphomz_crm.action_my_followups_today').id
+        self.authenticate('landing_rep', 'landing-rep-1')
+        self.assertEqual(self.session_info()['home_action_id'], self.env.ref('snaphomz_crm.action_my_followups_today').id)
+        self.assertEqual(self.env.ref('snaphomz_crm.action_my_new_leads').path, 'my-new-leads')
+
+    def test_admin_has_every_internal_permission(self):
+        admin = self.env.ref('base.user_admin')
+        integration = self.env.ref('snaphomz_crm.group_snaphomz_integration')
+        external = self.env.ref('base.group_portal') | self.env.ref('base.group_public')
+        internal = self.env['res.groups'].search([('share', '=', False)]).filtered(
+            lambda g: not (g.all_implied_ids & external)) - integration
+        self.assertFalse(internal - admin.all_group_ids, "admin holds every internal group")
+        self.assertFalse(admin.all_group_ids & external)
+        self.assertNotIn(integration, admin.all_group_ids)
+        self.assertTrue(admin.has_group('base.group_system'))
+        self.assertTrue(admin.has_group('sales_team.group_sale_manager'))
+        admin.tour_enabled = True
+        self.env['res.users']._snaphomz_grant_admin_full_access()
+        self.assertFalse(admin.tour_enabled, "onboarding tours stay off for admin")
+        # Groups that appear later are granted on the next upgrade.
+        extra = self.env['res.groups'].create({'name': 'Later module group'})
+        self.env['res.users']._snaphomz_grant_admin_full_access()
+        self.assertIn(extra, admin.all_group_ids)

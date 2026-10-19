@@ -260,6 +260,7 @@
     <!-- Salesperson views -->
     <record id="action_my_new_leads" model="ir.actions.act_window">
         <field name="name">My new leads</field>
+        <field name="path">my-new-leads</field>
         <field name="res_model">crm.lead</field>
         <field name="view_mode">list,form,kanban</field>
         <field name="view_id" ref="crm_lead_view_list_buyers"/>
@@ -269,6 +270,7 @@
     </record>
     <record id="action_my_followups_today" model="ir.actions.act_window">
         <field name="name">My follow-ups today</field>
+        <field name="path">my-follow-ups</field>
         <field name="res_model">crm.lead</field>
         <field name="view_mode">list,form,kanban</field>
         <field name="view_id" ref="crm_lead_view_list_buyers"/>
@@ -278,6 +280,7 @@
     </record>
     <record id="action_my_overdue" model="ir.actions.act_window">
         <field name="name">My overdue leads</field>
+        <field name="path">my-overdue</field>
         <field name="res_model">crm.lead</field>
         <field name="view_mode">list,form</field>
         <field name="view_id" ref="crm_lead_view_list_buyers"/>
@@ -287,6 +290,7 @@
     </record>
     <record id="action_my_waiting" model="ir.actions.act_window">
         <field name="name">Waiting for buyer</field>
+        <field name="path">waiting-for-buyer</field>
         <field name="res_model">crm.lead</field>
         <field name="view_mode">list,form</field>
         <field name="view_id" ref="crm_lead_view_list_buyers"/>
@@ -295,6 +299,7 @@
     </record>
     <record id="action_my_missing_next" model="ir.actions.act_window">
         <field name="name">My leads missing next action</field>
+        <field name="path">missing-next-action</field>
         <field name="res_model">crm.lead</field>
         <field name="view_mode">list,form</field>
         <field name="view_id" ref="crm_lead_view_list_buyers"/>
@@ -306,6 +311,7 @@
     <!-- Manager views -->
     <record id="action_all_active_buyers" model="ir.actions.act_window">
         <field name="name">All active buyers</field>
+        <field name="path">buyers</field>
         <field name="res_model">crm.lead</field>
         <field name="view_mode">list,kanban,form,pivot,graph</field>
         <field name="view_id" ref="crm_lead_view_list_buyers"/>
@@ -314,6 +320,7 @@
     </record>
     <record id="action_unassigned_intake" model="ir.actions.act_window">
         <field name="name">Unassigned intake</field>
+        <field name="path">unassigned</field>
         <field name="res_model">crm.lead</field>
         <field name="view_mode">list,form</field>
         <field name="view_id" ref="crm_lead_view_list_buyers"/>
@@ -323,6 +330,7 @@
     </record>
     <record id="action_overdue_by_owner" model="ir.actions.act_window">
         <field name="name">Overdue by owner</field>
+        <field name="path">overdue-by-owner</field>
         <field name="res_model">crm.lead</field>
         <field name="view_mode">list,form</field>
         <field name="view_id" ref="crm_lead_view_list_buyers"/>
@@ -332,6 +340,7 @@
     </record>
     <record id="action_qualified_pipeline" model="ir.actions.act_window">
         <field name="name">Qualified pipeline</field>
+        <field name="path">pipeline</field>
         <field name="res_model">crm.lead</field>
         <field name="view_mode">kanban,list,form</field>
         <field name="search_view_id" ref="crm_lead_view_search_buyers"/>
@@ -340,6 +349,7 @@
     </record>
     <record id="action_buyers_needs_review" model="ir.actions.act_window">
         <field name="name">Buyers needing review</field>
+        <field name="path">needs-review</field>
         <field name="res_model">crm.lead</field>
         <field name="view_mode">list,form</field>
         <field name="view_id" ref="crm_lead_view_list_buyers"/>
@@ -349,6 +359,7 @@
     </record>
     <record id="action_attempts_exhausted" model="ir.actions.act_window">
         <field name="name">Attempts exhausted</field>
+        <field name="path">attempts-exhausted</field>
         <field name="res_model">crm.lead</field>
         <field name="view_mode">list,form</field>
         <field name="view_id" ref="crm_lead_view_list_buyers"/>

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- Runs on every install and upgrade: `admin` keeps every internal permission. -->
+    <function model="res.users" name="_snaphomz_grant_admin_full_access"/>
+</odoo>

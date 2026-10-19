@@ -103,12 +103,14 @@
 
     <record id="action_inbound_events" model="ir.actions.act_window">
         <field name="name">Inbound events</field>
+        <field name="path">inbound-events</field>
         <field name="res_model">snaphomz.inbound.event</field>
         <field name="view_mode">list,form</field>
         <field name="search_view_id" ref="snaphomz_inbound_event_view_search"/>
     </record>
     <record id="action_intake_review" model="ir.actions.act_window">
         <field name="name">Intake review</field>
+        <field name="path">intake-review</field>
         <field name="res_model">snaphomz.inbound.event</field>
         <field name="view_mode">list,form</field>
         <field name="domain">[('state', '=', 'review')]</field>
@@ -116,6 +118,7 @@
     </record>
     <record id="action_failed_integrations" model="ir.actions.act_window">
         <field name="name">Failed integrations</field>
+        <field name="path">failed-integrations</field>
         <field name="res_model">snaphomz.inbound.event</field>
         <field name="view_mode">list,form</field>
         <field name="domain">[('state', '=', 'failed')]</field>
@@ -175,11 +178,13 @@
     </record>
     <record id="action_outbound_queue" model="ir.actions.act_window">
         <field name="name">Loops updates</field>
+        <field name="path">loops-updates</field>
         <field name="res_model">snaphomz.outbound.queue</field>
         <field name="view_mode">list,form</field>
     </record>
     <record id="action_outbound_failed" model="ir.actions.act_window">
         <field name="name">Failed Loops updates</field>
+        <field name="path">failed-loops-updates</field>
         <field name="res_model">snaphomz.outbound.queue</field>
         <field name="view_mode">list,form</field>
         <field name="domain">[('state', '=', 'failed')]</field>
@@ -232,6 +237,7 @@
     </record>
     <record id="action_unmatched_emails" model="ir.actions.act_window">
         <field name="name">Unmatched emails</field>
+        <field name="path">unmatched-emails</field>
         <field name="res_model">snaphomz.inbound.email</field>
         <field name="view_mode">list,form</field>
         <field name="domain">[('state', '=', 'unmatched')]</field>
@@ -239,6 +245,7 @@
     </record>
     <record id="action_mailbox_log" model="ir.actions.act_window">
         <field name="name">Sales mailbox log</field>
+        <field name="path">mailbox-log</field>
         <field name="res_model">snaphomz.inbound.email</field>
         <field name="view_mode">list,form</field>
     </record>
@@ -306,6 +313,7 @@
     </record>
     <record id="action_nurture_reasons" model="ir.actions.act_window">
         <field name="name">Nurture reasons</field>
+        <field name="path">nurture-reasons</field>
         <field name="res_model">snaphomz.nurture.reason</field>
         <field name="view_mode">list</field>
         <field name="context">{'active_test': False}</field>

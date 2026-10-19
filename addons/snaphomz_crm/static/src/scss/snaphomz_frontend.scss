@@ -1,7 +1,7 @@
 // Snaphomz login page.
 
 body.o_snaphomz_login {
-    background: $snz-cream;
+    background: $snz-white;
 
     // Public pages use the website palette, not the backend brand colour.
     .btn-primary {
@@ -18,35 +18,50 @@ body.o_snaphomz_login {
     }
 
     a:not(.btn) {
-        color: #b4572a;
+        color: #4b6600;
 
         &:hover {
-            color: #8f4421;
+            color: #364a00;
         }
     }
 
     .form-control:focus {
-        border-color: $snz-orange;
-        box-shadow: 0 0 0 0.2rem rgba($snz-orange, 0.25);
+        border-color: $snz-black;
+        box-shadow: 0 0 0 0.2rem $snz-lime;
     }
 
     .o_database_list {
         max-width: 380px !important;
         background: #fff !important;
         border-radius: 16px;
-        box-shadow: 0 12px 32px rgba($snz-black, 0.08);
-        border-top: 4px solid $snz-orange !important;
+        border: 1px solid #ececec !important;
+        box-shadow: 0 12px 32px rgba($snz-black, 0.06);
     }
 
     .o_snaphomz_login_logo {
-        max-height: 56px;
+        max-height: 44px;
         max-width: 100%;
         width: auto;
     }
 
-    .o_snaphomz_login_title {
-        font-size: 0.95rem;
-        color: rgba($snz-black, 0.7);
+    // "[Snaphomz logo] | CRM" on one line.
+    .o_snaphomz_login_brand {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.75rem;
+    }
+
+    // "CRM" highlighted in Snaphomz lime.
+    .o_snaphomz_login_product {
+        font-size: 1.35rem;
+        font-weight: 700;
+        line-height: 1;
+        letter-spacing: 0.04em;
+        color: $snz-black;
+        background: $snz-lime;
+        padding: 0.35rem 0.6rem;
+        border-radius: 8px;
     }
 
     .o_snaphomz_ms_btn {

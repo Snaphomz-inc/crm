@@ -9,6 +9,8 @@ from odoo.http import request
 
 from odoo.addons.web.controllers.utils import _get_login_redirect_url, ensure_db
 
+from .home import APP_PREFIX, to_app_url
+
 _logger = logging.getLogger(__name__)
 
 SESSION_KEY = 'snaphomz_entra'
@@ -17,8 +19,8 @@ PENDING_TTL = 600
 
 def _safe_redirect(target):
     if target and target.startswith('/') and not target.startswith('//') and '\\' not in target:
-        return target
-    return '/odoo'
+        return to_app_url(target)
+    return APP_PREFIX
 
 
 def _login_error(code):
@@ -62,6 +64,6 @@ class SnaphomzEntraLogin(http.Controller):
         except AccessDenied as exc:
             request.env.cr.commit()  # keep the consumed one-time token cleared
             return _login_error(getattr(exc, 'code', 'failed'))
-        response = request.redirect(_get_login_redirect_url(auth_info['uid'], pending.get('redirect')), 303)
+        response = request.redirect(to_app_url(_get_login_redirect_url(auth_info['uid'], pending.get('redirect'))), 303)
         response.autocorrect_location_header = False
         return response

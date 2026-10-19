@@ -92,6 +92,7 @@
 
     <record id="action_buyer_report" model="ir.actions.act_window">
         <field name="name">Buyer acquisition analysis</field>
+        <field name="path">buyer-report</field>
         <field name="res_model">snaphomz.buyer.report</field>
         <field name="view_mode">pivot,graph,list</field>
         <field name="search_view_id" ref="snaphomz_buyer_report_view_search"/>

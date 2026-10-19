@@ -1,6 +1,6 @@
 {
     'name': 'Snaphomz CRM',
-    'version': '19.0.1.1.0',
+    'version': '19.0.1.2.0',
     'category': 'Sales/CRM',
     'summary': 'Buyer acquisition workflow, intake, Loops sync, Snaphomz branding and Microsoft sign-in',
     'description': """
@@ -54,6 +54,7 @@ Snaphomz buyer-acquisition CRM
         'views/snaphomz_branding_templates.xml',
         'report/snaphomz_buyer_report_views.xml',
         'views/snaphomz_menus.xml',
+        'data/admin_access_data.xml',
     ],
     'assets': {
         'web._assets_primary_variables': [
@@ -64,6 +65,7 @@ Snaphomz buyer-acquisition CRM
             'snaphomz_crm/static/src/scss/snaphomz_backend.scss',
             'snaphomz_crm/static/src/xml/navbar.xml',
             'snaphomz_crm/static/src/js/title_service.js',
+            'snaphomz_crm/static/src/js/router_prefix.js',
         ],
         'web.assets_frontend': [
             'snaphomz_crm/static/src/scss/snaphomz_frontend.scss',
