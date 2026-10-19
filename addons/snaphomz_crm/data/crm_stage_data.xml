@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo noupdate="1">
+    <!-- Opportunity stages for qualified buyers. BRA signed = acquisition won. -->
+    <record id="stage_qualified" model="crm.stage">
+        <field name="name">Qualified</field>
+        <field name="sequence">10</field>
+        <field name="snaphomz_code">qualified</field>
+        <field name="requirements">Salesperson confirmed the buyer is ready now.</field>
+    </record>
+    <record id="stage_consultation_booked" model="crm.stage">
+        <field name="name">Consultation booked</field>
+        <field name="sequence">20</field>
+        <field name="snaphomz_code">consultation_booked</field>
+        <field name="requirements">Confirmed consultation time recorded.</field>
+    </record>
+    <record id="stage_consultation_completed" model="crm.stage">
+        <field name="name">Consultation completed</field>
+        <field name="sequence">30</field>
+        <field name="snaphomz_code">consultation_completed</field>
+        <field name="requirements">The buyer attended the consultation.</field>
+    </record>
+    <record id="stage_bra_sent" model="crm.stage">
+        <field name="name">BRA sent</field>
+        <field name="sequence">40</field>
+        <field name="snaphomz_code">bra_sent</field>
+        <field name="requirements">Buyer representation agreement sent for signature.</field>
+    </record>
+    <record id="stage_bra_signed" model="crm.stage">
+        <field name="name">BRA signed</field>
+        <field name="sequence">50</field>
+        <field name="is_won" eval="True"/>
+        <field name="snaphomz_code">bra_signed</field>
+        <field name="requirements">Signed agreement confirmed; agreement ID recorded.</field>
+    </record>
+</odoo>

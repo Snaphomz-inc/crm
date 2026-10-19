@@ -1,0 +1,199 @@
+{
+  "id": "SnzMetaIntake001",
+  "name": "Snaphomz | Meta Lead Ads -> Odoo intake",
+  "nodes": [
+    {
+      "parameters": {
+        "event": "newLead",
+        "page": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_PAGE_ID"
+        },
+        "form": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_FORM_ID"
+        },
+        "options": {
+          "simplifyOutput": true
+        }
+      },
+      "id": "1b34802b-28f6-5c48-b08f-4917f6dba585",
+      "name": "Meta lead form",
+      "type": "n8n-nodes-base.facebookLeadAdsTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "credentials": {
+        "facebookLeadAdsOAuth2Api": {
+          "id": "meta-lead-ads",
+          "name": "Meta Lead Ads"
+        }
+      },
+      "webhookId": "dbda20ca-8ad5-5719-ae4d-5d4d916a0fd7"
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.facebook.com/v21.0/{{ $json.id }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "facebookLeadAdsOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "campaign_id,campaign_name"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "d02a99e8-4fc5-5134-81d1-68fff8923c72",
+      "name": "Campaign details",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        240,
+        0
+      ],
+      "credentials": {
+        "facebookLeadAdsOAuth2Api": {
+          "id": "meta-lead-ads",
+          "name": "Meta Lead Ads"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const lead = $('Meta lead form').item.json;\nconst extra = $json.error ? {} : $json;\nreturn { json: { ...lead, campaign_id: extra.campaign_id || null, campaign_name: extra.campaign_name || null } };"
+      },
+      "id": "b091b837-3981-5105-84b2-842053c979e2",
+      "name": "Merge campaign",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Map a Meta lead (simplified n8n output, or raw Graph field_data) to the\n// canonical Snaphomz intake payload. Odoo enforces identity and ownership\n// rules; this node only reshapes data.\nconst STANDARD = new Set(['full_name', 'first_name', 'last_name', 'email', 'phone_number', 'phone',\n  'city', 'state', 'zip_code', 'post_code', 'country']);\n\nfunction flatten(lead) {\n  if (lead.data) return lead.data;\n  const out = {};\n  for (const f of lead.field_data || []) out[f.name] = (f.values || [])[0] ?? null;\n  return out;\n}\n\nreturn $input.all().map(({ json: lead }) => {\n  const d = flatten(lead);\n  const pick = (...keys) => keys.map(k => d[k]).find(v => v !== undefined && v !== null && v !== '') ?? null;\n  const answers = {};\n  for (const [k, v] of Object.entries(d)) if (!STANDARD.has(k)) answers[k] = v;\n  // A custom checkbox whose key contains \"consent\" records marketing consent.\n  const consentKey = Object.keys(answers).find(k => k.toLowerCase().includes('consent'));\n  const consent = consentKey ? ['yes', 'true', '1', 'i agree'].includes(String(answers[consentKey]).toLowerCase()) : false;\n  return {\n    json: {\n      payload: {\n        provider: 'meta',\n        event_type: 'lead_form',\n        event_id: String(lead.id),\n        event_time: lead.created_time,\n        person: {\n          name: pick('full_name'),\n          first_name: pick('first_name'),\n          last_name: pick('last_name'),\n          email: pick('email'),\n          phone: pick('phone_number', 'phone'),\n          country_code: pick('country'),\n        },\n        buyer_needs: { locations: pick('city', 'zip_code', 'post_code') },\n        attribution: {\n          source: 'facebook',\n          medium: 'paid_social',\n          campaign: lead.campaign_name || lead.campaign?.name || null,\n          meta: {\n            page_id: lead.page?.id || null,\n            form_id: lead.form?.id || lead.form_id || null,\n            campaign_id: lead.campaign_id || lead.campaign?.id || null,\n            adset_id: lead.adset?.id || lead.adset_id || null,\n            ad_id: lead.ad?.id || lead.ad_id || null,\n            lead_id: String(lead.id),\n          },\n        },\n        consent: consent ? { marketing_email: true, source: 'meta lead form', captured_at: lead.created_time } : {},\n        answers,\n      },\n    },\n  };\n});"
+      },
+      "id": "fd2031ac-9a0e-50e2-84c4-513f1b32a30e",
+      "name": "Map to intake payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://odoo:8069/json/2/snaphomz.inbound.event/submit_intake",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Odoo-Database",
+              "value": "snaphomz"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ payload: $json.payload }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "8210fa8a-980b-565f-920d-16a514dd4e29",
+      "name": "Submit to Odoo",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "odoo-integration-key",
+          "name": "Odoo integration API key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "Meta lead form": {
+      "main": [
+        [
+          {
+            "node": "Campaign details",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Campaign details": {
+      "main": [
+        [
+          {
+            "node": "Merge campaign",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge campaign": {
+      "main": [
+        [
+          {
+            "node": "Map to intake payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map to intake payload": {
+      "main": [
+        [
+          {
+            "node": "Submit to Odoo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "errorWorkflow": "SnzErrorAlert001"
+  },
+  "active": false,
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [],
+  "staticData": null
+}

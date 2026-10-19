@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- Salesperson: daily routine, in the order it is worked. -->
+    <menuitem id="menu_my_work" name="My buyers" parent="crm.crm_menu_root" sequence="0"
+              groups="sales_team.group_sale_salesman"/>
+    <menuitem id="menu_my_new_leads" name="My new leads" parent="menu_my_work"
+              action="action_my_new_leads" sequence="10"/>
+    <menuitem id="menu_my_followups_today" name="My follow-ups today" parent="menu_my_work"
+              action="action_my_followups_today" sequence="20"/>
+    <menuitem id="menu_my_overdue" name="My overdue leads" parent="menu_my_work"
+              action="action_my_overdue" sequence="30"/>
+    <menuitem id="menu_my_waiting" name="Waiting for buyer" parent="menu_my_work"
+              action="action_my_waiting" sequence="40"/>
+    <menuitem id="menu_my_missing_next" name="My leads missing next action" parent="menu_my_work"
+              action="action_my_missing_next" sequence="50"/>
+
+    <!-- Manager -->
+    <menuitem id="menu_manager" name="Manager" parent="crm.crm_menu_root" sequence="3"
+              groups="sales_team.group_sale_salesman_all_leads"/>
+    <menuitem id="menu_all_active_buyers" name="All active buyers" parent="menu_manager"
+              action="action_all_active_buyers" sequence="10"/>
+    <menuitem id="menu_unassigned_intake" name="Unassigned intake" parent="menu_manager"
+              action="action_unassigned_intake" sequence="20"/>
+    <menuitem id="menu_overdue_by_owner" name="Overdue by owner" parent="menu_manager"
+              action="action_overdue_by_owner" sequence="30"/>
+    <menuitem id="menu_qualified_pipeline" name="Qualified pipeline" parent="menu_manager"
+              action="action_qualified_pipeline" sequence="40"/>
+    <menuitem id="menu_attempts_exhausted" name="Attempts exhausted" parent="menu_manager"
+              action="action_attempts_exhausted" sequence="50"/>
+    <menuitem id="menu_buyers_needs_review" name="Buyers needing review" parent="menu_manager"
+              action="action_buyers_needs_review" sequence="60"/>
+    <menuitem id="menu_intake_review" name="Intake review" parent="menu_manager"
+              action="action_intake_review" sequence="70"/>
+    <menuitem id="menu_unmatched_emails" name="Unmatched emails" parent="menu_manager"
+              action="action_unmatched_emails" sequence="80"/>
+    <menuitem id="menu_failed_integrations" name="Failed integrations" parent="menu_manager"
+              action="action_failed_integrations" sequence="90"/>
+    <menuitem id="menu_failed_loops" name="Failed Loops updates" parent="menu_manager"
+              action="action_outbound_failed" sequence="95"/>
+
+    <!-- Reporting -->
+    <menuitem id="menu_buyer_report" name="Buyer acquisition" parent="crm.crm_menu_report"
+              action="action_buyer_report" sequence="1" groups="sales_team.group_sale_salesman"/>
+
+    <!-- Configuration / technical -->
+    <menuitem id="menu_nurture_reasons" name="Nurture reasons" parent="crm.crm_menu_config"
+              action="action_nurture_reasons" sequence="40" groups="sales_team.group_sale_manager"/>
+    <menuitem id="menu_integration" name="Integrations" parent="crm.crm_menu_config" sequence="90"
+              groups="sales_team.group_sale_salesman_all_leads"/>
+    <menuitem id="menu_inbound_events" name="Inbound events" parent="menu_integration"
+              action="action_inbound_events" sequence="10"/>
+    <menuitem id="menu_outbound_queue" name="Loops updates" parent="menu_integration"
+              action="action_outbound_queue" sequence="20"/>
+    <menuitem id="menu_mailbox_log" name="Sales mailbox log" parent="menu_integration"
+              action="action_mailbox_log" sequence="30"/>
+</odoo>

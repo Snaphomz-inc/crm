@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- Browser tab title and favicon on every page. -->
+    <template id="layout_snaphomz" inherit_id="web.layout" name="Snaphomz layout">
+        <xpath expr="//title" position="attributes">
+            <attribute name="t-esc">title or 'Snaphomz CRM'</attribute>
+        </xpath>
+        <xpath expr="//link[@rel='shortcut icon']" position="attributes">
+            <attribute name="t-att-href">x_icon or '/snaphomz_crm/static/src/img/favicon.ico'</attribute>
+        </xpath>
+        <xpath expr="//link[@rel='shortcut icon']" position="after">
+            <link rel="apple-touch-icon" href="/snaphomz_crm/static/description/icon.png"/>
+            <meta name="theme-color" content="#171717"/>
+        </xpath>
+    </template>
+
+    <!-- Login card: Snaphomz logo, cream background, no Odoo promotion. -->
+    <template id="login_layout_snaphomz" inherit_id="web.login_layout" name="Snaphomz login layout">
+        <xpath expr="//t[@t-set='body_classname']" position="attributes">
+            <attribute name="t-value">'o_snaphomz_login'</attribute>
+        </xpath>
+        <xpath expr="//img[contains(@t-attf-src, 'company_logo')]" position="attributes">
+            <attribute name="alt">Snaphomz</attribute>
+            <attribute name="class">o_snaphomz_login_logo</attribute>
+            <attribute name="style"/>
+        </xpath>
+        <xpath expr="//img[contains(@t-attf-src, 'company_logo')]" position="after">
+            <div class="o_snaphomz_login_title mt-2">Buyer CRM</div>
+        </xpath>
+        <xpath expr="//a[contains(@href, 'odoo.com')]" position="replace">
+            <span class="o_snaphomz_footer">Snaphomz CRM · authorised staff only</span>
+        </xpath>
+    </template>
+
+    <!-- Microsoft sign-in on the login page. -->
+    <template id="login_snaphomz_entra" inherit_id="web.login" name="Snaphomz Microsoft sign-in">
+        <xpath expr="//div[@id='oe_structure_login_top']" position="before">
+            <t t-set="snz_sso" t-value="request.env['res.users'].sudo()._snaphomz_login_page_context(request.params)"/>
+            <div t-if="snz_sso['enabled']" class="o_snaphomz_sso mb-3">
+                <a t-att-href="snz_sso['start_url']" class="btn btn-primary w-100 o_snaphomz_ms_btn">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 21 21" aria-hidden="true">
+                        <rect x="1" y="1" width="9" height="9" fill="#f25022"/>
+                        <rect x="11" y="1" width="9" height="9" fill="#7fba00"/>
+                        <rect x="1" y="11" width="9" height="9" fill="#00a4ef"/>
+                        <rect x="11" y="11" width="9" height="9" fill="#ffb900"/>
+                    </svg>
+                    <span>Sign in with Microsoft</span>
+                </a>
+                <p class="small text-muted text-center mt-2 mb-0">
+                    Use your <t t-out="snz_sso['domains']"/> account.
+                </p>
+                <p t-if="snz_sso['error']" class="alert alert-danger mt-3 mb-0" role="alert" t-out="snz_sso['error']"/>
+            </div>
+            <p t-elif="snz_sso['error']" class="alert alert-danger" role="alert" t-out="snz_sso['error']"/>
+        </xpath>
+        <xpath expr="//owl-component[@name='web.user_switch']" position="attributes">
+            <attribute name="t-if">not login and not snz_sso['hide_password']</attribute>
+        </xpath>
+        <xpath expr="//form[contains(@t-attf-class, 'oe_login_form')]" position="attributes">
+            <attribute name="t-attf-class">oe_login_form #{'' if login else 'd-none'} #{'d-none o_snaphomz_password_hidden' if snz_sso['hide_password'] else ''}</attribute>
+        </xpath>
+    </template>
+
+    <!-- No "Powered by Odoo" in portal footers. -->
+    <template id="brand_promotion_message_snaphomz" inherit_id="web.brand_promotion_message" name="Snaphomz brand promotion">
+        <xpath expr="//t[@t-out]" position="replace">
+            <span>Snaphomz</span>
+        </xpath>
+    </template>
+
+    <!-- Emails to buyers and staff: keep the unfollow link, drop "Powered by Odoo". -->
+    <template id="mail_notification_layout_snaphomz" inherit_id="mail.mail_notification_layout" name="Snaphomz mail layout">
+        <xpath expr="//div[@t-if='show_footer'][.//a[contains(@href, 'odoo.com')]]" position="replace">
+            <div t-if="show_footer and show_unfollow" style="color: #555555; font-size:11px;">
+                <span id="mail_unfollow">
+                    <a href="/mail/unfollow" style="text-decoration:none; color:#555555;">Unfollow</a>
+                </span>
+            </div>
+        </xpath>
+    </template>
+
+    <template id="mail_notification_light_snaphomz" inherit_id="mail.mail_notification_light" name="Snaphomz light mail layout">
+        <xpath expr="//tr[td/a[contains(@href, 'odoo.com')]]" position="replace">
+            <tr t-if="show_unfollow"><td align="center" style="min-width: 590px; font-size:11px; color:#555555;">
+                <span id="mail_unfollow">
+                    <a href="/mail/unfollow" style="text-decoration:none; color:#555555;">Unfollow</a>
+                </span>
+            </td></tr>
+        </xpath>
+    </template>
+</odoo>

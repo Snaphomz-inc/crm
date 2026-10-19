@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo noupdate="1">
+    <record id="lost_reason_do_not_contact" model="crm.lost.reason">
+        <field name="name">Asked not to be contacted</field>
+    </record>
+    <record id="lost_reason_unreachable" model="crm.lost.reason">
+        <field name="name">Unreachable after attempts</field>
+    </record>
+    <record id="lost_reason_wrong_details" model="crm.lost.reason">
+        <field name="name">Wrong or fake contact details</field>
+    </record>
+    <record id="lost_reason_has_agent" model="crm.lost.reason">
+        <field name="name">Already represented by another agent</field>
+    </record>
+    <record id="lost_reason_not_buying" model="crm.lost.reason">
+        <field name="name">Not looking to buy</field>
+    </record>
+    <record id="lost_reason_outside_area" model="crm.lost.reason">
+        <field name="name">Outside service area</field>
+    </record>
+</odoo>

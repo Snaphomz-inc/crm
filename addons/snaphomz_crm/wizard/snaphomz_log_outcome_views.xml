@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="snaphomz_log_outcome_view_form" model="ir.ui.view">
+        <field name="name">snaphomz.log.outcome.form</field>
+        <field name="model">snaphomz.log.outcome</field>
+        <field name="arch" type="xml">
+            <form string="Log outcome">
+                <field name="lead_id" invisible="1"/>
+                <div class="alert alert-warning" role="alert" invisible="not attempts_warning">
+                    <field name="attempts_warning" readonly="1"/>
+                </div>
+                <group>
+                    <group>
+                        <field name="outcome" widget="radio"/>
+                    </group>
+                    <group>
+                        <field name="buyer_local_time"/>
+                        <field name="attempt_count" string="Attempts so far"/>
+                    </group>
+                </group>
+                <group>
+                    <field name="summary" placeholder="Short summary: what was said, what was agreed"/>
+                </group>
+                <group invisible="outcome == 'do_not_contact'">
+                    <field name="next_action" required="outcome and outcome != 'do_not_contact'"/>
+                    <field name="next_action_at" required="outcome and outcome != 'do_not_contact'"/>
+                </group>
+                <div class="alert alert-danger" role="alert" invisible="outcome != 'do_not_contact'">
+                    The buyer will be marked do-not-contact, removed from sales sequences and closed as lost.
+                </div>
+                <footer>
+                    <button name="action_save" string="Save" type="object" class="btn-primary" data-hotkey="q"/>
+                    <button string="Cancel" class="btn-secondary" special="cancel" data-hotkey="x"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+</odoo>

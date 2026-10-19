@@ -1,0 +1,33 @@
+// Snaphomz accents for the backend web client.
+
+.o_main_navbar {
+    // Thin Snaphomz-orange rule under the black navbar.
+    box-shadow: inset 0 -3px 0 $snz-orange;
+
+    .o_snaphomz_navbar_brand {
+        padding: 0 0.5rem 0 0.25rem;
+        opacity: 1;
+
+        &:hover,
+        &:focus {
+            opacity: 0.85;
+        }
+    }
+
+    .o_snaphomz_navbar_logo {
+        height: 22px;
+        width: auto;
+        display: block;
+    }
+
+    .o_menu_sections .dropdown-toggle.show,
+    .o_menu_sections .o_nav_entry.active {
+        box-shadow: inset 0 -3px 0 $snz-orange;
+    }
+}
+
+// Current step of status bars and highlighted buttons stay black; give
+// the active status-bar step the brand accent so progress reads at a glance.
+.o_statusbar_status .o_arrow_button_current {
+    border-bottom: 2px solid $snz-orange;
+}

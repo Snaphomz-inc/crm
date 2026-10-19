@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="res_users_view_form_snaphomz" model="ir.ui.view">
+        <field name="name">res.users.form.snaphomz</field>
+        <field name="model">res.users</field>
+        <field name="inherit_id" ref="base.view_users_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='login'][1]" position="after">
+                <field name="snaphomz_entra_oid" groups="base.group_system" invisible="not snaphomz_entra_oid"
+                       placeholder="Linked on first Microsoft sign-in"/>
+            </xpath>
+        </field>
+    </record>
+</odoo>

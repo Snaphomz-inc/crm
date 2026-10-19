@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+    <!-- Snaphomz logo between the apps menu and the current app name. -->
+    <t t-inherit="web.NavBar" t-inherit-mode="extension">
+        <xpath expr="//t[@t-call='web.NavBar.AppsMenu']" position="after">
+            <a href="/odoo" class="o_snaphomz_navbar_brand d-flex align-items-center" title="Snaphomz CRM"
+               t-if="!this.ui.isSmall">
+                <img src="/snaphomz_crm/static/src/img/snaphomz-logo-white.svg" alt="Snaphomz"
+                     class="o_snaphomz_navbar_logo"/>
+            </a>
+        </xpath>
+    </t>
+</templates>

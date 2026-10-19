@@ -1,0 +1,313 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- ============================================================ -->
+    <!-- Inbound events                                               -->
+    <!-- ============================================================ -->
+    <record id="snaphomz_inbound_event_view_list" model="ir.ui.view">
+        <field name="name">snaphomz.inbound.event.list</field>
+        <field name="model">snaphomz.inbound.event</field>
+        <field name="arch" type="xml">
+            <list string="Inbound events" create="0" delete="0"
+                  decoration-danger="state == 'failed'" decoration-warning="state == 'review'"
+                  decoration-muted="state == 'ignored'">
+                <field name="received_at"/>
+                <field name="provider"/>
+                <field name="event_type"/>
+                <field name="event_id" optional="show"/>
+                <field name="partner_id"/>
+                <field name="lead_id" optional="show"/>
+                <field name="state" widget="badge"
+                       decoration-success="state == 'done'" decoration-danger="state == 'failed'"
+                       decoration-warning="state == 'review'" decoration-info="state == 'pending'"/>
+                <field name="attempts" optional="hide"/>
+                <field name="result" optional="show"/>
+                <field name="error" optional="hide"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="snaphomz_inbound_event_view_form" model="ir.ui.view">
+        <field name="name">snaphomz.inbound.event.form</field>
+        <field name="model">snaphomz.inbound.event</field>
+        <field name="arch" type="xml">
+            <form string="Inbound event" create="0" delete="0">
+                <header>
+                    <button name="action_open_resolve" string="Resolve identity" type="object" class="oe_highlight"
+                            invisible="state != 'review' or review_reason == 'unknown_buyer'"/>
+                    <button name="action_replay" string="Replay" type="object"
+                            invisible="state not in ('failed', 'review', 'pending')"
+                            confirm="Reprocess this event once now?"/>
+                    <button name="action_ignore" string="Ignore" type="object"
+                            invisible="state in ('done', 'ignored')"/>
+                    <field name="state" widget="statusbar" statusbar_visible="pending,done"/>
+                </header>
+                <sheet>
+                    <group>
+                        <group>
+                            <field name="provider"/>
+                            <field name="event_type"/>
+                            <field name="event_id"/>
+                            <field name="event_at"/>
+                            <field name="received_at"/>
+                            <field name="processed_at"/>
+                        </group>
+                        <group>
+                            <field name="partner_id"/>
+                            <field name="lead_id"/>
+                            <field name="person_uuid"/>
+                            <field name="acquisition_uuid"/>
+                            <field name="attempts"/>
+                            <field name="next_attempt_at" invisible="not next_attempt_at"/>
+                        </group>
+                    </group>
+                    <group invisible="state != 'review'" string="Review">
+                        <field name="review_reason"/>
+                        <field name="conflict_partner_ids" widget="many2many_tags"/>
+                    </group>
+                    <group>
+                        <field name="result"/>
+                        <field name="error" invisible="not error"/>
+                        <field name="forced_partner_id" invisible="not forced_partner_id"/>
+                        <field name="force_new_person" invisible="not force_new_person"/>
+                    </group>
+                    <field name="payload_pretty" widget="text" class="font-monospace small"/>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="snaphomz_inbound_event_view_search" model="ir.ui.view">
+        <field name="name">snaphomz.inbound.event.search</field>
+        <field name="model">snaphomz.inbound.event</field>
+        <field name="arch" type="xml">
+            <search>
+                <field name="event_id"/>
+                <field name="partner_id"/>
+                <field name="event_type"/>
+                <filter string="Failed" name="failed" domain="[('state', '=', 'failed')]"/>
+                <filter string="Needs review" name="review" domain="[('state', '=', 'review')]"/>
+                <filter string="Pending" name="pending" domain="[('state', '=', 'pending')]"/>
+                <separator/>
+                <filter string="Meta" name="meta" domain="[('provider', '=', 'meta')]"/>
+                <filter string="Website" name="website" domain="[('provider', '=', 'website')]"/>
+                <filter string="Loops" name="loops" domain="[('provider', '=', 'loops')]"/>
+                <filter string="Received" name="received" date="received_at"/>
+                <group>
+                    <filter string="Provider" name="group_provider" context="{'group_by': 'provider'}"/>
+                    <filter string="State" name="group_state" context="{'group_by': 'state'}"/>
+                    <filter string="Type" name="group_type" context="{'group_by': 'event_type'}"/>
+                </group>
+            </search>
+        </field>
+    </record>
+
+    <record id="action_inbound_events" model="ir.actions.act_window">
+        <field name="name">Inbound events</field>
+        <field name="res_model">snaphomz.inbound.event</field>
+        <field name="view_mode">list,form</field>
+        <field name="search_view_id" ref="snaphomz_inbound_event_view_search"/>
+    </record>
+    <record id="action_intake_review" model="ir.actions.act_window">
+        <field name="name">Intake review</field>
+        <field name="res_model">snaphomz.inbound.event</field>
+        <field name="view_mode">list,form</field>
+        <field name="domain">[('state', '=', 'review')]</field>
+        <field name="help" type="html"><p class="o_view_nocontent_smiling_face">No conflicting identities to resolve.</p></field>
+    </record>
+    <record id="action_failed_integrations" model="ir.actions.act_window">
+        <field name="name">Failed integrations</field>
+        <field name="res_model">snaphomz.inbound.event</field>
+        <field name="view_mode">list,form</field>
+        <field name="domain">[('state', '=', 'failed')]</field>
+        <field name="help" type="html"><p class="o_view_nocontent_smiling_face">No failed inbound events.</p></field>
+    </record>
+
+    <!-- ============================================================ -->
+    <!-- Outbound Loops queue                                         -->
+    <!-- ============================================================ -->
+    <record id="snaphomz_outbound_queue_view_list" model="ir.ui.view">
+        <field name="name">snaphomz.outbound.queue.list</field>
+        <field name="model">snaphomz.outbound.queue</field>
+        <field name="arch" type="xml">
+            <list string="Loops updates" create="0" delete="0"
+                  decoration-danger="state == 'failed'" decoration-muted="state in ('done', 'skipped')">
+                <field name="create_date" string="Queued"/>
+                <field name="partner_id"/>
+                <field name="version"/>
+                <field name="state" widget="badge"/>
+                <field name="attempts"/>
+                <field name="next_attempt_at" optional="show"/>
+                <field name="last_status_code" optional="show"/>
+                <field name="last_error" optional="show"/>
+                <field name="done_at" optional="hide"/>
+            </list>
+        </field>
+    </record>
+    <record id="snaphomz_outbound_queue_view_form" model="ir.ui.view">
+        <field name="name">snaphomz.outbound.queue.form</field>
+        <field name="model">snaphomz.outbound.queue</field>
+        <field name="arch" type="xml">
+            <form string="Loops update" create="0" delete="0" edit="0">
+                <header>
+                    <button name="action_retry" string="Retry" type="object" invisible="state not in ('failed', 'skipped')"/>
+                    <field name="state" widget="statusbar"/>
+                </header>
+                <sheet>
+                    <group>
+                        <group>
+                            <field name="partner_id"/>
+                            <field name="lead_id"/>
+                            <field name="version"/>
+                        </group>
+                        <group>
+                            <field name="attempts"/>
+                            <field name="claimed_at"/>
+                            <field name="next_attempt_at"/>
+                            <field name="done_at"/>
+                            <field name="last_status_code"/>
+                        </group>
+                    </group>
+                    <field name="last_error" invisible="not last_error"/>
+                    <field name="payload_pretty" widget="text" class="font-monospace small"/>
+                </sheet>
+            </form>
+        </field>
+    </record>
+    <record id="action_outbound_queue" model="ir.actions.act_window">
+        <field name="name">Loops updates</field>
+        <field name="res_model">snaphomz.outbound.queue</field>
+        <field name="view_mode">list,form</field>
+    </record>
+    <record id="action_outbound_failed" model="ir.actions.act_window">
+        <field name="name">Failed Loops updates</field>
+        <field name="res_model">snaphomz.outbound.queue</field>
+        <field name="view_mode">list,form</field>
+        <field name="domain">[('state', '=', 'failed')]</field>
+    </record>
+
+    <!-- ============================================================ -->
+    <!-- Sales mailbox                                                -->
+    <!-- ============================================================ -->
+    <record id="snaphomz_inbound_email_view_list" model="ir.ui.view">
+        <field name="name">snaphomz.inbound.email.list</field>
+        <field name="model">snaphomz.inbound.email</field>
+        <field name="arch" type="xml">
+            <list string="Sales mailbox" create="0">
+                <field name="received_at"/>
+                <field name="email_from"/>
+                <field name="name"/>
+                <field name="lead_id"/>
+                <field name="owner_id" widget="many2one_avatar_user"/>
+                <field name="state" widget="badge" decoration-warning="state == 'unmatched'"
+                       decoration-success="state in ('matched', 'attached')"/>
+                <field name="match_note" optional="show"/>
+            </list>
+        </field>
+    </record>
+    <record id="snaphomz_inbound_email_view_form" model="ir.ui.view">
+        <field name="name">snaphomz.inbound.email.form</field>
+        <field name="model">snaphomz.inbound.email</field>
+        <field name="arch" type="xml">
+            <form string="Sales mailbox email" create="0">
+                <header>
+                    <button name="action_attach_to_lead" string="Attach to buyer" type="object" class="oe_highlight"
+                            invisible="state != 'unmatched'"/>
+                    <button name="action_ignore" string="Ignore" type="object" invisible="state != 'unmatched'"/>
+                    <field name="state" widget="statusbar"/>
+                </header>
+                <sheet>
+                    <group>
+                        <field name="name"/>
+                        <field name="email_from"/>
+                        <field name="received_at"/>
+                        <field name="match_note"/>
+                        <field name="partner_id"/>
+                        <field name="lead_id" readonly="state != 'unmatched'" options="{'no_create': True}"/>
+                        <field name="owner_id"/>
+                    </group>
+                </sheet>
+                <chatter/>
+            </form>
+        </field>
+    </record>
+    <record id="action_unmatched_emails" model="ir.actions.act_window">
+        <field name="name">Unmatched emails</field>
+        <field name="res_model">snaphomz.inbound.email</field>
+        <field name="view_mode">list,form</field>
+        <field name="domain">[('state', '=', 'unmatched')]</field>
+        <field name="help" type="html"><p class="o_view_nocontent_smiling_face">Every reply reached the right buyer.</p></field>
+    </record>
+    <record id="action_mailbox_log" model="ir.actions.act_window">
+        <field name="name">Sales mailbox log</field>
+        <field name="res_model">snaphomz.inbound.email</field>
+        <field name="view_mode">list,form</field>
+    </record>
+
+    <!-- ============================================================ -->
+    <!-- Inquiries, history, reasons                                  -->
+    <!-- ============================================================ -->
+    <record id="snaphomz_inquiry_view_list" model="ir.ui.view">
+        <field name="name">snaphomz.inquiry.list</field>
+        <field name="model">snaphomz.inquiry</field>
+        <field name="arch" type="xml">
+            <list string="Inquiries" create="0" delete="0" edit="0">
+                <field name="inquiry_at"/>
+                <field name="lead_id"/>
+                <field name="provider"/>
+                <field name="event_type"/>
+                <field name="property_ref"/>
+                <field name="campaign" optional="show"/>
+                <field name="message" optional="show"/>
+                <field name="user_id" optional="hide"/>
+            </list>
+        </field>
+    </record>
+    <record id="snaphomz_inquiry_view_form" model="ir.ui.view">
+        <field name="name">snaphomz.inquiry.form</field>
+        <field name="model">snaphomz.inquiry</field>
+        <field name="arch" type="xml">
+            <form string="Inquiry" create="0" delete="0" edit="0">
+                <sheet>
+                    <group>
+                        <group>
+                            <field name="lead_id"/>
+                            <field name="partner_id"/>
+                            <field name="provider"/>
+                            <field name="event_type"/>
+                            <field name="inquiry_at"/>
+                        </group>
+                        <group>
+                            <field name="property_ref"/>
+                            <field name="listing_url" widget="url"/>
+                            <field name="source"/>
+                            <field name="medium"/>
+                            <field name="campaign"/>
+                            <field name="meta_form_id"/>
+                            <field name="meta_ad_id"/>
+                            <field name="landing_page" widget="url"/>
+                        </group>
+                    </group>
+                    <field name="message"/>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="snaphomz_nurture_reason_view_list" model="ir.ui.view">
+        <field name="name">snaphomz.nurture.reason.list</field>
+        <field name="model">snaphomz.nurture.reason</field>
+        <field name="arch" type="xml">
+            <list editable="bottom">
+                <field name="sequence" widget="handle"/>
+                <field name="name"/>
+                <field name="active" widget="boolean_toggle"/>
+            </list>
+        </field>
+    </record>
+    <record id="action_nurture_reasons" model="ir.actions.act_window">
+        <field name="name">Nurture reasons</field>
+        <field name="res_model">snaphomz.nurture.reason</field>
+        <field name="view_mode">list</field>
+        <field name="context">{'active_test': False}</field>
+    </record>
+</odoo>

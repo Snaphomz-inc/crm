@@ -1,0 +1,350 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- ============================================================ -->
+    <!-- Lead / opportunity form                                      -->
+    <!-- ============================================================ -->
+    <record id="crm_lead_view_form_snaphomz" model="ir.ui.view">
+        <field name="name">crm.lead.form.snaphomz</field>
+        <field name="model">crm.lead</field>
+        <field name="inherit_id" ref="crm.crm_lead_view_form"/>
+        <field name="arch" type="xml">
+            <!-- Buyers become opportunities through Qualify, never the generic convert/merge wizard. -->
+            <xpath expr="//header/button[@name='%(crm.action_crm_lead2opportunity_partner)d']" position="attributes">
+                <attribute name="invisible">type == 'opportunity' or not active or acquisition_uuid</attribute>
+            </xpath>
+            <xpath expr="//header/button[1]" position="before">
+                <button name="action_snaphomz_log_outcome" string="Log outcome" type="object"
+                        class="oe_highlight" data-hotkey="o" invisible="not id or not active"/>
+                <button name="action_snaphomz_qualify" string="Qualify" type="object" data-hotkey="y"
+                        invisible="not id or not active or type == 'opportunity' or buyer_status == 'lost'"/>
+            </xpath>
+            <xpath expr="//header/field[@name='stage_id']" position="after">
+                <field name="buyer_status" widget="statusbar" invisible="type == 'opportunity'"
+                       statusbar_visible="new,attempting,connected,qualified"/>
+            </xpath>
+
+            <xpath expr="//div[@name='button_box']" position="inside">
+                <button name="action_snaphomz_view_inquiries" type="object" class="oe_stat_button"
+                        icon="fa-inbox" invisible="not acquisition_uuid">
+                    <field name="inquiry_count" widget="statinfo" string="Inquiries"/>
+                </button>
+                <button name="action_snaphomz_view_marketing_events" type="object" class="oe_stat_button"
+                        icon="fa-envelope-o" string="Marketing" invisible="not partner_id"/>
+            </xpath>
+
+            <xpath expr="//div[hasclass('oe_title')]" position="before">
+                <field name="acquisition_uuid" invisible="1"/>
+                <field name="do_not_contact" invisible="1"/>
+                <field name="snaphomz_needs_review" invisible="1"/>
+                <field name="is_overdue" invisible="1"/>
+                <div class="alert alert-danger mb-2" role="alert" invisible="not do_not_contact">
+                    <strong>Do not contact.</strong> The buyer asked not to be contacted.
+                </div>
+                <div class="alert alert-warning mb-2" role="alert" invisible="not snaphomz_needs_review">
+                    <strong>Needs manager review: </strong>
+                    <field name="snaphomz_review_note" readonly="1" class="d-inline"/>
+                    <button name="action_snaphomz_clear_review" type="object" string="Mark reviewed"
+                            class="btn-link p-0 ms-2" groups="sales_team.group_sale_salesman_all_leads"/>
+                </div>
+            </xpath>
+
+            <xpath expr="//div[hasclass('oe_title')]" position="after">
+                <group name="snaphomz_next_action" string="Next action">
+                    <group>
+                        <field name="next_action" required="active and won_status != 'won' and buyer_status in ('new', 'attempting', 'connected', 'qualified')"/>
+                        <field name="next_action_at" decoration-danger="is_overdue"
+                               required="active and won_status != 'won' and buyer_status in ('new', 'attempting', 'connected', 'qualified')"/>
+                    </group>
+                    <group>
+                        <field name="buyer_timezone"/>
+                        <field name="preferred_contact_method"/>
+                        <field name="last_outcome"/>
+                        <field name="attempt_count"/>
+                    </group>
+                </group>
+            </xpath>
+
+            <xpath expr="//notebook" position="inside">
+                <page string="Buyer" name="snaphomz_buyer">
+                    <group>
+                        <group string="Qualification">
+                            <field name="buyer_readiness" readonly="1"/>
+                            <field name="qualification_reason" readonly="1"/>
+                            <field name="qualified_at"/>
+                            <field name="qualified_by_id"/>
+                            <field name="nurture_reason_id" readonly="1" invisible="buyer_status != 'nurture'"/>
+                            <field name="nurture_review_date" invisible="buyer_status != 'nurture'"
+                                   required="buyer_status == 'nurture'"/>
+                        </group>
+                        <group string="Needs">
+                            <field name="buyer_locations"/>
+                            <field name="home_type"/>
+                            <label for="budget_min" string="Budget"/>
+                            <div class="o_row">
+                                <field name="budget_min" class="oe_inline"/>
+                                <span>to</span>
+                                <field name="budget_max" class="oe_inline"/>
+                            </div>
+                            <field name="monthly_payment_comfort"/>
+                            <field name="buying_timeline"/>
+                            <field name="tour_ready"/>
+                            <field name="financing_status"/>
+                            <field name="existing_representation"/>
+                        </group>
+                    </group>
+                </page>
+                <page string="Contact &amp; milestones" name="snaphomz_milestones">
+                    <group>
+                        <group string="Human contact">
+                            <field name="first_human_attempt_at"/>
+                            <field name="last_human_attempt_at"/>
+                            <field name="last_two_way_contact_at"/>
+                            <field name="last_buyer_response_at"/>
+                            <field name="sla_start_at"/>
+                        </group>
+                        <group string="Consultation">
+                            <field name="consultation_booked_at"/>
+                            <field name="consultation_at"/>
+                            <field name="consultation_completed_at"/>
+                            <field name="consultation_cancelled_at" invisible="not consultation_cancelled_at"/>
+                        </group>
+                        <group string="Buyer representation agreement">
+                            <field name="bra_status"/>
+                            <field name="bra_reference"/>
+                            <field name="bra_sent_at"/>
+                            <field name="bra_signed_at"/>
+                            <field name="bra_expires_at"/>
+                            <field name="bra_ended_at" invisible="not bra_ended_at"/>
+                        </group>
+                        <group string="Marketing (Loops)">
+                            <field name="email_subscription_status"/>
+                            <field name="marketing_consent"/>
+                            <field name="sales_sequence_eligible"/>
+                            <field name="last_marketing_engagement_at"/>
+                        </group>
+                    </group>
+                </page>
+                <page string="Source" name="snaphomz_source">
+                    <group>
+                        <group string="Original inquiry (preserved)">
+                            <field name="origin_provider"/>
+                            <field name="origin_event_type"/>
+                            <field name="origin_at"/>
+                            <field name="origin_source"/>
+                            <field name="origin_medium"/>
+                            <field name="origin_campaign"/>
+                            <field name="origin_content"/>
+                            <field name="origin_term"/>
+                            <field name="origin_landing_page" widget="url"/>
+                            <field name="origin_meta_form_id"/>
+                            <field name="origin_meta_campaign_id"/>
+                            <field name="origin_meta_ad_id"/>
+                            <field name="origin_meta_lead_id"/>
+                        </group>
+                        <group string="Latest inquiry">
+                            <field name="latest_inquiry_provider"/>
+                            <field name="latest_inquiry_at"/>
+                            <field name="latest_inquiry_source"/>
+                            <field name="latest_inquiry_campaign"/>
+                            <field name="latest_property_ref"/>
+                            <field name="latest_inquiry_text"/>
+                        </group>
+                        <group string="Identifiers" groups="sales_team.group_sale_salesman_all_leads">
+                            <field name="acquisition_uuid" string="Acquisition UUID" readonly="1"/>
+                            <field name="person_uuid"/>
+                            <field name="snaphomz_user_id"/>
+                            <field name="merged_acquisition_uuids" invisible="not merged_acquisition_uuids"/>
+                        </group>
+                    </group>
+                </page>
+                <page string="Stage history" name="snaphomz_history" groups="sales_team.group_sale_salesman">
+                    <field name="stage_history_ids" readonly="1">
+                        <list>
+                            <field name="changed_at"/>
+                            <field name="kind"/>
+                            <field name="old_status"/>
+                            <field name="new_status"/>
+                            <field name="old_stage_id"/>
+                            <field name="new_stage_id"/>
+                            <field name="actor_id"/>
+                            <field name="origin"/>
+                        </list>
+                    </field>
+                </page>
+            </xpath>
+        </field>
+    </record>
+
+    <!-- ============================================================ -->
+    <!-- Work lists                                                   -->
+    <!-- ============================================================ -->
+    <record id="crm_lead_view_list_buyers" model="ir.ui.view">
+        <field name="name">crm.lead.list.snaphomz.buyers</field>
+        <field name="model">crm.lead</field>
+        <field name="priority">90</field>
+        <field name="arch" type="xml">
+            <list string="Buyers" default_order="next_action_at asc, id desc"
+                  decoration-danger="is_overdue" decoration-muted="not active" sample="1">
+                <field name="name" string="Buyer"/>
+                <field name="phone" optional="show"/>
+                <field name="email_from" optional="hide"/>
+                <field name="buyer_timezone" optional="show"/>
+                <field name="buyer_status" widget="badge"
+                       decoration-info="buyer_status == 'new'" decoration-success="buyer_status == 'qualified'"
+                       decoration-warning="buyer_status == 'nurture'"/>
+                <field name="stage_id" optional="show" invisible="type == 'lead'"/>
+                <field name="user_id" widget="many2one_avatar_user" optional="show"/>
+                <field name="next_action"/>
+                <field name="next_action_at"/>
+                <field name="last_outcome" optional="show"/>
+                <field name="attempt_count" optional="hide"/>
+                <field name="latest_property_ref" optional="hide"/>
+                <field name="latest_inquiry_at" optional="show"/>
+                <field name="origin_provider" optional="show"/>
+                <field name="origin_campaign" optional="hide"/>
+                <field name="is_overdue" column_invisible="1"/>
+                <field name="active" column_invisible="1"/>
+                <field name="type" column_invisible="1"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="crm_lead_view_search_buyers" model="ir.ui.view">
+        <field name="name">crm.lead.search.snaphomz.buyers</field>
+        <field name="model">crm.lead</field>
+        <field name="priority">90</field>
+        <field name="arch" type="xml">
+            <search string="Buyers">
+                <field name="name" string="Buyer"
+                       filter_domain="['|', '|', '|', ('name', 'ilike', self), ('partner_id', 'ilike', self), ('email_from', 'ilike', self), ('phone', 'ilike', self)]"/>
+                <field name="user_id"/>
+                <field name="latest_property_ref"/>
+                <field name="origin_campaign"/>
+                <filter string="My buyers" name="mine" domain="[('user_id', '=', uid)]"/>
+                <filter string="Unassigned" name="unassigned" domain="[('user_id', '=', False)]"/>
+                <separator/>
+                <filter string="New" name="status_new" domain="[('buyer_status', '=', 'new')]"/>
+                <filter string="Follow-ups due today" name="due_today" domain="[('is_due_today', '=', True)]"/>
+                <filter string="Overdue" name="overdue" domain="[('is_overdue', '=', True)]"/>
+                <filter string="Waiting for buyer" name="waiting" domain="[('waiting_for_buyer', '=', True)]"/>
+                <filter string="Missing next action" name="missing_next" domain="[('missing_next_action', '=', True)]"/>
+                <filter string="Attempts exhausted" name="attempts_exhausted" domain="[('attempts_exhausted', '=', True)]"/>
+                <separator/>
+                <filter string="Leads" name="leads" domain="[('type', '=', 'lead')]"/>
+                <filter string="Qualified pipeline" name="opportunities" domain="[('type', '=', 'opportunity')]"/>
+                <filter string="Nurture" name="nurture" domain="[('buyer_status', '=', 'nurture')]"/>
+                <filter string="Active BRAs" name="bra_active" domain="[('bra_active', '=', True)]"/>
+                <filter string="Needs review" name="needs_review" domain="[('snaphomz_needs_review', '=', True)]"/>
+                <separator/>
+                <filter string="Unqualified or lost" name="lost" domain="[('buyer_status', '=', 'lost'), ('active', '=', False)]"/>
+                <filter string="First inquiry" name="origin_date" date="origin_at"/>
+                <group>
+                    <filter string="Salesperson" name="group_user" context="{'group_by': 'user_id'}"/>
+                    <filter string="Lead status" name="group_status" context="{'group_by': 'buyer_status'}"/>
+                    <filter string="Stage" name="group_stage" context="{'group_by': 'stage_id'}"/>
+                    <filter string="Original channel" name="group_origin" context="{'group_by': 'origin_provider'}"/>
+                    <filter string="Original campaign" name="group_campaign" context="{'group_by': 'origin_campaign'}"/>
+                </group>
+            </search>
+        </field>
+    </record>
+
+    <!-- Salesperson views -->
+    <record id="action_my_new_leads" model="ir.actions.act_window">
+        <field name="name">My new leads</field>
+        <field name="res_model">crm.lead</field>
+        <field name="view_mode">list,form,kanban</field>
+        <field name="view_id" ref="crm_lead_view_list_buyers"/>
+        <field name="search_view_id" ref="crm_lead_view_search_buyers"/>
+        <field name="domain">[('acquisition_uuid', '!=', False), ('user_id', '=', uid), ('buyer_status', '=', 'new')]</field>
+        <field name="help" type="html"><p class="o_view_nocontent_smiling_face">No new buyers waiting for first contact.</p></field>
+    </record>
+    <record id="action_my_followups_today" model="ir.actions.act_window">
+        <field name="name">My follow-ups today</field>
+        <field name="res_model">crm.lead</field>
+        <field name="view_mode">list,form,kanban</field>
+        <field name="view_id" ref="crm_lead_view_list_buyers"/>
+        <field name="search_view_id" ref="crm_lead_view_search_buyers"/>
+        <field name="domain">[('acquisition_uuid', '!=', False), ('user_id', '=', uid), ('is_due_today', '=', True)]</field>
+        <field name="help" type="html"><p class="o_view_nocontent_smiling_face">Nothing due today.</p></field>
+    </record>
+    <record id="action_my_overdue" model="ir.actions.act_window">
+        <field name="name">My overdue leads</field>
+        <field name="res_model">crm.lead</field>
+        <field name="view_mode">list,form</field>
+        <field name="view_id" ref="crm_lead_view_list_buyers"/>
+        <field name="search_view_id" ref="crm_lead_view_search_buyers"/>
+        <field name="domain">[('acquisition_uuid', '!=', False), ('user_id', '=', uid), ('is_overdue', '=', True)]</field>
+        <field name="help" type="html"><p class="o_view_nocontent_smiling_face">No overdue follow-ups.</p></field>
+    </record>
+    <record id="action_my_waiting" model="ir.actions.act_window">
+        <field name="name">Waiting for buyer</field>
+        <field name="res_model">crm.lead</field>
+        <field name="view_mode">list,form</field>
+        <field name="view_id" ref="crm_lead_view_list_buyers"/>
+        <field name="search_view_id" ref="crm_lead_view_search_buyers"/>
+        <field name="domain">[('acquisition_uuid', '!=', False), ('user_id', '=', uid), ('waiting_for_buyer', '=', True)]</field>
+    </record>
+    <record id="action_my_missing_next" model="ir.actions.act_window">
+        <field name="name">My leads missing next action</field>
+        <field name="res_model">crm.lead</field>
+        <field name="view_mode">list,form</field>
+        <field name="view_id" ref="crm_lead_view_list_buyers"/>
+        <field name="search_view_id" ref="crm_lead_view_search_buyers"/>
+        <field name="domain">[('acquisition_uuid', '!=', False), ('user_id', '=', uid), ('missing_next_action', '=', True)]</field>
+        <field name="help" type="html"><p class="o_view_nocontent_smiling_face">Every active buyer has a dated next action.</p></field>
+    </record>
+
+    <!-- Manager views -->
+    <record id="action_all_active_buyers" model="ir.actions.act_window">
+        <field name="name">All active buyers</field>
+        <field name="res_model">crm.lead</field>
+        <field name="view_mode">list,kanban,form,pivot,graph</field>
+        <field name="view_id" ref="crm_lead_view_list_buyers"/>
+        <field name="search_view_id" ref="crm_lead_view_search_buyers"/>
+        <field name="domain">[('acquisition_uuid', '!=', False)]</field>
+    </record>
+    <record id="action_unassigned_intake" model="ir.actions.act_window">
+        <field name="name">Unassigned intake</field>
+        <field name="res_model">crm.lead</field>
+        <field name="view_mode">list,form</field>
+        <field name="view_id" ref="crm_lead_view_list_buyers"/>
+        <field name="search_view_id" ref="crm_lead_view_search_buyers"/>
+        <field name="domain">[('acquisition_uuid', '!=', False), ('user_id', '=', False)]</field>
+        <field name="help" type="html"><p class="o_view_nocontent_smiling_face">Every active buyer has an owner.</p></field>
+    </record>
+    <record id="action_overdue_by_owner" model="ir.actions.act_window">
+        <field name="name">Overdue by owner</field>
+        <field name="res_model">crm.lead</field>
+        <field name="view_mode">list,form</field>
+        <field name="view_id" ref="crm_lead_view_list_buyers"/>
+        <field name="search_view_id" ref="crm_lead_view_search_buyers"/>
+        <field name="domain">[('acquisition_uuid', '!=', False), ('is_overdue', '=', True)]</field>
+        <field name="context">{'group_by': ['user_id']}</field>
+    </record>
+    <record id="action_qualified_pipeline" model="ir.actions.act_window">
+        <field name="name">Qualified pipeline</field>
+        <field name="res_model">crm.lead</field>
+        <field name="view_mode">kanban,list,form</field>
+        <field name="search_view_id" ref="crm_lead_view_search_buyers"/>
+        <field name="domain">[('acquisition_uuid', '!=', False), ('type', '=', 'opportunity')]</field>
+        <field name="context">{'default_type': 'opportunity'}</field>
+    </record>
+    <record id="action_buyers_needs_review" model="ir.actions.act_window">
+        <field name="name">Buyers needing review</field>
+        <field name="res_model">crm.lead</field>
+        <field name="view_mode">list,form</field>
+        <field name="view_id" ref="crm_lead_view_list_buyers"/>
+        <field name="search_view_id" ref="crm_lead_view_search_buyers"/>
+        <field name="domain">[('acquisition_uuid', '!=', False), ('snaphomz_needs_review', '=', True)]</field>
+        <field name="context">{'active_test': False}</field>
+    </record>
+    <record id="action_attempts_exhausted" model="ir.actions.act_window">
+        <field name="name">Attempts exhausted</field>
+        <field name="res_model">crm.lead</field>
+        <field name="view_mode">list,form</field>
+        <field name="view_id" ref="crm_lead_view_list_buyers"/>
+        <field name="search_view_id" ref="crm_lead_view_search_buyers"/>
+        <field name="domain">[('acquisition_uuid', '!=', False), ('attempts_exhausted', '=', True)]</field>
+    </record>
+</odoo>

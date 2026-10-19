@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo noupdate="1">
+    <record id="cron_process_inbound_events" model="ir.cron">
+        <field name="name">Snaphomz: process pending inbound events</field>
+        <field name="model_id" ref="model_snaphomz_inbound_event"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_process_pending()</field>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="interval_number">1</field>
+        <field name="interval_type">minutes</field>
+    </record>
+
+    <record id="cron_release_outbound_claims" model="ir.cron">
+        <field name="name">Snaphomz: release stale Loops queue claims</field>
+        <field name="model_id" ref="model_snaphomz_outbound_queue"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_release_stale_claims()</field>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="interval_number">5</field>
+        <field name="interval_type">minutes</field>
+    </record>
+
+    <!-- Disabled until staffed hours are confirmed (see the Buyer Acquisition team). -->
+    <record id="cron_first_contact_alerts" model="ir.cron">
+        <field name="name">Snaphomz: first-contact reminders and escalation</field>
+        <field name="model_id" ref="crm.model_crm_lead"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_snaphomz_first_contact_alerts()</field>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="interval_number">5</field>
+        <field name="interval_type">minutes</field>
+        <field name="active" eval="False"/>
+    </record>
+
+    <record id="cron_overdue_digest" model="ir.cron">
+        <field name="name">Snaphomz: daily overdue follow-up digest</field>
+        <field name="model_id" ref="crm.model_crm_lead"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_snaphomz_overdue_digest()</field>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="interval_number">1</field>
+        <field name="interval_type">days</field>
+        <field name="nextcall" eval="(DateTime.now().replace(hour=12, minute=30, second=0) + timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')"/>
+    </record>
+
+    <record id="cron_bra_expiry" model="ir.cron">
+        <field name="name">Snaphomz: expire BRAs past their end date</field>
+        <field name="model_id" ref="crm.model_crm_lead"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_snaphomz_bra_expiry()</field>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="interval_number">1</field>
+        <field name="interval_type">hours</field>
+    </record>
+
+    <record id="cron_cleanup_events" model="ir.cron">
+        <field name="name">Snaphomz: remove unmatched marketing events after 30 days</field>
+        <field name="model_id" ref="model_snaphomz_inbound_event"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_cleanup()</field>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="interval_number">1</field>
+        <field name="interval_type">days</field>
+    </record>
+</odoo>

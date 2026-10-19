@@ -1,0 +1,245 @@
+{
+  "id": "SnzLoopsSync0001",
+  "name": "Snaphomz | Odoo -> Loops contact properties",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "327477d3-dc18-59d5-a6da-2903af381777",
+      "name": "Every minute",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://odoo:8069/json/2/snaphomz.outbound.queue/claim_batch",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Odoo-Database",
+              "value": "snaphomz"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ limit: 20 }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "87e31119-0eeb-5b72-91e0-c6eef0429f26",
+      "name": "Claim Loops batch",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        240,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "odoo-integration-key",
+          "name": "Odoo integration API key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "items",
+        "options": {}
+      },
+      "id": "3c1416a6-41f8-5a70-91f0-9d904b668dff",
+      "name": "One item per buyer",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        360,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "https://app.loops.so/api/v1/contacts/update",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 15000,
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "efa0d3a1-9085-5744-ad55-e4c817c1d5b1",
+      "name": "Update Loops contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "loops-api-key",
+          "name": "Loops API key"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Turn one Loops API response into an Odoo queue result.\nconst claim = $('One item per buyer').item.json;\nconst res = $json;\nconst status = Number(res.statusCode || 0);\nconst body = (res.body && typeof res.body === 'object') ? res.body : {};\nconst ok = status >= 200 && status < 300 && body.success !== false;\nreturn {\n  json: {\n    queue_id: claim.queue_id,\n    success: ok,\n    status_code: status,\n    error: ok ? null : String(body.message || res.error?.message || `HTTP ${status}`),\n    loops_contact_id: ok ? (body.id || null) : null,\n  },\n};"
+      },
+      "id": "dad38df7-26f0-5ad6-b38b-e2f3171b23ce",
+      "name": "Build results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://odoo:8069/json/2/snaphomz.outbound.queue/report_result",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Odoo-Database",
+              "value": "snaphomz"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "9e48a609-a4e9-5b5d-a96f-45ead91421fc",
+      "name": "Report to Odoo",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "odoo-integration-key",
+          "name": "Odoo integration API key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "Every minute": {
+      "main": [
+        [
+          {
+            "node": "Claim Loops batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Loops batch": {
+      "main": [
+        [
+          {
+            "node": "One item per buyer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One item per buyer": {
+      "main": [
+        [
+          {
+            "node": "Update Loops contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Loops contact": {
+      "main": [
+        [
+          {
+            "node": "Build results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build results": {
+      "main": [
+        [
+          {
+            "node": "Report to Odoo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "errorWorkflow": "SnzErrorAlert001"
+  },
+  "active": false,
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [],
+  "staticData": null
+}

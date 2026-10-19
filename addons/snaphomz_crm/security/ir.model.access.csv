@@ -1,0 +1,22 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_identity_key_manager,identity key manager,model_snaphomz_identity_key,sales_team.group_sale_salesman_all_leads,1,0,0,0
+access_identity_key_system,identity key system,model_snaphomz_identity_key,base.group_system,1,1,1,1
+access_inquiry_salesperson,inquiry salesperson,model_snaphomz_inquiry,sales_team.group_sale_salesman,1,0,0,0
+access_inquiry_manager,inquiry manager,model_snaphomz_inquiry,sales_team.group_sale_salesman_all_leads,1,1,0,0
+access_inquiry_system,inquiry system,model_snaphomz_inquiry,base.group_system,1,1,1,1
+access_stage_history_salesperson,stage history salesperson,model_snaphomz_stage_history,sales_team.group_sale_salesman,1,0,0,0
+access_stage_history_system,stage history system,model_snaphomz_stage_history,base.group_system,1,1,1,1
+access_nurture_reason_user,nurture reason user,model_snaphomz_nurture_reason,base.group_user,1,0,0,0
+access_nurture_reason_manager,nurture reason manager,model_snaphomz_nurture_reason,sales_team.group_sale_manager,1,1,1,1
+access_inbound_event_manager,inbound event manager,model_snaphomz_inbound_event,sales_team.group_sale_salesman_all_leads,1,1,0,0
+access_inbound_event_integration,inbound event integration,model_snaphomz_inbound_event,group_snaphomz_integration,1,0,0,0
+access_inbound_event_system,inbound event system,model_snaphomz_inbound_event,base.group_system,1,1,1,1
+access_outbound_queue_manager,outbound queue manager,model_snaphomz_outbound_queue,sales_team.group_sale_salesman_all_leads,1,1,0,0
+access_outbound_queue_integration,outbound queue integration,model_snaphomz_outbound_queue,group_snaphomz_integration,1,0,0,0
+access_outbound_queue_system,outbound queue system,model_snaphomz_outbound_queue,base.group_system,1,1,1,1
+access_inbound_email_manager,inbound email manager,model_snaphomz_inbound_email,sales_team.group_sale_salesman_all_leads,1,1,1,0
+access_inbound_email_system,inbound email system,model_snaphomz_inbound_email,base.group_system,1,1,1,1
+access_buyer_report_salesperson,buyer report salesperson,model_snaphomz_buyer_report,sales_team.group_sale_salesman,1,0,0,0
+access_log_outcome_salesperson,log outcome salesperson,model_snaphomz_log_outcome,sales_team.group_sale_salesman,1,1,1,1
+access_qualify_salesperson,qualify salesperson,model_snaphomz_qualify,sales_team.group_sale_salesman,1,1,1,1
+access_resolve_event_manager,resolve event manager,model_snaphomz_resolve_event,sales_team.group_sale_salesman_all_leads,1,1,1,1

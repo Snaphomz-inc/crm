@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="res_config_settings_view_form_snaphomz" model="ir.ui.view">
+        <field name="name">res.config.settings.form.snaphomz</field>
+        <field name="model">res.config.settings</field>
+        <field name="inherit_id" ref="crm.res_config_settings_view_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//app[@name='crm']" position="inside">
+                <block title="Snaphomz buyer intake" name="snaphomz_settings" groups="base.group_system">
+                    <setting string="Loops webhook secret" help="Signing secret of the Loops webhook endpoint (whsec_…). Enter old and new secrets separated by a space while rotating.">
+                        <field name="snaphomz_loops_signing_secret" password="True"/>
+                    </setting>
+                    <setting string="New Loops contacts" help="Which buyers may be created as new contacts in Loops. Existing Loops contacts are always updated; subscriptions are never changed.">
+                        <field name="snaphomz_loops_contact_creation"/>
+                    </setting>
+                    <setting string="Registrations" help="Treat website registrations as buyer intent.">
+                        <field name="snaphomz_registration_creates_lead"/>
+                    </setting>
+                    <setting string="Default phone country" help="Used for numbers without a country prefix.">
+                        <field name="snaphomz_default_country_code"/>
+                    </setting>
+                    <setting string="Technical owner" help="Receives permanent integration failures.">
+                        <field name="snaphomz_technical_owner_id"/>
+                    </setting>
+                </block>
+                <block title="Microsoft sign-in (Entra ID)" name="snaphomz_sso_settings" groups="base.group_system">
+                    <setting string="Microsoft sign-in" help="Snaphomz staff sign in with their Microsoft work account. Only users who already exist in the CRM can sign in.">
+                        <field name="snaphomz_entra_enabled"/>
+                        <div class="content-group mt-2" invisible="not snaphomz_entra_enabled">
+                            <div class="row">
+                                <label for="snaphomz_entra_tenant_id" class="col-lg-4 o_light_label"/>
+                                <field name="snaphomz_entra_tenant_id" placeholder="00000000-0000-0000-0000-000000000000"/>
+                            </div>
+                            <div class="row">
+                                <label for="snaphomz_entra_client_id" class="col-lg-4 o_light_label"/>
+                                <field name="snaphomz_entra_client_id" placeholder="00000000-0000-0000-0000-000000000000"/>
+                            </div>
+                            <div class="row">
+                                <label for="snaphomz_entra_client_secret" class="col-lg-4 o_light_label"/>
+                                <field name="snaphomz_entra_client_secret" password="True"/>
+                            </div>
+                            <div class="row">
+                                <label for="snaphomz_entra_allowed_domains" class="col-lg-4 o_light_label"/>
+                                <field name="snaphomz_entra_allowed_domains" placeholder="snaphomz.com"/>
+                            </div>
+                            <div class="row">
+                                <label for="snaphomz_entra_redirect_uri" class="col-lg-4 o_light_label"/>
+                                <field name="snaphomz_entra_redirect_uri" readonly="1" widget="CopyClipboardChar"/>
+                            </div>
+                        </div>
+                    </setting>
+                    <setting string="Require Microsoft sign-in" help="Refuse password sign-in for everyone except the break-glass logins, who sign in at /web/login?local=1.">
+                        <field name="snaphomz_sso_enforce"/>
+                        <div class="content-group mt-2" invisible="not snaphomz_sso_enforce">
+                            <div class="row">
+                                <label for="snaphomz_sso_password_logins" class="col-lg-4 o_light_label"/>
+                                <field name="snaphomz_sso_password_logins"/>
+                            </div>
+                        </div>
+                    </setting>
+                </block>
+            </xpath>
+        </field>
+    </record>
+</odoo>

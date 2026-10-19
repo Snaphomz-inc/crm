@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="snaphomz_resolve_event_view_form" model="ir.ui.view">
+        <field name="name">snaphomz.resolve.event.form</field>
+        <field name="model">snaphomz.resolve.event</field>
+        <field name="arch" type="xml">
+            <form string="Resolve buyer identity">
+                <field name="event_id" invisible="1"/>
+                <group>
+                    <field name="review_reason"/>
+                    <field name="conflict_partner_ids" widget="many2many_tags"/>
+                    <field name="resolution" widget="radio"/>
+                    <field name="partner_id" invisible="resolution != 'existing'" required="resolution == 'existing'"
+                           options="{'no_create': True}"/>
+                </group>
+                <p class="text-muted" invisible="resolution != 'new'">
+                    A new buyer is created. Identifiers already owned by another buyer (email, Snaphomz user ID) stay with that buyer.
+                </p>
+                <footer>
+                    <button name="action_apply" string="Apply and reprocess" type="object" class="btn-primary"/>
+                    <button string="Cancel" class="btn-secondary" special="cancel"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+</odoo>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo noupdate="1">
+    <!-- API-key-only user for n8n, the Snaphomz backend and Loops webhooks.
+         It has no password, so it cannot sign in to the web client. Generate
+         its key with scripts/create_integration_key.sh. -->
+    <record id="user_snaphomz_integration" model="res.users">
+        <field name="name">Snaphomz Integration</field>
+        <field name="login">snaphomz-integration</field>
+        <field name="email">crm-integration@snaphomz.invalid</field>
+        <field name="tz">UTC</field>
+        <field name="notification_type">inbox</field>
+        <field name="group_ids" eval="[(6, 0, [ref('base.group_user'), ref('group_snaphomz_integration')])]"/>
+    </record>
+</odoo>

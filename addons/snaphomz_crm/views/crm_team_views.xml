@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="crm_team_view_form_snaphomz" model="ir.ui.view">
+        <field name="name">crm.team.form.snaphomz</field>
+        <field name="model">crm.team</field>
+        <field name="inherit_id" ref="sales_team.crm_team_view_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//notebook" position="inside">
+                <page string="Buyer intake" name="snaphomz_intake" invisible="not snaphomz_is_buyer_team">
+                    <group>
+                        <group string="Assignment">
+                            <field name="snaphomz_is_buyer_team" invisible="1"/>
+                            <field name="snaphomz_intake_user_id"/>
+                            <field name="snaphomz_intake_available"/>
+                            <field name="snaphomz_backup_user_id"/>
+                            <field name="snaphomz_backup_available"/>
+                            <div class="text-muted" colspan="2">
+                                When neither is available, inquiries go to the Unassigned intake queue
+                                and the team leader owns the first-contact task.
+                            </div>
+                        </group>
+                        <group string="Staffed time">
+                            <field name="snaphomz_calendar_id"/>
+                            <field name="snaphomz_first_contact_minutes"/>
+                            <field name="snaphomz_escalation_minutes"/>
+                            <field name="snaphomz_retry_attempt_limit"/>
+                        </group>
+                    </group>
+                </page>
+            </xpath>
+        </field>
+    </record>
+</odoo>

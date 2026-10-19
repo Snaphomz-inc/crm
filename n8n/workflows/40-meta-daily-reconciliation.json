@@ -1,0 +1,299 @@
+{
+  "id": "SnzMetaRecon0001",
+  "name": "Snaphomz | Meta daily reconciliation",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "id": "73959764-fcc9-5d32-bb5f-7056a702c9f9",
+      "name": "Daily 07:00 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// List every live Meta lead form here (marketing owns this inventory).\nconst FORM_IDS = ['REPLACE_WITH_FORM_ID'];\nconst since = Math.floor(Date.now() / 1000) - 3 * 24 * 3600;  // last 3 days\nreturn FORM_IDS.map(form_id => ({ json: { form_id, since } }));"
+      },
+      "id": "ddf9f4a0-a25a-506b-9448-0c458329d477",
+      "name": "Forms to check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.facebook.com/v21.0/{{ $json.form_id }}/leads",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "facebookGraphApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "id,created_time,field_data,ad_id,adset_id,campaign_id,form_id"
+            },
+            {
+              "name": "limit",
+              "value": "500"
+            },
+            {
+              "name": "filtering",
+              "value": "=[{\"field\":\"time_created\",\"operator\":\"GREATER_THAN\",\"value\":{{ $json.since }}}]"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "pagination": {
+            "pagination": {
+              "paginationMode": "responseContainsNextURL",
+              "nextURL": "={{ $response.body.paging?.next }}",
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.paging?.next }}"
+            }
+          }
+        }
+      },
+      "id": "2e6f72a7-7378-5e6b-989c-ba79f287de93",
+      "name": "Recent form leads",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        0
+      ],
+      "credentials": {
+        "facebookGraphApi": {
+          "id": "meta-graph",
+          "name": "Meta Graph API (system user)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const leads = [];\nfor (const item of $input.all()) for (const lead of item.json.data || []) leads.push(lead);\nreturn [{ json: { event_ids: leads.map(l => String(l.id)), leads } }];"
+      },
+      "id": "62213da5-242c-5c07-8123-beb8663a457a",
+      "name": "Collect lead IDs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://odoo:8069/json/2/snaphomz.inbound.event/find_missing_events",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Odoo-Database",
+              "value": "snaphomz"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ provider: 'meta', event_ids: $json.event_ids }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "30a08d41-ecce-51b1-92fa-580a3c48bf11",
+      "name": "Find unprocessed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "odoo-integration-key",
+          "name": "Odoo integration API key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "const missing = new Set($json.missing || []);\nconst leads = $('Collect lead IDs').first().json.leads.filter(l => missing.has(String(l.id)));\nreturn leads.map(json => ({ json }));"
+      },
+      "id": "e59e8262-360f-53e1-84d8-a29539c1ab7f",
+      "name": "Missing leads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Map a Meta lead (simplified n8n output, or raw Graph field_data) to the\n// canonical Snaphomz intake payload. Odoo enforces identity and ownership\n// rules; this node only reshapes data.\nconst STANDARD = new Set(['full_name', 'first_name', 'last_name', 'email', 'phone_number', 'phone',\n  'city', 'state', 'zip_code', 'post_code', 'country']);\n\nfunction flatten(lead) {\n  if (lead.data) return lead.data;\n  const out = {};\n  for (const f of lead.field_data || []) out[f.name] = (f.values || [])[0] ?? null;\n  return out;\n}\n\nreturn $input.all().map(({ json: lead }) => {\n  const d = flatten(lead);\n  const pick = (...keys) => keys.map(k => d[k]).find(v => v !== undefined && v !== null && v !== '') ?? null;\n  const answers = {};\n  for (const [k, v] of Object.entries(d)) if (!STANDARD.has(k)) answers[k] = v;\n  // A custom checkbox whose key contains \"consent\" records marketing consent.\n  const consentKey = Object.keys(answers).find(k => k.toLowerCase().includes('consent'));\n  const consent = consentKey ? ['yes', 'true', '1', 'i agree'].includes(String(answers[consentKey]).toLowerCase()) : false;\n  return {\n    json: {\n      payload: {\n        provider: 'meta',\n        event_type: 'lead_form',\n        event_id: String(lead.id),\n        event_time: lead.created_time,\n        person: {\n          name: pick('full_name'),\n          first_name: pick('first_name'),\n          last_name: pick('last_name'),\n          email: pick('email'),\n          phone: pick('phone_number', 'phone'),\n          country_code: pick('country'),\n        },\n        buyer_needs: { locations: pick('city', 'zip_code', 'post_code') },\n        attribution: {\n          source: 'facebook',\n          medium: 'paid_social',\n          campaign: lead.campaign_name || lead.campaign?.name || null,\n          meta: {\n            page_id: lead.page?.id || null,\n            form_id: lead.form?.id || lead.form_id || null,\n            campaign_id: lead.campaign_id || lead.campaign?.id || null,\n            adset_id: lead.adset?.id || lead.adset_id || null,\n            ad_id: lead.ad?.id || lead.ad_id || null,\n            lead_id: String(lead.id),\n          },\n        },\n        consent: consent ? { marketing_email: true, source: 'meta lead form', captured_at: lead.created_time } : {},\n        answers,\n      },\n    },\n  };\n});"
+      },
+      "id": "fd2031ac-9a0e-50e2-84c4-513f1b32a30e",
+      "name": "Map to intake payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://odoo:8069/json/2/snaphomz.inbound.event/submit_intake",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Odoo-Database",
+              "value": "snaphomz"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ payload: $json.payload }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "fd06197f-af5f-52f1-a6d0-08a85a963e62",
+      "name": "Submit missing to Odoo",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "odoo-integration-key",
+          "name": "Odoo integration API key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "Daily 07:00 UTC": {
+      "main": [
+        [
+          {
+            "node": "Forms to check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Forms to check": {
+      "main": [
+        [
+          {
+            "node": "Recent form leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recent form leads": {
+      "main": [
+        [
+          {
+            "node": "Collect lead IDs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect lead IDs": {
+      "main": [
+        [
+          {
+            "node": "Find unprocessed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find unprocessed": {
+      "main": [
+        [
+          {
+            "node": "Missing leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Missing leads": {
+      "main": [
+        [
+          {
+            "node": "Map to intake payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map to intake payload": {
+      "main": [
+        [
+          {
+            "node": "Submit missing to Odoo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "errorWorkflow": "SnzErrorAlert001"
+  },
+  "active": false,
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [],
+  "staticData": null
+}

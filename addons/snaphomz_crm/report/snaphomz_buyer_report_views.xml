@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="snaphomz_buyer_report_view_pivot" model="ir.ui.view">
+        <field name="name">snaphomz.buyer.report.pivot</field>
+        <field name="model">snaphomz.buyer.report</field>
+        <field name="arch" type="xml">
+            <pivot string="Buyer acquisition" sample="1">
+                <field name="origin_provider" type="row"/>
+                <field name="intake_date" interval="month" type="col"/>
+                <field name="buyer_count" type="measure"/>
+                <field name="inquiry_count" type="measure"/>
+                <field name="first_attempt_minutes" type="measure"/>
+                <field name="two_way_count" type="measure"/>
+                <field name="qualified_count" type="measure"/>
+                <field name="consultation_booked_count" type="measure"/>
+                <field name="consultation_attended_count" type="measure"/>
+                <field name="bra_sent_count" type="measure"/>
+                <field name="bra_signed_count" type="measure"/>
+                <field name="bra_active_count" type="measure"/>
+                <field name="overdue_count" type="measure"/>
+            </pivot>
+        </field>
+    </record>
+
+    <record id="snaphomz_buyer_report_view_graph" model="ir.ui.view">
+        <field name="name">snaphomz.buyer.report.graph</field>
+        <field name="model">snaphomz.buyer.report</field>
+        <field name="arch" type="xml">
+            <graph string="Buyer acquisition" type="bar" sample="1">
+                <field name="intake_date" interval="week"/>
+                <field name="origin_provider"/>
+                <field name="buyer_count" type="measure"/>
+            </graph>
+        </field>
+    </record>
+
+    <record id="snaphomz_buyer_report_view_list" model="ir.ui.view">
+        <field name="name">snaphomz.buyer.report.list</field>
+        <field name="model">snaphomz.buyer.report</field>
+        <field name="arch" type="xml">
+            <list string="Buyer acquisition">
+                <field name="intake_date"/>
+                <field name="lead_id"/>
+                <field name="user_id"/>
+                <field name="origin_provider"/>
+                <field name="origin_campaign"/>
+                <field name="buyer_status"/>
+                <field name="stage_id"/>
+                <field name="inquiry_count" sum="Total"/>
+                <field name="first_attempt_minutes" avg="Average"/>
+                <field name="two_way_count" sum="Total"/>
+                <field name="qualified_count" sum="Total"/>
+                <field name="consultation_booked_count" sum="Total"/>
+                <field name="consultation_attended_count" sum="Total"/>
+                <field name="bra_sent_count" sum="Total"/>
+                <field name="bra_signed_count" sum="Total"/>
+                <field name="bra_active_count" sum="Total"/>
+                <field name="overdue_count" sum="Total"/>
+                <field name="lost_reason_id" optional="hide"/>
+                <field name="nurture_reason_id" optional="hide"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="snaphomz_buyer_report_view_search" model="ir.ui.view">
+        <field name="name">snaphomz.buyer.report.search</field>
+        <field name="model">snaphomz.buyer.report</field>
+        <field name="arch" type="xml">
+            <search>
+                <field name="user_id"/>
+                <field name="origin_campaign"/>
+                <field name="source_id"/>
+                <field name="campaign_id"/>
+                <filter string="Intake date" name="intake_date" date="intake_date" default_period="month"/>
+                <separator/>
+                <filter string="Meta" name="meta" domain="[('origin_provider', '=', 'meta')]"/>
+                <filter string="Website" name="website" domain="[('origin_provider', '=', 'website')]"/>
+                <separator/>
+                <filter string="Lost or unqualified" name="lost" domain="[('buyer_status', '=', 'lost')]"/>
+                <filter string="Nurture" name="nurture" domain="[('buyer_status', '=', 'nurture')]"/>
+                <group>
+                    <filter string="Salesperson" name="group_user" context="{'group_by': 'user_id'}"/>
+                    <filter string="Original channel" name="group_provider" context="{'group_by': 'origin_provider'}"/>
+                    <filter string="Original campaign" name="group_campaign" context="{'group_by': 'origin_campaign'}"/>
+                    <filter string="Lost reason" name="group_lost" context="{'group_by': 'lost_reason_id'}"/>
+                    <filter string="Nurture reason" name="group_nurture" context="{'group_by': 'nurture_reason_id'}"/>
+                    <filter string="Intake month" name="group_month" context="{'group_by': 'intake_date:month'}"/>
+                </group>
+            </search>
+        </field>
+    </record>
+
+    <record id="action_buyer_report" model="ir.actions.act_window">
+        <field name="name">Buyer acquisition analysis</field>
+        <field name="res_model">snaphomz.buyer.report</field>
+        <field name="view_mode">pivot,graph,list</field>
+        <field name="search_view_id" ref="snaphomz_buyer_report_view_search"/>
+        <field name="context">{'search_default_intake_date': 1, 'active_test': False}</field>
+        <field name="help" type="html">
+            <p>One row per buyer (unique person), dated by their first inquiry. Divide counts by
+               Unique buyers within an intake period to get conversion rates; attempts and
+               two-way contacts are counted separately.</p>
+        </field>
+    </record>
+</odoo>

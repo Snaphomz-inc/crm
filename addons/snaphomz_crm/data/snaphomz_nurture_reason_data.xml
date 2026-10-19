@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo noupdate="1">
+    <record id="nurture_reason_timeline" model="snaphomz.nurture.reason">
+        <field name="name">Buying timeline beyond 6 months</field>
+        <field name="sequence">10</field>
+    </record>
+    <record id="nurture_reason_financing" model="snaphomz.nurture.reason">
+        <field name="name">Needs financing preparation</field>
+        <field name="sequence">20</field>
+    </record>
+    <record id="nurture_reason_down_payment" model="snaphomz.nurture.reason">
+        <field name="name">Saving for down payment</field>
+        <field name="sequence">30</field>
+    </record>
+    <record id="nurture_reason_selling_first" model="snaphomz.nurture.reason">
+        <field name="name">Must sell current home first</field>
+        <field name="sequence">40</field>
+    </record>
+    <record id="nurture_reason_exploring" model="snaphomz.nurture.reason">
+        <field name="name">Exploring the market</field>
+        <field name="sequence">50</field>
+    </record>
+    <record id="nurture_reason_unresponsive" model="snaphomz.nurture.reason">
+        <field name="name">Unresponsive after attempts</field>
+        <field name="sequence">60</field>
+    </record>
+</odoo>

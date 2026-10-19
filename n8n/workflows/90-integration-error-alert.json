@@ -1,0 +1,82 @@
+{
+  "id": "SnzErrorAlert001",
+  "name": "Snaphomz | Integration error alert",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "96693dfb-44cf-5253-87b5-fb62e0abc4fc",
+      "name": "On workflow error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://odoo:8069/json/2/snaphomz.inbound.event/report_integration_failure",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Odoo-Database",
+              "value": "snaphomz"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ workflow: $json.workflow.name, error: $json.execution.error?.message || 'unknown error', execution_id: String($json.execution.id || ''), execution_url: $json.execution.url || null, node: $json.execution.lastNodeExecuted || null }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "59665036-e3e6-536a-8ab8-70c562725948",
+      "name": "Record failure in Odoo",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        260,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "odoo-integration-key",
+          "name": "Odoo integration API key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "On workflow error": {
+      "main": [
+        [
+          {
+            "node": "Record failure in Odoo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none"
+  },
+  "active": false,
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [],
+  "staticData": null
+}

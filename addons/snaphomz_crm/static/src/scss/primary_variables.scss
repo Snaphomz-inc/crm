@@ -1,0 +1,17 @@
+// Snaphomz brand palette, taken from the Snaphomz web app (tailwind.config.ts).
+// Loaded before Odoo's own primary variables, which are all `!default`.
+$snz-black: #171717;
+$snz-ink: #1f2020;
+$snz-orange: #e8804c;
+$snz-orange-light: #ffb576;
+$snz-terracotta: #d16f3e;
+$snz-cream: #faf9f5;
+
+// Navbar and primary buttons in Snaphomz black (white text: 17.9:1 contrast).
+$o-community-color: $snz-black;
+$o-brand-odoo: $snz-black;
+$o-brand-primary: $snz-black;
+$o-action: $snz-black;
+
+// Links in a darkened Snaphomz terracotta so they stay readable on white (4.8:1).
+$o-main-link-color: #b4572a;

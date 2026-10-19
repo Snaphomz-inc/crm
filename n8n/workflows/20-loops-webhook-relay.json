@@ -1,0 +1,226 @@
+{
+  "id": "SnzLoopsRelay001",
+  "name": "Snaphomz | Loops webhook relay",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "loops",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "494ec7a6-8835-5f72-8838-4ee7dc29c9c9",
+      "name": "Loops webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "325b9531-8978-545d-9771-9e067e46ba5b"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://odoo:8069/snaphomz/webhooks/loops",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "webhook-id",
+              "value": "={{ $json.headers['webhook-id'] }}"
+            },
+            {
+              "name": "webhook-timestamp",
+              "value": "={{ $json.headers['webhook-timestamp'] }}"
+            },
+            {
+              "name": "webhook-signature",
+              "value": "={{ $json.headers['webhook-signature'] }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Odoo-Database",
+              "value": "snaphomz"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "data",
+        "options": {
+          "timeout": 12000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "13216d65-2706-52bd-9b5c-92d1ea438707",
+      "name": "Forward to Odoo (verifies signature)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        260,
+        0
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ typeof $json.body === 'string' ? $json.body : JSON.stringify($json.body || {status: 'error'}) }}",
+        "options": {
+          "responseCode": "={{ $json.statusCode || 500 }}"
+        }
+      },
+      "id": "685613bb-fb98-5de5-b821-4bf00ad3a04c",
+      "name": "Reply to Loops",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        520,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $('Forward to Odoo (verifies signature)').item.json.statusCode }}",
+              "rightValue": 200,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ab121858-1769-51f1-aabc-7fd146afdbfb",
+      "name": "Accepted by Odoo?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        780,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://REPLACE-WITH-EXISTING-LOOPS-WEBHOOK-CONSUMER",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "webhook-id",
+              "value": "={{ $('Loops webhook').item.json.headers['webhook-id'] }}"
+            },
+            {
+              "name": "webhook-timestamp",
+              "value": "={{ $('Loops webhook').item.json.headers['webhook-timestamp'] }}"
+            },
+            {
+              "name": "webhook-signature",
+              "value": "={{ $('Loops webhook').item.json.headers['webhook-signature'] }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "data",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "ab322c03-1fcb-547c-8953-cba7b8f52b2d",
+      "name": "Existing consumer (configure or delete)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1040,
+        -80
+      ],
+      "disabled": true,
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Loops webhook": {
+      "main": [
+        [
+          {
+            "node": "Forward to Odoo (verifies signature)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Forward to Odoo (verifies signature)": {
+      "main": [
+        [
+          {
+            "node": "Reply to Loops",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reply to Loops": {
+      "main": [
+        [
+          {
+            "node": "Accepted by Odoo?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Accepted by Odoo?": {
+      "main": [
+        [
+          {
+            "node": "Existing consumer (configure or delete)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "errorWorkflow": "SnzErrorAlert001"
+  },
+  "active": false,
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [],
+  "staticData": null
+}

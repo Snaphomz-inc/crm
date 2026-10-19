@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo noupdate="1">
+    <record id="activity_type_first_contact" model="mail.activity.type">
+        <field name="name">First contact</field>
+        <field name="summary">First contact</field>
+        <field name="icon">fa-phone</field>
+        <field name="category">phonecall</field>
+        <field name="res_model">crm.lead</field>
+        <field name="sequence">1</field>
+    </record>
+    <record id="activity_type_call_retry" model="mail.activity.type">
+        <field name="name">Call retry</field>
+        <field name="summary">Call again</field>
+        <field name="icon">fa-repeat</field>
+        <field name="category">phonecall</field>
+        <field name="res_model">crm.lead</field>
+        <field name="sequence">2</field>
+    </record>
+    <record id="activity_type_follow_up" model="mail.activity.type">
+        <field name="name">Buyer follow-up</field>
+        <field name="summary">Follow up</field>
+        <field name="icon">fa-calendar-check-o</field>
+        <field name="res_model">crm.lead</field>
+        <field name="sequence">3</field>
+    </record>
+</odoo>

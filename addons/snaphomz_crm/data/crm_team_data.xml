@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo noupdate="1">
+    <record id="team_buyer_acquisition" model="crm.team">
+        <field name="name">Buyer Acquisition</field>
+        <field name="sequence">1</field>
+        <field name="snaphomz_is_buyer_team" eval="True"/>
+        <field name="snaphomz_calendar_id" ref="calendar_sales_coverage"/>
+        <field name="snaphomz_first_contact_minutes">15</field>
+        <field name="snaphomz_escalation_minutes">30</field>
+        <field name="snaphomz_retry_attempt_limit">3</field>
+        <field name="company_id" eval="False"/>
+    </record>
+</odoo>

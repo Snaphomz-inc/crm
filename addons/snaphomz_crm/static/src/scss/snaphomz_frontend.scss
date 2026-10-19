@@ -1,0 +1,69 @@
+// Snaphomz login page.
+
+body.o_snaphomz_login {
+    background: $snz-cream;
+
+    // Public pages use the website palette, not the backend brand colour.
+    .btn-primary {
+        background-color: $snz-black !important;
+        border-color: $snz-black !important;
+        color: #fff !important;
+
+        &:hover,
+        &:focus,
+        &:active {
+            background-color: #333 !important;
+            border-color: #333 !important;
+        }
+    }
+
+    a:not(.btn) {
+        color: #b4572a;
+
+        &:hover {
+            color: #8f4421;
+        }
+    }
+
+    .form-control:focus {
+        border-color: $snz-orange;
+        box-shadow: 0 0 0 0.2rem rgba($snz-orange, 0.25);
+    }
+
+    .o_database_list {
+        max-width: 380px !important;
+        background: #fff !important;
+        border-radius: 16px;
+        box-shadow: 0 12px 32px rgba($snz-black, 0.08);
+        border-top: 4px solid $snz-orange !important;
+    }
+
+    .o_snaphomz_login_logo {
+        max-height: 56px;
+        max-width: 100%;
+        width: auto;
+    }
+
+    .o_snaphomz_login_title {
+        font-size: 0.95rem;
+        color: rgba($snz-black, 0.7);
+    }
+
+    .o_snaphomz_ms_btn {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.75rem;
+        padding: 0.65rem 1rem;
+        font-weight: 600;
+        border-radius: 8px;
+
+        svg {
+            flex-shrink: 0;
+        }
+    }
+
+    .o_snaphomz_footer {
+        color: rgba($snz-black, 0.55);
+    }
+}

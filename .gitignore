@@ -1,0 +1,20 @@
+# Secrets and local state never go into the repository
+.env
+*.env.local
+secrets/
+backups/
+*.dump
+*.sql.gz
+*.tar.gz.gpg
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Claude Code local settings
+.claude/settings.local.json

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo noupdate="1">
+    <record id="param_loops_contact_creation" model="ir.config_parameter">
+        <field name="key">snaphomz_crm.loops_contact_creation</field>
+        <field name="value">consent</field>
+    </record>
+    <record id="param_default_country_code" model="ir.config_parameter">
+        <field name="key">snaphomz_crm.default_country_code</field>
+        <field name="value">US</field>
+    </record>
+    <record id="param_registration_creates_lead" model="ir.config_parameter">
+        <field name="key">snaphomz_crm.registration_creates_lead</field>
+        <field name="value">False</field>
+    </record>
+    <!-- The CRM is staff-only: no self-service sign-up (Odoo's auth_signup default is b2c). -->
+    <function model="ir.config_parameter" name="set_param" eval="('auth_signup.invitation_scope', 'b2b')"/>
+</odoo>

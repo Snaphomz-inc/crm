@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="res_partner_view_form_snaphomz" model="ir.ui.view">
+        <field name="name">res.partner.form.snaphomz</field>
+        <field name="model">res.partner</field>
+        <field name="inherit_id" ref="base.view_partner_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//notebook" position="inside">
+                <page string="Snaphomz buyer" name="snaphomz_buyer" invisible="not snaphomz_person_uuid">
+                    <group>
+                        <group string="Contact preferences">
+                            <field name="tz" string="Buyer timezone"/>
+                            <field name="preferred_contact_method"/>
+                            <field name="do_not_contact"/>
+                            <field name="do_not_contact_at" invisible="not do_not_contact"/>
+                        </group>
+                        <group string="Email marketing (Loops)">
+                            <field name="email_subscription_status" readonly="1"/>
+                            <field name="email_status_event_at"/>
+                            <field name="marketing_consent"/>
+                            <field name="consent_source"/>
+                            <field name="consent_at"/>
+                            <field name="last_marketing_engagement_at"/>
+                            <field name="last_email_open_at"/>
+                        </group>
+                        <group string="Identifiers" groups="sales_team.group_sale_salesman_all_leads">
+                            <field name="snaphomz_person_uuid"/>
+                            <field name="snaphomz_user_id"/>
+                            <field name="loops_contact_id"/>
+                            <field name="snaphomz_owner_user_ids" widget="many2many_tags"/>
+                        </group>
+                    </group>
+                    <field name="snaphomz_identity_key_ids" readonly="1" groups="base.group_system">
+                        <list>
+                            <field name="kind"/>
+                            <field name="value"/>
+                        </list>
+                    </field>
+                </page>
+            </xpath>
+        </field>
+    </record>
+</odoo>
