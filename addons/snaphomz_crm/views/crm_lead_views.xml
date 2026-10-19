@@ -32,8 +32,16 @@
                         icon="fa-envelope-o" string="Marketing" invisible="not partner_id"/>
             </xpath>
 
+            <!-- Only sales managers decide who works a buyer. -->
+            <xpath expr="(//field[@name='user_id'])[1]" position="attributes">
+                <attribute name="readonly">not snaphomz_can_assign</attribute>
+            </xpath>
+            <xpath expr="(//field[@name='user_id'])[2]" position="attributes">
+                <attribute name="readonly">not snaphomz_can_assign</attribute>
+            </xpath>
             <xpath expr="//div[hasclass('oe_title')]" position="before">
                 <field name="acquisition_uuid" invisible="1"/>
+                <field name="snaphomz_can_assign" invisible="1"/>
                 <field name="do_not_contact" invisible="1"/>
                 <field name="snaphomz_needs_review" invisible="1"/>
                 <field name="is_overdue" invisible="1"/>

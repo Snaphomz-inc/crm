@@ -82,6 +82,23 @@ class TestPermissions(SnaphomzCase):
         new_message = self.mine.message_ids[0]
         self.assertFalse(self.env['mail.message'].with_user(self.rep_a).search([('id', '=', new_message.id)]))
 
+    def test_only_managers_assign_buyers(self):
+        """Nothing reaches a salesperson unless a manager assigns it."""
+        with self.assertRaises(AccessError):
+            self.mine.with_user(self.rep_a).write({'user_id': self.rep_b.id})
+        with self.assertRaises(AccessError):
+            self.env['crm.lead'].with_user(self.rep_a).create({
+                'name': 'Walk-in buyer', 'next_action': 'Call', 'next_action_at': STAFFED_NOW})
+        self.assertFalse(self.mine.with_user(self.rep_a).snaphomz_can_assign)
+        # A manager's assignment is recorded in the tracked history.
+        self.theirs.with_user(self.manager).with_context(mail_notrack=False).user_id = self.rep_a
+        self.env.flush_all()
+        self.env.cr.precommit.run()  # tracking values are written at commit time
+        self.assertIn(self.theirs, self.env['crm.lead'].with_user(self.rep_a).search([]))
+        tracking = self.theirs.message_ids.tracking_value_ids.filtered(
+            lambda t: t.field_id.name == 'user_id' and t.new_value_integer == self.rep_a.id)
+        self.assertEqual(tracking.mail_message_id.author_id, self.manager.partner_id)
+
     def test_salesperson_has_no_integration_access(self):
         with self.assertRaises(AccessError):
             self.env['snaphomz.inbound.event'].with_user(self.rep_a).search([])

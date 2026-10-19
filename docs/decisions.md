@@ -22,6 +22,11 @@
   contacts of other salespeople's buyers are hidden; a reassigned salesperson is unsubscribed
   from the buyer's conversation.
 * Public sign-up on the login page is turned off (Odoo's default allows it).
+* **Assignment is manager-controlled** (decided 19 Oct 2026): no automatic intake
+  salesperson; inquiries wait in the Unassigned intake queue until a manager (currently
+  Phani or Nrupen) assigns them. Only users with *Sales: All Documents* can create buyers or
+  change the salesperson. Manager alerts go to the team leader plus every team member with
+  manager access. Either manager can authorise; a two-person approval was not built.
 * **Branding** comes from the Snaphomz web app: logo files from
   `Snaphomz-frontend-prod-prod-feature/public/assets/images` (`logo-01.svg`, recoloured for
   dark backgrounds) and the favicon, Snaphomz black `#171717` for the navbar and primary

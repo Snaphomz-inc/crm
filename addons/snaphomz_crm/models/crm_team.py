@@ -35,6 +35,14 @@ class CrmTeam(models.Model):
             team = self.search([('snaphomz_is_buyer_team', '=', True)], limit=1)
         return team.sudo()
 
+    def _snaphomz_managers(self):
+        """Who receives manager alerts: the team leader plus every active team
+        member with all-documents access (e.g. program manager, CEO)."""
+        self.ensure_one()
+        members = self.member_ids.filtered(
+            lambda u: u.active and not u.share and u.has_group('sales_team.group_sale_salesman_all_leads'))
+        return (self.user_id | members).filtered('active')
+
     def _snaphomz_calendar(self):
         self.ensure_one()
         return (

@@ -138,6 +138,9 @@ class TestIntake(SnaphomzCase):
         lead = self.lead_for('queue@example.com')
         self.assertFalse(lead.user_id)
         self.assertEqual(self.open_activities(lead).user_id, self.manager)
+        alert = self.env['mail.message'].search([('model', '=', 'crm.lead'), ('res_id', '=', lead.id),
+                                                 ('subject', '=', 'New buyer waiting for assignment')])
+        self.assertIn(self.manager.partner_id, alert.partner_ids, "managers are alerted on the buyer record")
 
         # Assigning later moves the first-contact task to the new owner.
         lead.with_user(self.manager).user_id = self.rep_b

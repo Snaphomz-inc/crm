@@ -59,6 +59,21 @@ class TestWorkingHours(SnaphomzCase):
         self.assertEqual(set(notified.partner_ids.ids) & {self.rep_a.partner_id.id, self.manager.partner_id.id},
                          {self.rep_a.partner_id.id, self.manager.partner_id.id})
 
+    def test_escalation_reaches_every_team_manager(self):
+        from odoo.tests import new_test_user
+        ceo = new_test_user(self.env, 'snz_ceo', groups='sales_team.group_sale_manager', name='Chief Exec')
+        self.team.member_ids = [(4, ceo.id), (4, self.rep_a.id)]
+        self.assertEqual(self.team._snaphomz_managers(), self.manager | ceo,
+                         "team leader plus members with all-documents access; salespeople excluded")
+        with freeze_time(datetime(2026, 10, 19, 14, 0)):
+            self.submit(self.payload(email='escalate@example.com'))
+        lead = self.lead_for('escalate@example.com')
+        with freeze_time(datetime(2026, 10, 19, 14, 31)):
+            self.env['crm.lead']._cron_snaphomz_first_contact_alerts()
+        escalation = self.env['mail.message'].search([('model', '=', 'crm.lead'), ('res_id', '=', lead.id),
+                                                      ('subject', 'ilike', 'Escalation')])
+        self.assertEqual(set(escalation.partner_ids.ids), {self.manager.partner_id.id, ceo.partner_id.id})
+
     def test_overdue_digest_runs(self):
         with freeze_time(datetime(2026, 10, 19, 14, 0)):
             self.submit(self.payload(email='late@example.com'))

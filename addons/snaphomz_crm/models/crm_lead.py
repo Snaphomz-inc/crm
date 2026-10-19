@@ -212,6 +212,7 @@ class CrmLead(models.Model):
     # Review and history
     # ------------------------------------------------------------------
     snaphomz_needs_review = fields.Boolean('Needs manager review', copy=False, tracking=True)
+    snaphomz_can_assign = fields.Boolean(compute='_compute_snaphomz_can_assign')
     snaphomz_review_note = fields.Text('Review note', copy=False)
     stage_history_ids = fields.One2many('snaphomz.stage.history', 'lead_id', 'Stage history')
 
@@ -310,10 +311,24 @@ class CrmLead(models.Model):
     def _snaphomz_is_integration(self):
         return self.env.user.has_group('snaphomz_crm.group_snaphomz_integration') and not self.env.su
 
+    def _snaphomz_can_assign(self):
+        """Only sales managers decide which salesperson works a buyer."""
+        return self.env.su or self.env.user.has_group('sales_team.group_sale_salesman_all_leads')
+
+    @api.depends_context('uid')
+    def _compute_snaphomz_can_assign(self):
+        can_assign = self._snaphomz_can_assign()
+        for lead in self:
+            lead.snaphomz_can_assign = can_assign
+
     @api.model_create_multi
     def create(self, vals_list):
         if self._snaphomz_is_integration() and not self.env.context.get('snaphomz_intake'):
             raise AccessError(_("The integration user creates buyers only through submit_intake."))
+        if not self._snaphomz_can_assign() and not self.env.context.get('snaphomz_intake'):
+            raise AccessError(_(
+                "New buyers arrive through intake or are added by a sales manager, "
+                "who decides which salesperson works them."))
         team = self.env['crm.team']._snaphomz_buyer_team()
         now = fields.Datetime.now()
         for vals in vals_list:
@@ -350,6 +365,9 @@ class CrmLead(models.Model):
         if (set(CLOCK_FIELDS) & set(vals) and not self.env.su
                 and not self.env.context.get('snaphomz_log_outcome')):
             raise AccessError(_("Contact attempts and conversations are recorded with Log outcome."))
+        if ('user_id' in vals and not self._snaphomz_can_assign()
+                and any(lead.user_id.id != (vals['user_id'] or False) for lead in self)):
+            raise AccessError(_("Only a sales manager can assign or reassign buyers."))
         if 'buyer_readiness' in vals:
             vals = dict(vals, qualified_at=fields.Datetime.now(), qualified_by_id=self.env.uid)
         if vals.get('type') == 'opportunity':

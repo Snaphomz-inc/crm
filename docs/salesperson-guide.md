@@ -2,6 +2,10 @@
 
 Everything you need is under **CRM › My buyers**, worked top to bottom.
 
+You only see buyers a sales manager has assigned to you; new inquiries wait in the
+managers' queue until then. You'll get a notification (bell icon) when a buyer is
+assigned. To add a buyer you met yourself, or to hand one back, ask a manager.
+
 1. **My new leads**: buyers who have not been contacted yet. First contact is due 15
    staffed minutes after the inquiry; your manager is alerted at 30.
 2. **My follow-ups today**: everything due before the end of your day (overdue in red).

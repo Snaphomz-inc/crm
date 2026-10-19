@@ -33,15 +33,15 @@ class CrmLeadAutomation(models.Model):
                     body=html_escape(_('No contact attempt has been logged since the inquiry. Call now and use Log outcome.')))
             lead.sla_owner_alerted = True
         for lead in Lead.search(base + [('sla_manager_alerted', '=', False), ('sla_manager_alert_at', '<=', now)]):
-            manager = lead.team_id.user_id
-            if manager:
+            managers = lead.team_id._snaphomz_managers() if lead.team_id else self.env['res.users']
+            if managers:
                 lead.message_notify(
-                    partner_ids=manager.partner_id.ids,
+                    partner_ids=managers.partner_id.ids,
                     subject=_('Escalation: %s not contacted', lead.display_name),
                     body=html_escape(_('Owner: %(owner)s. Inquiry received %(at)s. No contact attempt logged.',
                                        owner=lead.user_id.name or _('unassigned'),
                                        at=format_datetime(self.env, lead.origin_at or lead.create_date,
-                                                          tz=manager.tz))))
+                                                          tz=managers[0].tz))))
             lead.sla_manager_alerted = True
 
     @api.model
@@ -72,11 +72,12 @@ class CrmLeadAutomation(models.Model):
                 Thread.message_notify(
                     model='crm.team', res_id=team.id, partner_ids=user.partner_id.ids,
                     subject=_('%s overdue follow-ups', len(leads)), body=table(leads, user.tz))
-        if team.user_id:
+        managers = team._snaphomz_managers() if team else self.env['res.users']
+        if managers:
             Thread.message_notify(
-                model='crm.team', res_id=team.id, partner_ids=team.user_id.partner_id.ids,
+                model='crm.team', res_id=team.id, partner_ids=managers.partner_id.ids,
                 subject=_('Team overdue follow-ups: %s', len(overdue)),
-                body=table(overdue.sorted(lambda l: (l.user_id.name or '', l.next_action_at)), team.user_id.tz))
+                body=table(overdue.sorted(lambda l: (l.user_id.name or '', l.next_action_at)), managers[0].tz))
 
     @api.model
     def _cron_snaphomz_bra_expiry(self):

@@ -272,7 +272,8 @@ class SnaphomzInboundEventIntake(models.Model):
                 })
                 self._snaphomz_notify_managers(
                     _("Do-not-contact buyer inquired again"),
-                    _("%s sent a new inquiry. The record stays closed until a manager decides.", partner.display_name))
+                    _("%s sent a new inquiry. The record stays closed until a manager decides.", partner.display_name),
+                    lead=lead)
                 return {'state': 'done', 'summary': _('inquiry from do-not-contact buyer flagged for review'),
                         'partner_id': partner.id, 'lead_id': lead.id}
             lead = lead.with_context(snaphomz_origin=self.provider,
@@ -298,8 +299,10 @@ class SnaphomzInboundEventIntake(models.Model):
             lead._snaphomz_apply_milestone(event_type, n, self)
         if not lead.user_id:
             self._snaphomz_notify_managers(
-                _("Unassigned buyer intake"),
-                _("%s is in the unassigned intake queue: no intake salesperson is available.", lead.display_name))
+                _("New buyer waiting for assignment"),
+                _("%s is in the Unassigned intake queue. Assign a salesperson when you have reviewed it.",
+                  lead.display_name),
+                lead=lead)
         return {'state': 'done', 'summary': summary, 'partner_id': partner.id, 'lead_id': lead.id}
 
     def _snaphomz_has_buyer_intent(self, event_type):

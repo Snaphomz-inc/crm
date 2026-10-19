@@ -1,5 +1,18 @@
 # Operations runbook
 
+## Assigning buyers (managers)
+
+No buyer reaches a salesperson automatically. Every new inquiry lands in **Manager ›
+Unassigned intake**, the team leader owns its first-contact task, and every team member
+with manager access gets a "New buyer waiting for assignment" notification. A manager
+opens the buyer and sets **Salesperson**; the salesperson is notified and the open tasks
+move to them. Only managers can assign or reassign buyers, or add buyers by hand; each
+change is recorded in the buyer's history with who made it.
+
+Notifications currently arrive in the CRM itself (bell icon), because no outgoing mail
+server is configured yet. Once email is set up, people can choose *Handle by Emails* in
+their preferences.
+
 ## Daily during the first live week
 
 * **Manager › Unassigned intake** and **Overdue by owner**: clear or reassign.

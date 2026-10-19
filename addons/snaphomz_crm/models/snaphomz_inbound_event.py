@@ -314,23 +314,24 @@ class SnaphomzInboundEvent(models.Model):
     # Notifications
     # ------------------------------------------------------------------
 
-    def _snaphomz_notify(self, users, subject, body):
+    def _snaphomz_notify(self, users, subject, body, lead=None):
         partners = users.filtered('active').partner_id
         if not partners:
             return
         for event in self:
-            target = event.lead_id
+            target = lead or event.lead_id
             if target:
                 target.sudo().message_notify(partner_ids=partners.ids, subject=subject, body=body)
             else:
                 self.env['mail.thread'].sudo().message_notify(
                     model=self._name, res_id=event.id, partner_ids=partners.ids, subject=subject, body=body)
 
-    def _snaphomz_notify_managers(self, subject, body):
+    def _snaphomz_notify_managers(self, subject, body, lead=None):
         team = self.env['crm.team']._snaphomz_buyer_team()
-        managers = team.user_id or self.env.ref('sales_team.group_sale_manager').sudo().user_ids.filtered(
-            lambda u: not u.share and u.id != self.env.ref('base.user_root').id)[:3]
-        self._snaphomz_notify(managers, subject, html_escape(body))
+        managers = (team._snaphomz_managers() if team else self.env['res.users']) or \
+            self.env.ref('sales_team.group_sale_manager').sudo().user_ids.filtered(
+                lambda u: not u.share and u.id != self.env.ref('base.user_root').id)[:3]
+        self._snaphomz_notify(managers, subject, html_escape(body), lead=lead)
 
     def _snaphomz_notify_technical_owner(self):
         param = self.env['ir.config_parameter'].sudo().get_param('snaphomz_crm.technical_owner_id')
